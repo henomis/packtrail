@@ -1,5 +1,7 @@
 # Packtrail
 
+[![Build Status](https://github.com/henomis/packtrail/actions/workflows/checks.yml/badge.svg)](https://github.com/henomis/packtrail/actions/workflows/checks.yml) [![GoDoc](https://godoc.org/github.com/henomis/packtrail?status.svg)](https://godoc.org/github.com/henomis/packtrail) [![Go Report Card](https://goreportcard.com/badge/github.com/henomis/packtrail)](https://goreportcard.com/report/github.com/henomis/packtrail) [![GitHub release](https://img.shields.io/github/release/henomis/packtrail.svg)](https://github.com/henomis/packtrail/releases)
+
 A **durable, ecosystem-agnostic workflow engine** in Go, backed **only by NATS**
 (Core + JetStream + KV + Message Scheduler). Packtrail orchestrates declarative YAML
 flow graphs — `task`, `fanout`, `fanin`, `choice` and `signal` nodes — with

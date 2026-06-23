@@ -198,12 +198,9 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		return nil, err
 	}
 
+	// The signals stream is ensured by runtime.New (during engine construction
+	// above); this Signals instance only publishes to it.
 	sig := signal.New(js, n)
-
-	err = sig.EnsureStream(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	// Publish each flow's graph to a KV registry so observability tools (e.g.
 	// packtrail-ui) can render flows without access to the source YAML.
@@ -375,6 +372,19 @@ func loadFlows(c config) (map[string]*dsl.Flow, error) {
 
 	for _, doc := range c.flowDocs {
 		f, err := dsl.Parse(doc)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, dup := flows[f.Name]; dup {
+			return nil, fmt.Errorf("duplicate flow %q", f.Name)
+		}
+
+		flows[f.Name] = f
+	}
+
+	for _, def := range c.flowDefs {
+		f, err := flowDefToDSL(def)
 		if err != nil {
 			return nil, err
 		}

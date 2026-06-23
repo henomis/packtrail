@@ -17,6 +17,7 @@ package packtrail_test
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,13 +46,92 @@ edges:
 // non-NATS invoker registered via WithInvoker — proving the engine orchestrates
 // any transport (durability, ordering, payload threading) with no built-in
 // protocol involved.
+// TestWithFlowDefEndToEnd is the struct-based equivalent of TestCustomInvokerEndToEnd:
+// it registers the same two-node flow via WithFlowDef instead of YAML and verifies
+// the engine runs it identically.
+func TestWithFlowDefEndToEnd(t *testing.T) {
+	srv := natstest.Start(t)
+
+	var (
+		seen []string
+		mu   sync.Mutex
+	)
+
+	custom := packtrail.InvokerFunc(func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
+		mu.Lock()
+		seen = append(seen, req.Target)
+		mu.Unlock()
+		out, _ := json.Marshal(map[string]string{"last": req.Target}) //nolint:errchkjson
+		return packtrail.Result{Status: packtrail.StatusOK, Payload: out}, nil
+	})
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("t-flowdef"),
+		packtrail.WithFlowDef(packtrail.FlowDef{
+			Name: "agnostic-def",
+			Nodes: []packtrail.NodeDef{
+				{ID: "a", Type: "task", Invoker: "custom", Target: "agent-a"},
+				{ID: "b", Type: "task", Invoker: "custom", Target: "agent-b"},
+			},
+			Edges: []packtrail.EdgeDef{
+				{From: "a", To: "b"},
+			},
+		}),
+		packtrail.WithInvoker("custom", custom),
+		packtrail.WithResultCache(),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	id, err := s.Start(ctx, "agnostic-def", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		ex, getErr := s.Get(ctx, id)
+		if getErr == nil && ex.Status == packtrail.ExecCompleted {
+			if string(ex.Payload) != `{"last":"agent-b"}` {
+				t.Fatalf("final payload = %s, want last=agent-b", ex.Payload)
+			}
+
+			mu.Lock()
+			order := make([]string, len(seen))
+			copy(order, seen)
+			mu.Unlock()
+
+			if len(order) != 2 || order[0] != "agent-a" || order[1] != "agent-b" {
+				t.Fatalf("invocation order = %v, want [agent-a agent-b]", order)
+			}
+
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("execution did not complete in time")
+}
+
 func TestCustomInvokerEndToEnd(t *testing.T) {
 	srv := natstest.Start(t)
 
-	var seen []string
+	var (
+		seen []string
+		mu   sync.Mutex
+	)
 
 	custom := packtrail.InvokerFunc(func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
+		mu.Lock()
 		seen = append(seen, req.Target)
+		mu.Unlock()
 		// Echo the target into the shared payload to prove threading works.
 		out, _ := json.Marshal(map[string]string{"last": req.Target}) //nolint:errchkjson // map[string]string is always safe
 
@@ -86,8 +166,13 @@ func TestCustomInvokerEndToEnd(t *testing.T) {
 				t.Fatalf("final payload = %s, want last=agent-b", ex.Payload)
 			}
 
-			if len(seen) != 2 || seen[0] != "agent-a" || seen[1] != "agent-b" {
-				t.Fatalf("invocation order = %v, want [agent-a agent-b]", seen)
+			mu.Lock()
+			order := make([]string, len(seen))
+			copy(order, seen)
+			mu.Unlock()
+
+			if len(order) != 2 || order[0] != "agent-a" || order[1] != "agent-b" {
+				t.Fatalf("invocation order = %v, want [agent-a agent-b]", order)
 			}
 
 			return

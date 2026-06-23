@@ -15,10 +15,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/henomis/packtrail"
@@ -80,43 +82,89 @@ func (a *api) flowGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 // listExecutions returns execution summaries, optionally filtered by ?status= or
-// ?flow=. Ids are resolved to summaries via Get (the authoritative state).
+// ?flow=.
+//
+// Filtered queries read summaries directly from the visibility index (no
+// per-execution round-trips). The unfiltered case ("list all") fetches each
+// execution concurrently with a bounded pool because the index has no
+// all-executions view that carries full summary data.
 func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	status := r.URL.Query().Get("status")
+	flow := r.URL.Query().Get("flow")
 
-	var (
-		ids []string
-		err error
-	)
+	if status != "" || flow != "" {
+		var (
+			events []packtrail.Event
+			err    error
+		)
 
-	switch {
-	case r.URL.Query().Get("status") != "":
-		ids, err = a.srv.ByStatus(ctx, r.URL.Query().Get("status"))
-	case r.URL.Query().Get("flow") != "":
-		ids, err = a.srv.ByFlow(ctx, r.URL.Query().Get("flow"))
-	default:
-		ids, err = a.srv.List(ctx)
+		if status != "" {
+			events, err = a.srv.ByStatusEvents(ctx, status)
+		} else {
+			events, err = a.srv.ByFlowEvents(ctx, flow)
+		}
+
+		if err != nil {
+			httpError(w, err)
+			return
+		}
+
+		out := make([]execSummary, len(events))
+		for i, ev := range events {
+			out[i] = execSummary{
+				ID: ev.ExecID, Flow: ev.Flow, Status: ev.Status,
+				CurrentNode: ev.Node, Error: ev.Error, UpdatedAt: ev.Time,
+			}
+		}
+
+		writeJSON(w, out)
+
+		return
 	}
 
+	ids, err := a.srv.List(ctx)
 	if err != nil {
 		httpError(w, err)
 		return
 	}
 
-	out := make([]execSummary, 0, len(ids))
-	for _, id := range ids {
-		ex, getErr := a.srv.Get(ctx, id)
-		if getErr != nil {
-			continue // raced with deletion / index lag
-		}
+	const maxParallel = 32
 
-		out = append(out, execSummary{
-			ID: ex.ID, Flow: ex.Flow, Status: ex.Status,
-			CurrentNode: ex.CurrentNode, Error: ex.Error, UpdatedAt: ex.UpdatedAt,
-		})
+	out := make([]execSummary, len(ids))
+	sem := make(chan struct{}, maxParallel)
+
+	var wg sync.WaitGroup
+
+	for i, id := range ids {
+		wg.Add(1)
+
+		go func(i int, id string) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			ex, getErr := a.srv.Get(ctx, id)
+			if getErr == nil {
+				out[i] = execSummary{
+					ID: ex.ID, Flow: ex.Flow, Status: ex.Status,
+					CurrentNode: ex.CurrentNode, Error: ex.Error, UpdatedAt: ex.UpdatedAt,
+				}
+			}
+		}(i, id)
 	}
 
-	writeJSON(w, out)
+	wg.Wait()
+
+	result := make([]execSummary, 0, len(out))
+	for _, e := range out {
+		if e.ID != "" {
+			result = append(result, e)
+		}
+	}
+
+	writeJSON(w, result)
 }
 
 func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {
@@ -195,8 +243,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func httpError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		code = http.StatusServiceUnavailable
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
+	w.WriteHeader(code)
 
 	if encErr := json.NewEncoder(w).Encode(map[string]string{"error": err.Error()}); encErr != nil {
 		slog.Error("write error response", "err", encErr)

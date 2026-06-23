@@ -142,12 +142,22 @@ func New(
 		return nil, err
 	}
 
+	// Ensure the signals stream during construction. This is the only piece of
+	// JetStream setup the engine owns; doing it here (rather than in Run) keeps
+	// all stream creation in the single-threaded setup phase. Two engines whose
+	// Run methods race would otherwise issue concurrent CreateOrUpdateStream
+	// calls, which nats-server does not serialise across an account.
+	signals := signal.New(st.JS(), st.Names())
+	if err = signals.EnsureStream(context.Background()); err != nil {
+		return nil, err
+	}
+
 	return &Engine{
 		invoker:  inv,
 		js:       st.JS(),
 		store:    st,
 		sched:    sched,
-		signals:  signal.New(st.JS(), st.Names()),
+		signals:  signals,
 		names:    st.Names(),
 		flows:    flows,
 		programs: programs,
@@ -218,7 +228,8 @@ func (e *Engine) Start(ctx context.Context, flowName string, payload json.RawMes
 		return "", err
 	}
 
-	_ = e.store.EmitEvent(ctx, exec)
+	e.emitEvent(ctx, exec)
+
 	if err := e.enqueue(ctx, id, workItem{ExecID: id, Kind: kindAdvance}); err != nil {
 		return "", err
 	}
@@ -322,12 +333,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	defer fc.Stop()
 
-	// Apply external signals idempotently (CAS before ack).
-	err = e.signals.EnsureStream(ctx)
-	if err != nil {
-		return err
-	}
-
+	// Apply external signals idempotently (CAS before ack). The signals stream is
+	// ensured once at construction (see New), not here, so concurrent engines do
+	// not issue racing stream updates.
 	sc, err := e.signals.Consume(ctx, e.names.DurSignals, e.applySignal)
 	if err != nil {
 		return fmt.Errorf("signal consumer: %w", err)
@@ -386,6 +394,15 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	_ = msg.Ack()
+}
+
+// emitEvent publishes a domain event, logging at debug level on failure. Event
+// emission is best-effort: the visibility indexes are eventually reconciled, so
+// a failure here never blocks execution progress.
+func (e *Engine) emitEvent(ctx context.Context, ex *store.Execution) {
+	if err := e.store.EmitEvent(ctx, ex); err != nil {
+		e.log.Debug("emit event", "exec", ex.ID, "err", err)
+	}
 }
 
 func (e *Engine) heartbeat(ctx context.Context, msg jetstream.Msg, execID string) {
@@ -482,7 +499,7 @@ func (e *Engine) advanceTo(ctx context.Context, execID, nextNode string, mutate 
 		return err
 	}
 
-	_ = e.store.EmitEvent(ctx, updated)
+	e.emitEvent(ctx, updated)
 
 	if nextNode == "" {
 		return nil
@@ -709,7 +726,7 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 		return err
 	}
 
-	_ = e.store.EmitEvent(ctx, updated)
+	e.emitEvent(ctx, updated)
 
 	return e.enqueue(ctx, execID, workItem{Kind: kindAdvance})
 }
@@ -726,7 +743,7 @@ func (e *Engine) fail(ctx context.Context, execID, reason string) error {
 		return err
 	}
 
-	_ = e.store.EmitEvent(ctx, updated)
+	e.emitEvent(ctx, updated)
 
 	return nil
 }

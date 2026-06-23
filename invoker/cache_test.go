@@ -119,3 +119,35 @@ func TestCacheDoesNotCacheTransportError(t *testing.T) {
 		t.Fatalf("delegate called %d times, want 2 (error not cached)", got)
 	}
 }
+
+// TestCacheKVGetError verifies a KV lookup failure that is not "key not found"
+// is surfaced to the caller and the delegate is never reached.
+func TestCacheKVGetError(t *testing.T) {
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(context.Background(), jetstream.KeyValueConfig{Bucket: "test-cache-get-err"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	delegate := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		calls.Add(1)
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+
+	// A cancelled context makes the KV Get fail with something other than
+	// ErrKeyNotFound, exercising the error-propagation branch.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, invokeErr := cache.Invoke(ctx, invoker.Request{ExecutionID: "e", NodeID: "n", Attempt: 0}); invokeErr == nil {
+		t.Fatal("expected error from KV Get with cancelled context")
+	}
+
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("delegate called %d times, want 0 (KV error short-circuits)", got)
+	}
+}

@@ -95,7 +95,7 @@ func (e *Engine) stepFanout(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 			return parkErr
 		}
 
-		_ = e.store.EmitEvent(ctx, parked)
+		e.emitEvent(ctx, parked)
 
 		return nil
 	}

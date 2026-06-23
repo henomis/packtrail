@@ -217,6 +217,7 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 		FlowName: ex.FlowName,
 		Status:   ex.Status,
 		Node:     ex.CurrentNode,
+		Error:    ex.Error,
 		Revision: ex.Revision,
 		Time:     time.Now().UTC(),
 	}
@@ -260,10 +261,24 @@ func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
 	return listByPrefix(ctx, ix.idxFlow, flow+sep)
 }
 
+// ByStatusEvents returns the index entries for all executions under status.
+// Each entry is the most recent event stored for that execution, so callers
+// can build summaries (including the error message) without a per-execution
+// round-trip.
+func (ix *Indexer) ByStatusEvents(ctx context.Context, status string) ([]store.Event, error) {
+	return listEventsByPrefix(ctx, ix.idxStatus, status+sep)
+}
+
+// ByFlowEvents returns the index entries for all executions belonging to flow.
+func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event, error) {
+	return listEventsByPrefix(ctx, ix.idxFlow, flow+sep)
+}
+
 // listByPrefix returns the execution ids of every key in kv that begins with
-// prefix, stripped of that prefix.
+// prefix. It uses a server-side Watch filter so only matching keys are
+// transferred, avoiding a full-bucket scan.
 func listByPrefix(ctx context.Context, kv jetstream.KeyValue, prefix string) ([]string, error) {
-	keys, err := kv.Keys(ctx)
+	w, err := kv.Watch(ctx, prefix+">", jetstream.IgnoreDeletes(), jetstream.MetaOnly())
 	if err != nil {
 		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return nil, nil
@@ -271,14 +286,55 @@ func listByPrefix(ctx context.Context, kv jetstream.KeyValue, prefix string) ([]
 
 		return nil, err
 	}
+	defer func() { _ = w.Stop() }()
 
 	var out []string
 
-	for _, k := range keys {
-		if id, ok := strings.CutPrefix(k, prefix); ok {
-			out = append(out, id)
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				return out, nil
+			}
+
+			if id, found := strings.CutPrefix(entry.Key(), prefix); found {
+				out = append(out, id)
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
+}
 
-	return out, nil
+// listEventsByPrefix returns the stored event values for every key in kv that
+// begins with prefix. Unlike listByPrefix it fetches full values so callers
+// can build summaries without additional round-trips.
+func listEventsByPrefix(ctx context.Context, kv jetstream.KeyValue, prefix string) ([]store.Event, error) {
+	w, err := kv.Watch(ctx, prefix+">", jetstream.IgnoreDeletes())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+	defer func() { _ = w.Stop() }()
+
+	var out []store.Event
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				return out, nil
+			}
+
+			var ev store.Event
+			if json.Unmarshal(entry.Value(), &ev) == nil {
+				out = append(out, ev)
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }

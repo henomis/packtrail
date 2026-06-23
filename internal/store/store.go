@@ -243,6 +243,7 @@ func (s *Store) EmitEvent(ctx context.Context, e *Execution) error {
 		FlowName: e.FlowName,
 		Status:   e.Status,
 		Node:     e.CurrentNode,
+		Error:    e.Error,
 		Revision: e.Revision,
 		Time:     time.Now().UTC(),
 	}

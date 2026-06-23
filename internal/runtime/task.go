@@ -81,7 +81,7 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 			return err
 		}
 
-		_ = e.store.EmitEvent(ctx, updated)
+		e.emitEvent(ctx, updated)
 
 		if early != nil {
 			r, earlyErr := activityResult(*early)

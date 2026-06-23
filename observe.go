@@ -70,6 +70,7 @@ type Event struct {
 	Flow     string    `json:"flow"`
 	Status   string    `json:"status"`
 	Node     string    `json:"node"`
+	Error    string    `json:"error,omitempty"`
 	Revision uint64    `json:"revision"`
 	Time     time.Time `json:"time"`
 }
@@ -170,10 +171,7 @@ func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
 		}
 
 		select {
-		case out <- Event{
-			ExecID: ev.ExecID, Flow: ev.FlowName, Status: ev.Status,
-			Node: ev.Node, Revision: ev.Revision, Time: ev.Time,
-		}:
+		case out <- storeEventToPublic(ev):
 		case <-ctx.Done():
 		}
 	})
@@ -188,4 +186,43 @@ func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
 	}()
 
 	return out, nil
+}
+
+// ByStatusEvents returns a summary event for every execution currently indexed
+// under status, read directly from the visibility index without a per-execution
+// round-trip. The index is eventually consistent; use Get for authoritative state.
+func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, error) {
+	evs, err := s.indexer.ByStatusEvents(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+
+	return convertStoreEvents(evs), nil
+}
+
+// ByFlowEvents returns a summary event for every execution belonging to flow,
+// read directly from the visibility index without a per-execution round-trip.
+func (s *Server) ByFlowEvents(ctx context.Context, flow string) ([]Event, error) {
+	evs, err := s.indexer.ByFlowEvents(ctx, flow)
+	if err != nil {
+		return nil, err
+	}
+
+	return convertStoreEvents(evs), nil
+}
+
+func storeEventToPublic(ev store.Event) Event {
+	return Event{
+		ExecID: ev.ExecID, Flow: ev.FlowName, Status: ev.Status,
+		Node: ev.Node, Error: ev.Error, Revision: ev.Revision, Time: ev.Time,
+	}
+}
+
+func convertStoreEvents(evs []store.Event) []Event {
+	out := make([]Event, len(evs))
+	for i, ev := range evs {
+		out[i] = storeEventToPublic(ev)
+	}
+
+	return out
 }

@@ -84,7 +84,7 @@ const (
 // acked (CAS-before-ack). A returned error triggers redelivery. The returned
 // ConsumeContext must be stopped by the caller.
 func (s *Signals) Consume(
-	ctx context.Context, durable string, handler func(Delivery) error,
+	ctx context.Context, durable string, handler func(context.Context, Delivery) error,
 ) (jetstream.ConsumeContext, error) {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
 		Durable:       durable,
@@ -110,7 +110,7 @@ func (s *Signals) Consume(
 		}
 
 		d := Delivery{ExecID: execID, Name: name, Seq: meta.Sequence.Stream, Payload: msg.Data()}
-		if handlerErr := handler(d); handlerErr != nil {
+		if handlerErr := handler(ctx, d); handlerErr != nil {
 			_ = msg.NakWithDelay(signalNakDelay)
 			return
 		}

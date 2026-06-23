@@ -90,6 +90,7 @@ type Event struct {
 	FlowName string    `json:"flow_name"`
 	Status   string    `json:"status"`
 	Node     string    `json:"node"`
+	Error    string    `json:"error,omitempty"`
 	Revision uint64    `json:"revision"`
 	Time     time.Time `json:"time"`
 }

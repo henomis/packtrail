@@ -202,9 +202,9 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <span class="eyebrow">Flow definitions</span>
       <h2>Anatomy of a flow</h2>
       <p>
-        A flow is a YAML document describing a graph of <strong>nodes</strong> connected by
-        <strong>edges</strong>. Packtrail parses and validates it at startup, then walks the graph at
-        runtime. Top-level fields:
+        A flow describes a graph of <strong>nodes</strong> connected by <strong>edges</strong>. It can
+        be provided as a YAML document or constructed programmatically as a <code>FlowDef</code> Go
+        struct — both are parsed, validated, and treated identically at runtime. Top-level fields:
       </p>
       <table class="doctable">
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
@@ -217,8 +217,9 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       </table>
       <p>
         Flows are loaded with <a href="#options"><code>WithFlowsDir</code></a> (every <code>*.yaml</code>
-        / <code>*.yml</code> in a directory) or <code>WithFlow</code> (one inline document, repeatable).
-        Duplicate flow names are rejected.
+        / <code>*.yml</code> in a directory), <code>WithFlow</code> (one inline YAML document, repeatable),
+        or <code>WithFlowDef</code> (one <code>FlowDef</code> Go struct, repeatable). All three can be
+        combined freely. Duplicate flow names across any source are rejected at startup.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -681,6 +682,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="optlist__row"><code>WithNamespace(prefix)</code><span>Prefix every bucket, stream, subject and durable (default "packtrail") — isolate deployments on a shared cluster.</span></div>
         <div class="optlist__row"><code>WithFlowsDir(dir)</code><span>Load every *.yaml / *.yml flow definition in a directory at startup.</span></div>
         <div class="optlist__row"><code>WithFlow(yamlDoc)</code><span>Register a single flow from an inline YAML document; repeatable.</span></div>
+        <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; repeatable, combinable with the options above.</span></div>
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker under a kind; the built-in nats-task is always present and may be overridden.</span></div>
         <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache keyed by (execution, node, attempt).</span></div>
         <div class="optlist__row"><code>WithReconcile(cron)</code><span>Install a recurring visibility reconciliation on a 6-field cron expression.</span></div>
@@ -715,7 +717,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
       </div>
       <p>
         Each flow's graph is published to <code>packtrail-flows</code> at startup, so observability tools can
-        render flows without access to the source YAML or the engine process.
+        render flows without access to the source files or the engine process.
       </p>
     </section>
 
@@ -728,7 +730,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
       <p>
         <code>packtrail-ui</code> is a read-only dashboard that connects to the same NATS cluster, reads
         execution state and the flow registry, and tails the live event stream — no engine process or
-        source YAML required. It reads <code>NATS_URL</code> (default <code>nats://localhost:4222</code>).
+        source files required. It reads <code>NATS_URL</code> (default <code>nats://localhost:4222</code>).
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -777,9 +779,10 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
 <span class="pr">$</span> go vet ./...</code></pre>
       </div>
       <div class="callout">
-        Use <a href="#options"><code>WithFlow</code></a> to register flows inline from a YAML literal —
-        no files on disk — which keeps tests self-contained, and give each test a distinct
-        <code>WithNamespace</code> so they never collide on a shared server.
+        Use <a href="#options"><code>WithFlow</code></a> to register flows inline from a YAML literal,
+        or <code>WithFlowDef</code> to build them as Go structs — both keep tests self-contained with
+        no files on disk. Give each test a distinct <code>WithNamespace</code> so they never collide
+        on a shared server.
       </div>
     </section>
 

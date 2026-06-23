@@ -73,6 +73,13 @@ func (c *Cache) Invoke(ctx context.Context, req Request) (Result, error) {
 		return res, err
 	}
 
+	// Cache all non-error results including StatusPending. Caching Pending is
+	// intentional: a work item redelivered after a crash would otherwise
+	// re-invoke the node and dispatch a second async activity. The cached
+	// Pending causes re-parking instead, and the outstanding CompleteActivity
+	// settles it. Consequence: if the async worker is permanently lost and
+	// CompleteActivity is never called, the execution parks indefinitely —
+	// async workers should carry their own timeout/failure mechanism.
 	if data, mErr := json.Marshal(res); mErr == nil {
 		_, _ = c.kv.Put(ctx, key, data)
 	}

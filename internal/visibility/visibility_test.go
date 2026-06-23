@@ -169,6 +169,115 @@ func TestStaleEventIgnored(t *testing.T) {
 	}
 }
 
+// findEvent returns the event for id from evs, or fails.
+func findEvent(t *testing.T, evs []store.Event, id string) store.Event {
+	t.Helper()
+
+	for _, ev := range evs {
+		if ev.ExecID == id {
+			return ev
+		}
+	}
+
+	t.Fatalf("event for %s not found in %v", id, evs)
+
+	return store.Event{}
+}
+
+// TestByStatusEvents verifies the status index returns full events (not just
+// ids), each carrying the execution's flow, node and error message.
+func TestByStatusEvents(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "zeta")
+	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
+
+	evs, err := ix.ByStatusEvents(ctx, store.StatusRunning)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	ev := findEvent(t, evs, ex.ID)
+	if ev.FlowName != "zeta" || ev.Status != store.StatusRunning || ev.Node != "start" {
+		t.Fatalf("event = %+v, want flow=zeta status=running node=start", ev)
+	}
+}
+
+// TestByFlowEvents verifies the flow index returns full events grouped by flow.
+func TestByFlowEvents(t *testing.T) {
+	ctx, st, ix := setup(t)
+	a := mkExec(t, st, "eta")
+	b := mkExec(t, st, "theta")
+	waitIndex(t, ix, store.StatusRunning, a.ID, true)
+	waitIndex(t, ix, store.StatusRunning, b.ID, true)
+
+	evs, err := ix.ByFlowEvents(ctx, "eta")
+	if err != nil {
+		t.Fatalf("by flow events: %v", err)
+	}
+
+	if got := findEvent(t, evs, a.ID); got.FlowName != "eta" {
+		t.Fatalf("event flow = %q, want eta", got.FlowName)
+	}
+
+	for _, ev := range evs {
+		if ev.ExecID == b.ID {
+			t.Fatalf("ByFlowEvents(eta) leaked execution from another flow: %v", evs)
+		}
+	}
+}
+
+// TestByStatusEventsCarryError verifies a failed execution's error message is
+// projected into the index and surfaced through ByStatusEvents, and that a
+// Reconcile rebuild preserves it (the reassert path).
+func TestByStatusEventsCarryError(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "iota")
+	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
+
+	const wantErr = "boom: task exploded"
+
+	updated, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.Status = store.StatusFailed
+		e.Error = wantErr
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	_ = st.EmitEvent(ctx, updated)
+
+	waitIndex(t, ix, store.StatusFailed, ex.ID, true)
+
+	// Live projection carries the error.
+	evs, err := ix.ByStatusEvents(ctx, store.StatusFailed)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	if got := findEvent(t, evs, ex.ID); got.Error != wantErr {
+		t.Fatalf("live event error = %q, want %q", got.Error, wantErr)
+	}
+
+	// Corrupt and rebuild from the source of truth: the error must survive.
+	_ = st.IdxStatus().Delete(ctx, store.StatusFailed+sep+ex.ID)
+	_ = st.IdxStatus().Delete(ctx, metaPrefix+ex.ID)
+
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
+	}
+
+	evs, err = ix.ByStatusEvents(ctx, store.StatusFailed)
+	if err != nil {
+		t.Fatalf("by status events after reconcile: %v", err)
+	}
+
+	if got := findEvent(t, evs, ex.ID); got.Error != wantErr {
+		t.Fatalf("reconciled event error = %q, want %q", got.Error, wantErr)
+	}
+}
+
 // TestReconcileRepairsDrift verifies Reconcile rebuilds the index from the
 // source of truth after manual corruption.
 func TestReconcileRepairsDrift(t *testing.T) {

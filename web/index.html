@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Packtrail — ecosystem-agnostic durable workflows on NATS</title>
-<meta name="description" content="Packtrail is a durable, ecosystem-agnostic workflow engine in Go. It orchestrates declarative YAML flow graphs backed only by NATS — JetStream, KV and the Message Scheduler — with a pluggable Invoker that lets you drive any transport: agent callers, HTTP clients, NATS workers." />
+<meta name="description" content="Packtrail is a durable, ecosystem-agnostic workflow engine in Go. It orchestrates flow graphs — defined in YAML or as Go structs — backed only by NATS — JetStream, KV and the Message Scheduler — with a pluggable Invoker that lets you drive any transport: agent callers, HTTP clients, NATS workers." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -48,11 +48,12 @@
       <span class="eyebrow">Durable workflow engine · Go · ecosystem-agnostic</span>
       <h1>Your transport.<br><span class="hl">Packtrail's durability.</span></h1>
       <p class="lede">
-        Packtrail orchestrates declarative YAML flow graphs — <code>task</code>, <code>fanout</code>,
-        <code>fanin</code>, <code>choice</code> and <code>signal</code> nodes — with full crash
-        durability backed only by NATS. Node execution runs through a
-        <strong>pluggable&nbsp;Invoker</strong>: plug in your own agent caller, an HTTP client, or
-        the built-in NATS worker and inherit all of packtrail's machinery for&nbsp;free.
+        Packtrail orchestrates declarative flow graphs — <code>task</code>, <code>fanout</code>,
+        <code>fanin</code>, <code>choice</code> and <code>signal</code> nodes, defined in
+        <strong>YAML or as Go&nbsp;structs</strong> — with full crash durability backed only by
+        NATS. Node execution runs through a <strong>pluggable&nbsp;Invoker</strong>: plug in your
+        own agent caller, an HTTP client, or the built-in NATS worker and inherit all of
+        packtrail's machinery for&nbsp;free.
       </p>
       <div class="hero__cta">
         <a class="btn btn--primary" href="#embed">Get started</a>
@@ -204,7 +205,7 @@
     <div class="arch__top">
       <div class="arch__box arch__box--side">
         <span class="arch__tag">input</span>
-        <strong>YAML flows</strong>
+        <strong>YAML flows / Go structs</strong>
         <small>parsed &amp; validated at startup; graph published to KV</small>
       </div>
 
@@ -289,7 +290,7 @@
     </article>
     <article class="choice-card reveal">
       <h4>Why a flow registry in KV?</h4>
-      <p>Each flow's graph is published to <code>packtrail-flows</code> at startup, so observability tools like packtrail-ui can render the live graph <em>without</em> access to the source YAML or the engine process.</p>
+      <p>Each flow's graph is published to <code>packtrail-flows</code> at startup, so observability tools like packtrail-ui can render the live graph <em>without</em> access to the source files or the engine process.</p>
     </article>
   </div>
 </section>
@@ -401,13 +402,15 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
   <div class="section__head reveal">
     <span class="eyebrow">Flow definition</span>
     <h2>Declare the graph. Packtrail walks it.</h2>
+    <p class="section__sub">Define flows in YAML <em>or</em> as Go structs — both paths run through the same validation and produce identical runtime behaviour.</p>
   </div>
 
   <div class="dsl">
+    <div style="display:flex;flex-direction:column;gap:1rem">
     <div class="codecard reveal">
       <div class="codecard__bar">
         <span class="codecard__dots"><i></i><i></i><i></i></span>
-        <span class="codecard__name">agent-pipeline.yaml</span>
+        <span class="codecard__name">agent-pipeline.yaml — YAML definition</span>
         <button class="copy" data-copy="#yaml-src">Copy</button>
       </div>
 <pre class="codecard__body" id="yaml-src"><code><span class="k">version</span>: <span class="s">"1.0"</span>
@@ -450,6 +453,43 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
   - {<span class="k">from</span>: join,      <span class="k">to</span>: route}
   - {<span class="k">from</span>: synthesis, <span class="k">to</span>: gate}</code></pre>
     </div>
+
+    <div class="codecard reveal">
+      <div class="codecard__bar">
+        <span class="codecard__dots"><i></i><i></i><i></i></span>
+        <span class="codecard__name">main.go — same flow as a Go struct (WithFlowDef)</span>
+        <button class="copy" data-copy="#struct-src">Copy</button>
+      </div>
+<pre class="codecard__body" id="struct-src"><code>packtrail.<span class="fn">WithFlowDef</span>(packtrail.FlowDef{
+    Name: <span class="s">"agent-pipeline"</span>,
+    Nodes: []packtrail.NodeDef{
+        {ID: <span class="s">"triage"</span>, Type: <span class="s">"task"</span>, Invoker: <span class="s">"agent"</span>, Target: <span class="s">"triage-agent"</span>,
+         Timeout: 2*time.Minute,
+         Retry: &amp;packtrail.RetryPolicy{MaxAttempts: 3, Backoff: <span class="s">"exponential"</span>}},
+        {ID: <span class="s">"research"</span>, Type: <span class="s">"fanout"</span>, Branches: []<span class="kw">string</span>{<span class="s">"tech"</span>, <span class="s">"market"</span>, <span class="s">"legal"</span>}},
+        {ID: <span class="s">"tech"</span>,   Type: <span class="s">"task"</span>, Invoker: <span class="s">"agent"</span>, Target: <span class="s">"tech-agent"</span>},
+        {ID: <span class="s">"market"</span>, Type: <span class="s">"task"</span>, Invoker: <span class="s">"agent"</span>, Target: <span class="s">"market-agent"</span>},
+        {ID: <span class="s">"legal"</span>,  Type: <span class="s">"task"</span>, Invoker: <span class="s">"agent"</span>, Target: <span class="s">"legal-agent"</span>},
+        {ID: <span class="s">"join"</span>, Type: <span class="s">"fanin"</span>,
+         WaitFor: []<span class="kw">string</span>{<span class="s">"tech"</span>, <span class="s">"market"</span>, <span class="s">"legal"</span>}, JoinPolicy: <span class="s">"all"</span>},
+        {ID: <span class="s">"route"</span>, Type: <span class="s">"choice"</span>, Rules: []packtrail.RuleDef{
+            {When: <span class="s">"payload.risk_score &gt; 80"</span>, To: <span class="s">"escalation"</span>},
+            {Default: <span class="kw">true</span>, To: <span class="s">"synthesis"</span>},
+        }},
+        {ID: <span class="s">"synthesis"</span>,  Type: <span class="s">"task"</span>, Invoker: <span class="s">"agent"</span>, Target: <span class="s">"synthesis-agent"</span>},
+        {ID: <span class="s">"escalation"</span>, Type: <span class="s">"task"</span>, Subject: <span class="s">"tasks.escalate.{execution_id}"</span>},
+        {ID: <span class="s">"gate"</span>, Type: <span class="s">"signal"</span>, SignalName: <span class="s">"approval"</span>,
+         Timeout: 24*time.Hour, OnTimeout: <span class="s">"escalation"</span>},
+    },
+    Edges: []packtrail.EdgeDef{
+        {From: <span class="s">"triage"</span>,    To: <span class="s">"research"</span>},
+        {From: <span class="s">"research"</span>,  To: <span class="s">"join"</span>},
+        {From: <span class="s">"join"</span>,      To: <span class="s">"route"</span>},
+        {From: <span class="s">"synthesis"</span>, To: <span class="s">"gate"</span>},
+    },
+})</code></pre>
+    </div>
+    </div><!-- end left column -->
 
     <div class="graphcard reveal">
       <div class="graphcard__title">The graph it describes</div>
@@ -635,6 +675,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker; the built-in nats-task is always present</span></div>
         <div class="optlist__row"><code>WithFlowsDir(dir)</code><span>Load every *.yaml / *.yml flow definition in dir at startup</span></div>
         <div class="optlist__row"><code>WithFlow(yamlDoc)</code><span>Register a single flow from an inline YAML document</span></div>
+        <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; combinable with <code>WithFlow</code> / <code>WithFlowsDir</code></span></div>
         <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache</span></div>
         <div class="optlist__row"><code>WithReconcile(cron)</code><span>Schedule periodic reconciliation of the visibility indexes</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64)</span></div>
@@ -644,8 +685,8 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
       </div>
 
       <article class="choice-card reveal">
-        <h4>Or load flows inline</h4>
-        <p>Pass <code>WithFlow(yamlDoc)</code> multiple times to register flows programmatically — no YAML files on disk, great for tests and embedded deployments with generated pipelines.</p>
+        <h4>Or define flows in code</h4>
+        <p>Pass <code>WithFlowDef(f)</code> to register flows as Go structs — no YAML on disk, ideal for generated pipelines or programmatic flow construction. <code>WithFlow(yamlDoc)</code> covers the inline YAML case. Both can be combined freely with <code>WithFlowsDir</code>.</p>
       </article>
     </div>
   </div>
@@ -659,7 +700,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
     <p class="section__sub">
       <code>packtrail-ui</code> is a read-only web dashboard that connects to the same NATS cluster,
       reads execution state from the flow registry KV, and tails the live event stream —
-      no engine process or source YAML required.
+      no engine process or source files required.
     </p>
   </div>
 

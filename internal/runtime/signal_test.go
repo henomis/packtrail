@@ -104,7 +104,7 @@ func TestSignalIdempotent(t *testing.T) {
 	h.waitStatus(t, id, store.StatusWaiting, 5*time.Second)
 
 	d := signal.Delivery{ExecID: id, Name: "approval", Seq: 42, Payload: json.RawMessage(`{"approved":true}`)}
-	if applyErr := h.engine.applySignal(d); applyErr != nil {
+	if applyErr := h.engine.applySignal(context.Background(), d); applyErr != nil {
 		t.Fatalf("apply 1: %v", applyErr)
 	}
 
@@ -114,7 +114,7 @@ func TestSignalIdempotent(t *testing.T) {
 	}
 
 	// Redelivery of the same sequence: must be a no-op.
-	if applyErr := h.engine.applySignal(d); applyErr != nil {
+	if applyErr := h.engine.applySignal(context.Background(), d); applyErr != nil {
 		t.Fatalf("apply 2 (dup): %v", applyErr)
 	}
 

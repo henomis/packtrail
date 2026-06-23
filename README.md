@@ -3,10 +3,10 @@
 [![Build Status](https://github.com/henomis/packtrail/actions/workflows/checks.yml/badge.svg)](https://github.com/henomis/packtrail/actions/workflows/checks.yml) [![GoDoc](https://godoc.org/github.com/henomis/packtrail?status.svg)](https://godoc.org/github.com/henomis/packtrail) [![Go Report Card](https://goreportcard.com/badge/github.com/henomis/packtrail)](https://goreportcard.com/report/github.com/henomis/packtrail) [![GitHub release](https://img.shields.io/github/release/henomis/packtrail.svg)](https://github.com/henomis/packtrail/releases)
 
 A **durable, ecosystem-agnostic workflow engine** in Go, backed **only by NATS**
-(Core + JetStream + KV + Message Scheduler). Packtrail orchestrates declarative YAML
-flow graphs — `task`, `fanout`, `fanin`, `choice` and `signal` nodes — with
-crash-durable state, retries, conditional routing, external signals and
-timers/cron.
+(Core + JetStream + KV + Message Scheduler). Packtrail orchestrates declarative
+flow graphs — `task`, `fanout`, `fanin`, `choice` and `signal` nodes — defined
+either in YAML or directly as Go structs, with crash-durable state, retries,
+conditional routing, external signals and timers/cron.
 
 Packtrail's defining feature is that **node execution is pluggable**. The engine
 never speaks a wire protocol directly: every `task`/branch node runs through an
@@ -16,7 +16,7 @@ packtrail's durability machinery for free.
 
 ```mermaid
 flowchart LR
-    YAML["YAML flows"] --> Engine["Engine\n(runtime)"]
+    FLOWS["YAML flows\nor Go structs"] --> Engine["Engine\n(runtime)"]
     Engine <-->|"invoker.Invoke\n(pluggable seam)"| Invokers["Invoker(s)\nagent / http\nnats-task"]
     Invokers --> Services["your services\n(agents, APIs…)"]
     Engine -->|"CAS state / work / timers"| NATS["NATS JetStream + KV\n(the only backend)"]
@@ -38,7 +38,7 @@ to run them.
 nc, _ := nats.Connect(nats.DefaultURL)
 
 srv, _ := packtrail.New(nc,
-    packtrail.WithFlowsDir("flows"),          // directory of *.yaml flow files
+    packtrail.WithFlowsDir("flows"),           // directory of *.yaml flow files
     packtrail.WithNamespace("acme"),           // isolate from other deployments
     packtrail.WithInvoker("agent", myInvoker), // your transport
     packtrail.WithResultCache(),               // idempotent retries
@@ -67,6 +67,11 @@ request/reply on `tasks.<x>.*` — as the default transport. So:
 
 ## Flow definition
 
+Flows can be defined in YAML or as Go structs — both paths run through the same
+validation and produce identical runtime behaviour.
+
+### YAML
+
 ```yaml
 version: "1.0"
 name: agent-pipeline
@@ -87,10 +92,40 @@ edges:
   - {from: general-agent, to: notify}
 ```
 
-- `invoker:` selects a registered Invoker kind (default `nats-task`).
-- `target:` is interpreted by that Invoker (an agent name, a URL, …); `subject:`
-  is the nats-task alias. `{execution_id}` is substituted at dispatch.
-- `retry.backoff` accepts `exponential`, `linear`, or `fixed` (default).
+### Go structs
+
+The same flow as a `FlowDef`, useful when flows are constructed programmatically:
+
+```go
+packtrail.WithFlowDef(packtrail.FlowDef{
+    Name: "agent-pipeline",
+    Nodes: []packtrail.NodeDef{
+        {ID: "triage", Type: "task", Invoker: "agent", Target: "triage-agent",
+         Timeout: 2 * time.Minute, Retry: &packtrail.RetryPolicy{MaxAttempts: 3, Backoff: "exponential"}},
+        {ID: "route", Type: "choice", Rules: []packtrail.RuleDef{
+            {When: `payload.category == "billing"`, To: "billing-agent"},
+            {Default: true, To: "general-agent"},
+        }},
+        {ID: "billing-agent", Type: "task", Invoker: "agent", Target: "billing-agent"},
+        {ID: "general-agent", Type: "task", Invoker: "agent", Target: "general-agent"},
+        {ID: "notify", Type: "task", Subject: "tasks.notify.{execution_id}"},
+    },
+    Edges: []packtrail.EdgeDef{
+        {From: "triage", To: "route"},
+        {From: "billing-agent", To: "notify"},
+        {From: "general-agent", To: "notify"},
+    },
+})
+```
+
+`WithFlowDef` may be combined freely with `WithFlow` and `WithFlowsDir`; duplicate
+flow names across any source are rejected at startup.
+
+- `invoker:` / `Invoker` selects a registered Invoker kind (default `nats-task`).
+- `target:` / `Target` is interpreted by that Invoker (an agent name, a URL, …);
+  `subject:` / `Subject` is the nats-task alias. `{execution_id}` is substituted
+  at dispatch.
+- `retry.backoff` / `Retry.Backoff` accepts `exponential`, `linear`, or `fixed` (default).
 
 ## Node types
 
@@ -266,6 +301,7 @@ twice (LLM calls, writes, e-mails). See [`invoker/cache.go`](invoker/cache.go).
 | `WithNamespace(prefix)` | `"packtrail"` | Prefix for every NATS resource; isolates deployments on a shared cluster |
 | `WithFlowsDir(dir)` | — | Load all `*.yaml`/`*.yml` files in dir |
 | `WithFlow(yamlDoc)` | — | Register a single flow from an inline YAML document; may be called multiple times |
+| `WithFlowDef(f)` | — | Register a single flow from a `FlowDef` Go struct; may be combined with `WithFlow`/`WithFlowsDir` |
 | `WithInvoker(kind, inv)` | — | Register an Invoker under kind; overrides the built-in `"nats-task"` if reused |
 | `WithResultCache()` | disabled | Cache invocation results by `(execution, node, attempt)` for idempotent retries |
 | `WithReconcile(cronExpr)` | — | Schedule periodic visibility reconciliation (6-field cron) |

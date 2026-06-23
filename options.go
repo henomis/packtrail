@@ -27,6 +27,7 @@ type config struct {
 	prefix        string
 	flowsDir      string
 	flowDocs      [][]byte
+	flowDefs      []FlowDef
 	reconcileCron string
 	invokers      map[string]invoker.Invoker
 	resultCache   bool
@@ -49,6 +50,12 @@ func WithFlowsDir(dir string) Option { return func(c *config) { c.flowsDir = dir
 // multiple times.
 func WithFlow(yamlDoc []byte) Option {
 	return func(c *config) { c.flowDocs = append(c.flowDocs, yamlDoc) }
+}
+
+// WithFlowDef registers a single flow from a Go struct. It may be passed
+// multiple times and combined with WithFlow / WithFlowsDir.
+func WithFlowDef(f FlowDef) Option {
+	return func(c *config) { c.flowDefs = append(c.flowDefs, f) }
 }
 
 // WithInvoker registers an Invoker under kind, the value a flow node selects via

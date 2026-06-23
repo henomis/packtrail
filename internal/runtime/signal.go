@@ -52,7 +52,7 @@ func (e *Engine) stepSignal(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 		return err
 	}
 
-	_ = e.store.EmitEvent(ctx, updated)
+	e.emitEvent(ctx, updated)
 
 	if node.Timeout.D() > 0 {
 		item, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindWaitTimeout, Node: node.ID, Signal: name})
@@ -69,15 +69,10 @@ func (e *Engine) stepSignal(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 // applySignal is the signal-consumer callback. It records the signal
 // idempotently (by stream sequence) and, if the execution is waiting on it,
 // advances. State is always persisted via CAS before the message is acked.
-func (e *Engine) applySignal(d signal.Delivery) error {
-	ctx := context.Background()
-
-	var duplicate bool
-
+func (e *Engine) applySignal(ctx context.Context, d signal.Delivery) error {
 	updated, err := e.store.Mutate(ctx, d.ExecID, func(ex *store.Execution) error {
 		if ex.LastSeq != nil && ex.LastSeq[d.Name] >= d.Seq {
-			duplicate = true
-			return errSkip
+			return errSkip // duplicate: already applied at >= this sequence
 		}
 
 		if ex.LastSeq == nil {
@@ -100,8 +95,6 @@ func (e *Engine) applySignal(d signal.Delivery) error {
 
 		return err
 	}
-
-	_ = duplicate
 
 	// If the execution is waiting on this signal at a signal node, advance.
 	if updated.Status == store.StatusWaiting && updated.WaitSignal == d.Name {
@@ -154,14 +147,11 @@ func (e *Engine) transitionFromSignal(ctx context.Context, flow *dsl.Flow, execI
 func (e *Engine) guardedAdvance(
 	ctx context.Context, execID, signalNodeID, name, nextNode string, mergeSignal bool,
 ) error {
-	changed := false
-
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if ex.Status != store.StatusWaiting || ex.CurrentNode != signalNodeID || ex.WaitSignal != name {
 			return errSkip // guard failed: leave unchanged
 		}
 
-		changed = true
 		ex.WaitSignal = ""
 
 		ex.Attempt = 0
@@ -191,11 +181,7 @@ func (e *Engine) guardedAdvance(
 		return err
 	}
 
-	if !changed {
-		return nil
-	}
-
-	_ = e.store.EmitEvent(ctx, updated)
+	e.emitEvent(ctx, updated)
 
 	if nextNode == "" {
 		return nil

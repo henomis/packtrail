@@ -39,6 +39,7 @@ func TestConsumeHandlerErrorRedelivers(t *testing.T) {
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded // fail first delivery
 		}
+
 		close(done)
 
 		return nil
@@ -46,6 +47,7 @@ func TestConsumeHandlerErrorRedelivers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
+
 	t.Cleanup(cc.Stop)
 
 	if err = sigs.Publish(ctx, "exec-r", "go", []byte("1")); err != nil {

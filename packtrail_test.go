@@ -59,9 +59,12 @@ func TestWithFlowDefEndToEnd(t *testing.T) {
 
 	custom := packtrail.InvokerFunc(func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
 		mu.Lock()
+
 		seen = append(seen, req.Target)
 		mu.Unlock()
+
 		out, _ := json.Marshal(map[string]string{"last": req.Target}) //nolint:errchkjson
+
 		return packtrail.Result{Status: packtrail.StatusOK, Payload: out}, nil
 	})
 
@@ -130,6 +133,7 @@ func TestCustomInvokerEndToEnd(t *testing.T) {
 
 	custom := packtrail.InvokerFunc(func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
 		mu.Lock()
+
 		seen = append(seen, req.Target)
 		mu.Unlock()
 		// Echo the target into the shared payload to prove threading works.

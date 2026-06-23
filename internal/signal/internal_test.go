@@ -70,6 +70,7 @@ func TestConsumeBadSubjectTermed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
+
 	t.Cleanup(cc.Stop)
 
 	// A subject under the filter prefix but without the "exec.name" structure

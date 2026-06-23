@@ -25,6 +25,7 @@ func TestInvokerKind(t *testing.T) {
 	if got := (&Node{}).InvokerKind(); got != DefaultInvoker {
 		t.Errorf("default InvokerKind = %q, want %q", got, DefaultInvoker)
 	}
+
 	if got := (&Node{Invoker: "agent"}).InvokerKind(); got != "agent" {
 		t.Errorf("explicit InvokerKind = %q, want agent", got)
 	}
@@ -34,9 +35,11 @@ func TestInvokeTarget(t *testing.T) {
 	if got := (&Node{Target: "t", Subject: "s"}).InvokeTarget(); got != "t" {
 		t.Errorf("InvokeTarget with Target = %q, want t (Target wins)", got)
 	}
+
 	if got := (&Node{Subject: "s"}).InvokeTarget(); got != "s" {
 		t.Errorf("InvokeTarget with only Subject = %q, want s", got)
 	}
+
 	if got := (&Node{}).InvokeTarget(); got != "" {
 		t.Errorf("InvokeTarget with neither = %q, want empty", got)
 	}
@@ -63,6 +66,7 @@ nodes:
 	if err != nil {
 		t.Fatalf("parse valid duration: %v", err)
 	}
+
 	if got := f.Node("a").Timeout.D(); got != 30*time.Second {
 		t.Errorf("timeout = %v, want 30s", got)
 	}
@@ -76,6 +80,7 @@ nodes:
 	if err != nil {
 		t.Fatalf("parse empty duration: %v", err)
 	}
+
 	if got := f.Node("a").Timeout.D(); got != 0 {
 		t.Errorf("empty timeout = %v, want 0", got)
 	}
@@ -107,6 +112,7 @@ func TestParseInvalidYAML(t *testing.T) {
 
 func TestParseFile(t *testing.T) {
 	dir := t.TempDir()
+
 	good := filepath.Join(dir, "good.yaml")
 	if err := os.WriteFile(good, []byte("name: f\nnodes:\n  - {id: a, type: task, subject: s}\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -126,6 +132,7 @@ func TestParseFile(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("name: f\nnodes: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := ParseFile(bad); err == nil {
 		t.Fatal("ParseFile(bad) succeeded, want error")
 	}
@@ -138,9 +145,11 @@ func TestLoadDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte("name: alpha\nnodes:\n  - {id: a, type: task, subject: s}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignore me"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +158,7 @@ func TestLoadDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDir: %v", err)
 	}
+
 	if len(flows) != 1 || flows["alpha"] == nil {
 		t.Fatalf("LoadDir = %v, want only [alpha]", flows)
 	}
@@ -172,10 +182,12 @@ func TestLoadDirInvalidFile(t *testing.T) {
 
 func TestLoadDirDuplicateName(t *testing.T) {
 	dir := t.TempDir()
+
 	flow := "name: same\nnodes:\n  - {id: a, type: task, subject: s}\n"
 	if err := os.WriteFile(filepath.Join(dir, "one.yaml"), []byte(flow), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(filepath.Join(dir, "two.yaml"), []byte(flow), 0o600); err != nil {
 		t.Fatal(err)
 	}

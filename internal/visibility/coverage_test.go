@@ -89,6 +89,7 @@ func TestListEventsByPrefixSkipsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("by flow events: %v", err)
 	}
+
 	if len(evs) != 0 {
 		t.Fatalf("corrupt entry was not skipped: %v", evs)
 	}

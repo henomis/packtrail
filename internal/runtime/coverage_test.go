@@ -57,6 +57,7 @@ func TestScheduleReconcileFires(t *testing.T) {
 	h := newHarness(t, linearFlow, Config{})
 
 	fired := make(chan struct{}, 1)
+
 	h.engine.OnReconcile(func(context.Context) error {
 		select {
 		case fired <- struct{}{}:
@@ -162,6 +163,7 @@ func TestAsyncBranchError(t *testing.T) {
 		invoker.Result{Status: invoker.StatusError, Error: "branch boom"}); completeErr != nil {
 		t.Fatalf("complete x: %v", completeErr)
 	}
+
 	waitBranch(t, h, id, "x", store.BranchFailed)
 
 	// Settle the other branch OK; the "all" join is unmet → execution fails.

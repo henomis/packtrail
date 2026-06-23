@@ -24,6 +24,7 @@ func TestNewEmptyPrefixFallsBackToDefault(t *testing.T) {
 	if got := New(""); got != New(Default) {
 		t.Fatalf("New(\"\") = %+v, want same as New(%q)", got, Default)
 	}
+
 	if New("").Prefix != Default {
 		t.Errorf("Prefix = %q, want %q", New("").Prefix, Default)
 	}
@@ -65,6 +66,7 @@ func TestNewDefaultValues(t *testing.T) {
 
 func TestNewCustomPrefixAppliedEverywhere(t *testing.T) {
 	const prefix = "myapp"
+
 	n := New(prefix)
 
 	if n.Prefix != prefix {
@@ -72,6 +74,7 @@ func TestNewCustomPrefixAppliedEverywhere(t *testing.T) {
 	}
 
 	v := reflect.ValueOf(n)
+
 	tp := v.Type()
 	for i := 0; i < v.NumField(); i++ {
 		val := v.Field(i).String()
@@ -87,15 +90,18 @@ func TestNewNamesAreUnique(t *testing.T) {
 	v := reflect.ValueOf(n)
 	tp := v.Type()
 	seen := make(map[string]string)
+
 	for i := 0; i < v.NumField(); i++ {
 		name := tp.Field(i).Name
 		if name == "Prefix" {
 			continue
 		}
+
 		val := v.Field(i).String()
 		if prev, dup := seen[val]; dup {
 			t.Errorf("duplicate resource name %q used by both %s and %s", val, prev, name)
 		}
+
 		seen[val] = name
 	}
 }

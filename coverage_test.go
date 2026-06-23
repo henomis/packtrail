@@ -191,6 +191,7 @@ func TestListFlowsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFlows: %v", err)
 	}
+
 	if len(names) != 0 {
 		t.Fatalf("ListFlows = %v, want empty", names)
 	}
@@ -207,6 +208,7 @@ nodes:
 edges:
   - {from: gate, to: done}
 `
+
 	srv := natstest.Start(t)
 
 	s, err := packtrail.New(srv.NC,

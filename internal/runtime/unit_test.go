@@ -41,9 +41,11 @@ func TestRetryReason(t *testing.T) {
 	if got := retryReason(invoker.Result{}, errors.New("transport")); got != "transport" {
 		t.Errorf("retryReason(callErr) = %q, want transport", got)
 	}
+
 	if got := retryReason(invoker.Result{Error: "explicit"}, nil); got != "explicit" {
 		t.Errorf("retryReason(res.Error) = %q, want explicit", got)
 	}
+
 	if got := retryReason(invoker.Result{}, nil); got != "retry requested" {
 		t.Errorf("retryReason(empty) = %q, want 'retry requested'", got)
 	}

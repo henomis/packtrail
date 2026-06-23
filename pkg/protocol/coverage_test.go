@@ -38,6 +38,7 @@ func TestServeAppliesDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serve: %v", err)
 	}
+
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 
 	resp := request(t, srv, "tasks.deadline.x", protocol.TaskRequest{
@@ -47,6 +48,7 @@ func TestServeAppliesDeadline(t *testing.T) {
 	if resp.Status != protocol.StatusOK {
 		t.Fatalf("status = %q, want ok", resp.Status)
 	}
+
 	if !hasDeadline {
 		t.Fatal("handler context had no deadline despite a non-zero request deadline")
 	}
@@ -65,12 +67,14 @@ func TestReplyMarshalFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serve: %v", err)
 	}
+
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 
 	resp := request(t, srv, "tasks.badresp.x", protocol.TaskRequest{ExecutionID: "exec-b"})
 	if resp.Status != protocol.StatusError {
 		t.Fatalf("status = %q, want error (marshal fallback)", resp.Status)
 	}
+
 	if resp.Error == "" {
 		t.Fatal("fallback response carried no error message")
 	}

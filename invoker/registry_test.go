@@ -43,6 +43,7 @@ func TestRegistryHasAndInvoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invoke: %v", err)
 	}
+
 	if res.Status != invoker.StatusOK || string(res.Payload) != `{"k":1}` {
 		t.Fatalf("unexpected result: %+v", res)
 	}
@@ -55,6 +56,7 @@ func TestRegistryUnknownKind(t *testing.T) {
 	if err == nil {
 		t.Fatal("Invoke on unregistered kind succeeded, want error")
 	}
+
 	if !strings.Contains(err.Error(), "missing") {
 		t.Errorf("error %q does not name the missing kind", err)
 	}
@@ -76,6 +78,7 @@ func TestRegistryRegisterReplaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invoke: %v", err)
 	}
+
 	if res.Status != invoker.StatusOK {
 		t.Fatalf("Register did not replace: got %+v", res)
 	}

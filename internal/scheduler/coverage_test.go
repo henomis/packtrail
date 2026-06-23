@@ -39,6 +39,7 @@ func TestCronFires(t *testing.T) {
 		if f.key != "exec-cron" {
 			t.Fatalf("key = %q, want exec-cron", f.key)
 		}
+
 		if string(f.payload) != "beat" {
 			t.Fatalf("payload = %q, want beat", f.payload)
 		}
@@ -68,6 +69,7 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded
 		}
+
 		close(done)
 
 		return nil
@@ -75,6 +77,7 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("consume fired: %v", err)
 	}
+
 	t.Cleanup(cc.Stop)
 
 	if err := sched.After(ctx, "exec-err", time.Second, []byte("x")); err != nil {

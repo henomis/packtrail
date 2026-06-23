@@ -35,12 +35,15 @@ func TestAccessors(t *testing.T) {
 	if s.JS() == nil {
 		t.Error("JS() returned nil")
 	}
+
 	if s.Names() != names.New("") {
 		t.Errorf("Names() = %+v, want default", s.Names())
 	}
+
 	if s.IdxStatus() == nil {
 		t.Error("IdxStatus() returned nil")
 	}
+
 	if s.IdxFlow() == nil {
 		t.Error("IdxFlow() returned nil")
 	}
@@ -144,6 +147,7 @@ func TestEmitEvent(t *testing.T) {
 		got.Node != "n1" || got.Error != "kaboom" || got.Revision != 7 {
 		t.Fatalf("event mismatch: %+v", got)
 	}
+
 	if got.Time.IsZero() {
 		t.Error("event Time not set")
 	}
@@ -158,6 +162,7 @@ func TestListExecutionKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty list: %v", err)
 	}
+
 	if len(keys) != 0 {
 		t.Fatalf("empty list = %v, want none", keys)
 	}
@@ -172,7 +177,9 @@ func TestListExecutionKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
+
 	sort.Strings(keys)
+
 	if len(keys) != 3 || keys[0] != "a" || keys[1] != "b" || keys[2] != "c" {
 		t.Fatalf("keys = %v, want [a b c]", keys)
 	}
@@ -185,6 +192,7 @@ func TestCasBackoff(t *testing.T) {
 		if d <= 0 {
 			t.Errorf("casBackoff(%d) = %v, want > 0", attempt, d)
 		}
+
 		if d > casBackoffCap {
 			t.Errorf("casBackoff(%d) = %v, exceeds cap %v", attempt, d, casBackoffCap)
 		}
@@ -195,6 +203,7 @@ func TestIsWrongLastSeq(t *testing.T) {
 	if isWrongLastSeq(nil) {
 		t.Error("isWrongLastSeq(nil) = true, want false")
 	}
+
 	if isWrongLastSeq(errors.New("plain")) {
 		t.Error("isWrongLastSeq(plain) = true, want false")
 	}
@@ -220,6 +229,7 @@ func TestAcquireLeaseContendedTakeover(t *testing.T) {
 	if ok, _ := s.AcquireLease(ctx, "e", "old", time.Millisecond); !ok {
 		t.Fatal("seed acquire")
 	}
+
 	time.Sleep(20 * time.Millisecond)
 
 	const contenders = 8
@@ -235,11 +245,14 @@ func TestAcquireLeaseContendedTakeover(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+
 			<-start
+
 			ok, err := s.AcquireLease(ctx, "e", string(rune('A'+i)), 30*time.Second)
 			if err != nil {
 				t.Errorf("contender %d: %v", i, err)
 			}
+
 			if ok {
 				mu.Lock()
 				wins++
@@ -285,21 +298,27 @@ func TestOperationsContextError(t *testing.T) {
 	if _, err := s.Get(ctx, "x"); err == nil {
 		t.Error("Get with cancelled context: want error")
 	}
+
 	if _, err := s.Create(ctx, &Execution{ID: "y", Status: StatusRunning, Payload: json.RawMessage(`{}`)}); err == nil {
 		t.Error("Create with cancelled context: want error")
 	}
+
 	if _, err := s.Mutate(ctx, "x", func(*Execution) error { return nil }); err == nil {
 		t.Error("Mutate with cancelled context: want error")
 	}
+
 	if err := s.EmitEvent(ctx, &Execution{ID: "x"}); err == nil {
 		t.Error("EmitEvent with cancelled context: want error")
 	}
+
 	if _, err := s.ListExecutionKeys(ctx); err == nil {
 		t.Error("ListExecutionKeys with cancelled context: want error")
 	}
+
 	if _, err := s.AcquireLease(ctx, "x", "inst", time.Second); err == nil {
 		t.Error("AcquireLease with cancelled context: want error")
 	}
+
 	if err := s.ReleaseLease(ctx, "x", "inst"); err == nil {
 		t.Error("ReleaseLease with cancelled context: want error")
 	}

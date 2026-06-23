@@ -24,6 +24,13 @@ import (
 	"github.com/henomis/packtrail/invoker"
 )
 
+const (
+	retryRequestedMessage  = "retry requested"
+	backoffKindFixed       = "fixed"
+	backoffKindExponential = "exponential"
+	backoffKindLinear      = "linear"
+)
+
 // invoke executes a single task/branch node through the configured Invoker. It
 // applies the node timeout as the call deadline (both as a ctx deadline and in
 // the request), so individual Invokers do not have to.
@@ -162,13 +169,13 @@ func retryReason(res invoker.Result, callErr error) string {
 		return res.Error
 	}
 
-	return "retry requested"
+	return retryRequestedMessage
 }
 
 // backoff returns the delay before the next attempt. attempt is the number of
 // attempts already made (1-based after the first failure).
 func backoff(node *dsl.Node, attempt int, base, maxDelay time.Duration) time.Duration {
-	kind := "fixed"
+	kind := backoffKindFixed
 	if node.Retry != nil && node.Retry.Backoff != "" {
 		kind = node.Retry.Backoff
 	}
@@ -176,9 +183,9 @@ func backoff(node *dsl.Node, attempt int, base, maxDelay time.Duration) time.Dur
 	var d time.Duration
 
 	switch kind {
-	case "exponential":
+	case backoffKindExponential:
 		d = base << (attempt - 1) // attempt>=1
-	case "linear":
+	case backoffKindLinear:
 		d = base * time.Duration(attempt)
 	default: // fixed
 		d = base

@@ -53,8 +53,8 @@ func TestRetryReason(t *testing.T) {
 
 func TestBackoff(t *testing.T) {
 	const (
-		base = 100 * time.Millisecond
-		cap  = 10 * time.Second
+		base     = 100 * time.Millisecond
+		maxDelay = 10 * time.Second
 	)
 
 	cases := []struct {
@@ -69,19 +69,19 @@ func TestBackoff(t *testing.T) {
 		{"linear attempt 3", "linear", 3, 3 * base},
 		{"exponential attempt 1", "exponential", 1, base},
 		{"exponential attempt 4", "exponential", 4, base << 3},
-		{"capped at max", "exponential", 30, cap}, // 100ms<<29 overflows past cap
+		{"capped at max", "exponential", 30, maxDelay}, // 100ms<<29 overflows past cap
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			node := &dsl.Node{Retry: &dsl.RetryPolicy{Backoff: c.kind}}
-			if got := backoff(node, c.attempt, base, cap); got != c.want {
+			if got := backoff(node, c.attempt, base, maxDelay); got != c.want {
 				t.Errorf("backoff(%s, %d) = %v, want %v", c.kind, c.attempt, got, c.want)
 			}
 		})
 	}
 
 	// A node with no retry policy uses the fixed default.
-	if got := backoff(&dsl.Node{}, 1, base, cap); got != base {
+	if got := backoff(&dsl.Node{}, 1, base, maxDelay); got != base {
 		t.Errorf("backoff(no policy) = %v, want %v", got, base)
 	}
 }

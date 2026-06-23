@@ -80,8 +80,8 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 
 	t.Cleanup(cc.Stop)
 
-	if err := sched.After(ctx, "exec-err", time.Second, []byte("x")); err != nil {
-		t.Fatalf("after: %v", err)
+	if afterErr := sched.After(ctx, "exec-err", time.Second, []byte("x")); afterErr != nil {
+		t.Fatalf("after: %v", afterErr)
 	}
 
 	select {

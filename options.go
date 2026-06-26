@@ -18,10 +18,20 @@ import (
 	"time"
 
 	"github.com/henomis/packtrail/invoker"
+	"github.com/henomis/packtrail/invoker/asyncqueue"
 )
 
 // Option configures a Server. Pass options to New.
 type Option func(*config)
+
+// asyncInvoker records an async invoker kind registered via WithAsyncInvoker:
+// New ensures its work-queue stream and registers the Dispatcher; Run hosts a
+// Worker that executes exec and settles results via the Server.
+type asyncInvoker struct {
+	kind string
+	exec invoker.Invoker
+	opts []asyncqueue.Option
+}
 
 type config struct {
 	prefix        string
@@ -30,6 +40,7 @@ type config struct {
 	flowDefs      []FlowDef
 	reconcileCron string
 	invokers      map[string]invoker.Invoker
+	asyncInvokers []asyncInvoker
 	resultCache   bool
 
 	ownerID        string
@@ -68,6 +79,21 @@ func WithInvoker(kind string, inv invoker.Invoker) Option {
 		}
 
 		c.invokers[kind] = inv
+	}
+}
+
+// WithAsyncInvoker registers an asynchronous Invoker under kind. Unlike
+// WithInvoker, exec does not run on the engine's critical path: a flow node
+// selecting this kind is dispatched to a durable JetStream work-queue (the
+// engine parks the execution) and exec is run later by an in-process worker,
+// with at-least-once delivery. Use it for slow nodes — an agent call, an HTTP
+// request — so they never hold an engine slot. exec is an ordinary synchronous
+// Invoker returning StatusOK/StatusError/StatusRetry; the durability, retries
+// and completion are handled for you. opts tune the worker and its stream (see
+// the asyncqueue package). It may be passed multiple times for distinct kinds.
+func WithAsyncInvoker(kind string, exec invoker.Invoker, opts ...asyncqueue.Option) Option {
+	return func(c *config) {
+		c.asyncInvokers = append(c.asyncInvokers, asyncInvoker{kind: kind, exec: exec, opts: opts})
 	}
 }
 

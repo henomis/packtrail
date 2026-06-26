@@ -65,6 +65,10 @@ request/reply on `tasks.<x>.*` — as the default transport. So:
 - The core has **no dependency on any agent framework** (enforced by
   `internal/acceptance`), so it stays reusable by any project.
 
+For slow nodes there is also the built-in **`invoker/asyncqueue`** package, which
+makes any ordinary Invoker durable and asynchronous — see
+[Async activities](#async-activities-long-running-work).
+
 ## Flow definition
 
 Flows can be defined in YAML or as Go structs — both paths run through the same
@@ -221,13 +225,49 @@ An Invoker normally returns a terminal status (`StatusOK`/`Error`/`Retry`) and
 the engine settles the node synchronously. For long-running work (an agent call,
 a remote job) an Invoker can instead return **`StatusPending`**: the engine parks
 the execution as `waiting` and frees its work slot immediately, without blocking.
+The activity is settled later via `Server.CompleteActivity(ctx, execID, node,
+attempt, result)` — OK to advance, Error to fail, Retry to re-dispatch per the
+node policy. It is idempotent and stale-safe (keyed by node + attempt, and robust
+to a completion that arrives before the task has finished parking), so an
+at-least-once worker can call it freely. This works for plain task nodes and
+fan-out branches alike.
 
-The worker that eventually finishes the activity calls
-`Server.CompleteActivity(ctx, execID, node, attempt, result)` to settle it — OK
-to advance, Error to fail, Retry to re-dispatch per the node policy. It is
-idempotent and stale-safe (keyed by node + attempt, and robust to a completion
-that arrives before the task has finished parking), so an at-least-once worker
-can call it freely. This works for plain task nodes and fan-out branches alike.
+### The built-in async invoker (recommended)
+
+You rarely need to wire that plumbing by hand. The **`invoker/asyncqueue`**
+package turns any *ordinary synchronous* Invoker into a durable asynchronous one:
+register it with `WithAsyncInvoker` and packtrail dispatches matching nodes to a
+JetStream work-queue (returning `StatusPending` for you), runs your Invoker on an
+in-process worker pool off the engine's critical path, and settles the result via
+`CompleteActivity` — with at-least-once delivery, dispatch dedup, ack-extending
+heartbeats and crash redelivery all handled for you.
+
+```go
+// Your slow work is just a normal Invoker — no queue/ack/heartbeat code.
+exec := packtrail.InvokerFunc(func(ctx context.Context, req packtrail.Request) (packtrail.Result, error) {
+    out, err := callSlowService(ctx, req.Target, req.Payload) // an agent, an API, …
+    if err != nil {
+        return packtrail.Result{}, err // transient → retried per the node policy
+    }
+    return packtrail.Result{Status: packtrail.StatusOK, Payload: out}, nil
+})
+
+srv, _ := packtrail.New(nc,
+    packtrail.WithAsyncInvoker("agent", exec,
+        asyncqueue.WithConcurrency(64)), // tune the worker (optional)
+    // … plus flows whose nodes select `invoker: agent`
+)
+```
+
+Each kind gets its own work-queue stream, so many workers — in or out of process —
+can share it to scale horizontally; the low-level `asyncqueue.Dispatcher` and
+`asyncqueue.Worker` are exported for out-of-process workers.
+
+### Doing it by hand
+
+For a bespoke transport you can implement the two halves yourself: return
+`StatusPending` from your Invoker after enqueuing a durable job, and call
+`CompleteActivity` from the worker that runs it.
 
 ```go
 // dispatch (non-blocking): enqueue a durable job, return pending
@@ -303,6 +343,7 @@ twice (LLM calls, writes, e-mails). See [`invoker/cache.go`](invoker/cache.go).
 | `WithFlow(yamlDoc)` | — | Register a single flow from an inline YAML document; may be called multiple times |
 | `WithFlowDef(f)` | — | Register a single flow from a `FlowDef` Go struct; may be combined with `WithFlow`/`WithFlowsDir` |
 | `WithInvoker(kind, inv)` | — | Register an Invoker under kind; overrides the built-in `"nats-task"` if reused |
+| `WithAsyncInvoker(kind, exec, opts…)` | — | Register an async Invoker under kind: nodes dispatch to a durable work-queue and `exec` runs on a hosted worker pool (see `invoker/asyncqueue`) |
 | `WithResultCache()` | disabled | Cache invocation results by `(execution, node, attempt)` for idempotent retries |
 | `WithReconcile(cronExpr)` | — | Schedule periodic visibility reconciliation (6-field cron) |
 | `WithOwnerID(id)` | random | Stable per-instance lease owner id |

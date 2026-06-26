@@ -40,6 +40,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ import (
 	"github.com/henomis/packtrail/internal/store"
 	"github.com/henomis/packtrail/internal/visibility"
 	"github.com/henomis/packtrail/invoker"
+	"github.com/henomis/packtrail/invoker/asyncqueue"
 	"github.com/henomis/packtrail/invoker/natstask"
 	"github.com/henomis/packtrail/pkg/protocol"
 )
@@ -128,6 +130,7 @@ type Server struct {
 	flows         []string
 	flowsKV       jetstream.KeyValue
 	reconcileCron string
+	asyncInvokers []asyncInvoker
 
 	mu   sync.Mutex
 	subs []*nats.Subscription
@@ -173,6 +176,16 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 
 	for kind, inv := range c.invokers {
 		reg.Register(kind, inv)
+	}
+
+	// Async invokers: ensure each kind's work-queue stream and register its
+	// Dispatcher (the parking side). The Worker (execution side) is started by Run.
+	for _, ai := range c.asyncInvokers {
+		if err = asyncqueue.EnsureStream(ctx, js, n.Prefix, ai.kind, ai.opts...); err != nil {
+			return nil, err
+		}
+
+		reg.Register(ai.kind, asyncqueue.NewDispatcher(js, n.Prefix, ai.kind))
 	}
 
 	var inv invoker.Invoker = reg
@@ -230,6 +243,7 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		flows:         flowNames(flows),
 		flowsKV:       flowsKV,
 		reconcileCron: c.reconcileCron,
+		asyncInvokers: c.asyncInvokers,
 	}, nil
 }
 
@@ -338,6 +352,29 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
+
+	// Host an in-process worker for each async invoker kind. Each consumes its
+	// kind's work-queue and settles results via this Server. They stop when ctx
+	// is cancelled (i.e. when engine.Run returns below).
+	var wg sync.WaitGroup
+
+	js := s.store.JS()
+
+	for _, ai := range s.asyncInvokers {
+		w := asyncqueue.NewWorker(js, s.prefix, ai.kind, ai.exec, s, ai.opts...)
+
+		wg.Add(1)
+
+		go func(w *asyncqueue.Worker, kind string) {
+			defer wg.Done()
+
+			if runErr := w.Run(ctx); runErr != nil && ctx.Err() == nil {
+				slog.Error("asyncqueue worker stopped unexpectedly", "kind", kind, "err", runErr)
+			}
+		}(w, ai.kind)
+	}
+
+	defer wg.Wait()
 	defer s.Close()
 
 	return s.engine.Run(ctx)

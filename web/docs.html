@@ -543,12 +543,39 @@ srv.<span class="fn">Handle</span>(<span class="s">"tasks.notify.*"</span>, <spa
         Long-running work (an agent call, a human task, an external job) should not hold a work slot. An
         Invoker that returns <code>StatusPending</code> parks the execution in the <code>waiting</code>
         state and frees the slot immediately — a single instance can have thousands of inflight async
-        activities. The external worker settles it later with <code>CompleteActivity</code>.
+        activities. The activity is settled later with <code>CompleteActivity</code>.
+      </p>
+      <p>
+        You rarely wire that by hand. The built-in <code>invoker/asyncqueue</code> package turns any
+        <em>ordinary synchronous</em> Invoker into a durable async one: register it with
+        <code>WithAsyncInvoker</code> and packtrail dispatches matching nodes to a JetStream work-queue,
+        runs your Invoker on a hosted worker pool, and settles via <code>CompleteActivity</code> — with
+        at-least-once delivery, dispatch dedup and ack-extending heartbeats handled for you.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
           <span class="codecard__dots"><i></i><i></i><i></i></span>
-          <span class="codecard__name">dispatch then settle</span>
+          <span class="codecard__name">recommended: WithAsyncInvoker</span>
+          <button class="copy" data-copy="#async-rec">Copy</button>
+        </div>
+<pre class="codecard__body" id="async-rec"><code><span class="cm">// Your slow work is just a normal Invoker — no queue or ack code.</span>
+exec := packtrail.<span class="fn">InvokerFunc</span>(<span class="kw">func</span>(ctx context.Context, req packtrail.Request) (packtrail.Result, <span class="kw">error</span>) {
+    out, err := <span class="fn">callSlowService</span>(ctx, req.Target, req.Payload)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return</span> packtrail.Result{}, err <span class="cm">// transient → retried per node policy</span>
+    }
+    <span class="kw">return</span> packtrail.Result{Status: packtrail.<span class="ok">StatusOK</span>, Payload: out}, <span class="kw">nil</span>
+})
+
+srv, _ := packtrail.<span class="fn">New</span>(nc,
+    packtrail.<span class="fn">WithAsyncInvoker</span>("agent", exec, asyncqueue.<span class="fn">WithConcurrency</span>(64)),
+)</code></pre>
+      </div>
+      <p>The mechanism the package is built on — implement it yourself only for a bespoke transport:</p>
+      <div class="codecard">
+        <div class="codecard__bar">
+          <span class="codecard__dots"><i></i><i></i><i></i></span>
+          <span class="codecard__name">by hand: dispatch then settle</span>
           <button class="copy" data-copy="#async-src">Copy</button>
         </div>
 <pre class="codecard__body" id="async-src"><code><span class="cm">// 1) dispatch: enqueue durable work, park the execution.</span>
@@ -684,6 +711,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="optlist__row"><code>WithFlow(yamlDoc)</code><span>Register a single flow from an inline YAML document; repeatable.</span></div>
         <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; repeatable, combinable with the options above.</span></div>
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker under a kind; the built-in nats-task is always present and may be overridden.</span></div>
+        <div class="optlist__row"><code>WithAsyncInvoker(kind, exec, opts…)</code><span>Register an async Invoker: nodes of this kind dispatch to a durable work-queue and <code>exec</code> runs on a hosted worker pool (see <a href="#async">async activities</a>).</span></div>
         <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache keyed by (execution, node, attempt).</span></div>
         <div class="optlist__row"><code>WithReconcile(cron)</code><span>Install a recurring visibility reconciliation on a 6-field cron expression.</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64).</span></div>

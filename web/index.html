@@ -180,7 +180,7 @@
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--task"></span>Async activities</h3>
-      <p>An Invoker can return <code>StatusPending</code> to park the execution non-blocking. A long-running worker calls <code>CompleteActivity</code> later to settle — idempotent, stale-safe.</p>
+      <p>Slow nodes never hold a work slot. The built-in <code>asyncqueue</code> invoker makes any ordinary Invoker durable and asynchronous — dispatch to a work-queue, run on a worker pool, settle via <code>CompleteActivity</code>, at-least-once. Or return <code>StatusPending</code> yourself.</p>
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--fan"></span>Cron &amp; timers</h3>
@@ -569,8 +569,10 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
     <h2>Dispatch now. Settle later.</h2>
     <p class="section__sub">
       An Invoker that returns <code>StatusPending</code> parks the execution without blocking
-      a work slot. The external worker calls <code>CompleteActivity</code> when done —
-      idempotent, stale-safe, works for task nodes and fan-out branches alike.
+      a work slot; the worker calls <code>CompleteActivity</code> when done —
+      idempotent, stale-safe, for task nodes and fan-out branches alike. The built-in
+      <code>invoker/asyncqueue</code> package does all of this for you — the manual
+      mechanism is shown here.
     </p>
   </div>
 
@@ -608,6 +610,10 @@ srv.<span class="fn">CompleteActivity</span>(ctx,
     </div>
 
     <div class="api__envelopes" style="display:flex;flex-direction:column;gap:1.1rem">
+      <article class="choice-card reveal">
+        <h4>Batteries included</h4>
+        <p>You rarely write the code on the left. <code>WithAsyncInvoker("kind", exec)</code> takes an ordinary synchronous Invoker and makes it durable and async — a JetStream work-queue, a hosted worker pool, dispatch dedup, ack-extending heartbeats and crash redelivery, all handled.</p>
+      </article>
       <article class="choice-card reveal">
         <h4>Non-blocking dispatch</h4>
         <p>The engine parks the execution as <code>waiting</code> and moves on to other work immediately. No goroutine is held, no work slot consumed — a single engine instance can have thousands of inflight async activities.</p>

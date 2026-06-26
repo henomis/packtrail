@@ -640,7 +640,8 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
       </div>
       <p>
         Periodic reconciliation of the visibility indexes uses the same cron format via
-        <a href="#options"><code>WithReconcile</code></a>.
+        <a href="#options"><code>WithReconcileActive</code></a> (in-flight executions) and
+        <a href="#options"><code>WithReconcileFull</code></a> (full scan; also runs the archive sweep).
       </p>
     </section>
 
@@ -680,7 +681,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <thead><tr><th>Method</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td>New(nc, …opts)</td><td>Build a server: bootstrap buckets/streams, register invokers, load flows. Does not start processing.</td></tr>
-          <tr><td>Run(ctx)</td><td>Start the engine, indexer and (if configured) reconcile schedule; blocks until ctx is cancelled. Drains workers on return.</td></tr>
+          <tr><td>Run(ctx)</td><td>Start the engine, indexer and (if configured) the reconcile and archival schedules; blocks until ctx is cancelled. Drains workers on return.</td></tr>
           <tr><td>Start(ctx, flow, payload)</td><td>Create a new execution and return its id.</td></tr>
           <tr><td>ScheduleFlow(ctx, name, flow, cron, payload)</td><td>Install/replace a recurring schedule that starts a flow.</td></tr>
           <tr><td>Signal(ctx, execID, name, payload)</td><td>Deliver an external signal to an execution.</td></tr>
@@ -689,8 +690,10 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> snapshot, or <code>ErrNotFound</code>.</td></tr>
           <tr><td>ByStatus(ctx, status)</td><td>Execution ids indexed under a status (eventually consistent).</td></tr>
           <tr><td>ByFlow(ctx, flow)</td><td>Execution ids belonging to a flow.</td></tr>
-          <tr><td>List(ctx)</td><td>Every execution id in the store (authoritative).</td></tr>
-          <tr><td>Reconcile(ctx)</td><td>Rebuild the visibility indexes from the source of truth.</td></tr>
+          <tr><td>ByStatusEventsLimit(ctx, status, n)</td><td>Up to <code>n</code> summary events under a status (guardrail cap; <code>ByFlowEventsLimit</code> for flows).</td></tr>
+          <tr><td>List(ctx) / ListFunc(ctx, fn)</td><td>Hot-bucket execution ids (active + recently-completed when archival is on; every execution otherwise). <code>ListFunc</code> streams them.</td></tr>
+          <tr><td>Reconcile(ctx) / ReconcileActive(ctx)</td><td>Rebuild the visibility indexes from the source of truth — full scan, or just in-flight executions.</td></tr>
+          <tr><td>ArchiveCompleted(ctx) / GCIndex(ctx)</td><td>Sweep completed executions into the cold archive; prune index entries orphaned by archive expiry. No-ops unless archival is enabled.</td></tr>
           <tr><td>Flows()</td><td>Names of the flows this server knows.</td></tr>
           <tr><td>Handle(subject, h)</td><td>Register an in-process built-in nats-task worker.</td></tr>
           <tr><td>Close()</td><td>Drain registered workers. Does not close the NATS connection.</td></tr>
@@ -713,7 +716,9 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker under a kind; the built-in nats-task is always present and may be overridden.</span></div>
         <div class="optlist__row"><code>WithAsyncInvoker(kind, exec, opts…)</code><span>Register an async Invoker: nodes of this kind dispatch to a durable work-queue and <code>exec</code> runs on a hosted worker pool (see <a href="#async">async activities</a>).</span></div>
         <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache keyed by (execution, node, attempt).</span></div>
-        <div class="optlist__row"><code>WithReconcile(cron)</code><span>Install a recurring visibility reconciliation on a 6-field cron expression.</span></div>
+        <div class="optlist__row"><code>WithReconcileActive(cron)</code><span>Schedule the cheap active-set reconcile over in-flight executions (6-field cron).</span></div>
+        <div class="optlist__row"><code>WithReconcileFull(cron)</code><span>Schedule the authoritative full reconcile; also runs the archive sweep and index GC. Keep it well below the active cadence.</span></div>
+        <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep completed executions into a cold archive bucket retained for <code>retention</code>, bounding the hot store. Runs on the full-reconcile schedule.</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64).</span></div>
         <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Invocation timeout for nodes that omit one (default 30s).</span></div>
         <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Per-execution ownership lease TTL (default 30s); a crashed instance's work frees after roughly this.</span></div>

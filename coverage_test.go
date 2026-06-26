@@ -91,7 +91,8 @@ func TestObservabilityMethods(t *testing.T) {
 		packtrail.WithLeaseTTL(15*time.Second),
 		packtrail.WithMaxConcurrency(8),
 		packtrail.WithDefaultTimeout(5*time.Second),
-		packtrail.WithReconcile("* * * * * *"),
+		packtrail.WithReconcileActive("* * * * * *"),
+		packtrail.WithReconcileFull("* * * * * *"),
 	)
 	if err != nil {
 		t.Fatalf("new: %v", err)

@@ -105,6 +105,55 @@ func TestMutateConcurrent(t *testing.T) {
 	}
 }
 
+func TestArchiveCompleted(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	mk := func(id, status string) {
+		if _, err := s.Create(ctx, &Execution{ID: id, FlowName: "f", Status: status, Payload: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+
+	mk("done", StatusCompleted)
+	mk("bust", StatusFailed)
+	mk("live", StatusRunning)
+
+	moved, err := s.ArchiveCompleted(ctx)
+	if err != nil || moved != 1 {
+		t.Fatalf("ArchiveCompleted = %d, %v; want 1, nil", moved, err)
+	}
+
+	// The completed exec left the hot bucket; failed and running stayed.
+	keys, err := s.ListExecutionKeys(ctx)
+	if err != nil {
+		t.Fatalf("keys: %v", err)
+	}
+
+	hot := map[string]bool{}
+	for _, k := range keys {
+		hot[k] = true
+	}
+
+	if hot["done"] {
+		t.Error("completed exec still in hot bucket after archive")
+	}
+
+	if !hot["bust"] || !hot["live"] {
+		t.Errorf("non-completed execs were archived: hot=%v", keys)
+	}
+
+	// The archived exec is still readable via Get's cold-store fallback.
+	got, err := s.Get(ctx, "done")
+	if err != nil || got.Status != StatusCompleted {
+		t.Fatalf("Get archived = %v, %v; want completed", got, err)
+	}
+}
+
 func TestLease(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)

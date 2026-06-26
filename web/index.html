@@ -656,7 +656,9 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
     packtrail.<span class="fn">WithNamespace</span>(<span class="s">"acme"</span>),       <span class="cm">// namespace every NATS resource</span>
     packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, myInvoker),  <span class="cm">// your transport</span>
     packtrail.<span class="fn">WithResultCache</span>(),              <span class="cm">// idempotent invocations</span>
-    packtrail.<span class="fn">WithReconcile</span>(<span class="s">"0 */5 * * * *"</span>),<span class="cm">// rebuild indexes every 5 min</span>
+    packtrail.<span class="fn">WithReconcileActive</span>(<span class="s">"0 */5 * * * *"</span>), <span class="cm">// re-index in-flight execs</span>
+    packtrail.<span class="fn">WithReconcileFull</span>(<span class="s">"0 0 * * * *"</span>),    <span class="cm">// full scan + archive sweep, hourly</span>
+    packtrail.<span class="fn">WithArchive</span>(30 * 24 * time.Hour),  <span class="cm">// archive completed execs, keep 30d</span>
 )
 
 <span class="cm">// Built-in nats-task workers live in the same binary:</span>
@@ -672,7 +674,7 @@ ex, _ := srv.<span class="fn">Get</span>(ctx, id)
 srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, <span class="s">"agent-pipeline"</span>,
     <span class="s">"0 0 2 * * *"</span>, nil)
 
-srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexer + reconcile</span></code></pre>
+srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexer + reconcile + archival</span></code></pre>
     </div>
 
     <div style="display:flex;flex-direction:column;gap:1rem">
@@ -683,7 +685,9 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
         <div class="optlist__row"><code>WithFlow(yamlDoc)</code><span>Register a single flow from an inline YAML document</span></div>
         <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; combinable with <code>WithFlow</code> / <code>WithFlowsDir</code></span></div>
         <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache</span></div>
-        <div class="optlist__row"><code>WithReconcile(cron)</code><span>Schedule periodic reconciliation of the visibility indexes</span></div>
+        <div class="optlist__row"><code>WithReconcileActive(cron)</code><span>Schedule the cheap reconcile over in-flight executions</span></div>
+        <div class="optlist__row"><code>WithReconcileFull(cron)</code><span>Schedule the full reconcile; also runs the archive sweep and index GC</span></div>
+        <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep completed executions into a cold archive bucket to bound the hot store</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64)</span></div>
         <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Timeout for nodes that omit one (default 30 s)</span></div>
         <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Ownership lease duration; failed instances release within this window</span></div>

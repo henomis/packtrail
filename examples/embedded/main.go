@@ -52,7 +52,8 @@ func main() {
 	srv, err := packtrail.New(nc,
 		packtrail.WithNamespace("acme"),
 		packtrail.WithFlowsDir("examples"),
-		packtrail.WithReconcile("0 */5 * * * *"),
+		packtrail.WithReconcileActive("0 */5 * * * *"),
+		packtrail.WithReconcileFull("0 0 * * * *"),
 	)
 	if err != nil {
 		log.Fatalf("new: %v", err)

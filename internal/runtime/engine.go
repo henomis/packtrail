@@ -57,9 +57,14 @@ const (
 	kindWaitTimeout = "wait_timeout" // a signal node's timeout fired
 )
 
-// reconcileKey is the schedule key whose firing triggers a visibility
-// reconciliation (see OnReconcile / ScheduleReconcile).
-const reconcileKey = "reconcile"
+// Reconcile schedule keys. Each firing triggers the matching visibility
+// reconciliation callback (see OnReconcileActive / OnReconcileFull). They are
+// independent durable schedules so the cheap active-set pass and the
+// authoritative full scan can run on separate cadences.
+const (
+	reconcileActiveKey = "reconcile-active"
+	reconcileFullKey   = "reconcile-full"
+)
 
 const (
 	defaultLeaseTTL      = 30 * time.Second
@@ -97,7 +102,8 @@ type Engine struct {
 	cfg      Config
 	log      *slog.Logger
 
-	onReconcile func(context.Context) error // optional visibility reconcile hook
+	onReconcileActive func(context.Context) error // optional cheap active-set reconcile hook
+	onReconcileFull   func(context.Context) error // optional authoritative full reconcile hook
 
 	sem chan struct{}
 }
@@ -252,16 +258,28 @@ func (e *Engine) ScheduleFlow(ctx context.Context, name, flowName, cronExpr stri
 	return e.sched.Cron(ctx, name, "start."+flowName, cronExpr, payload)
 }
 
-// OnReconcile registers a callback invoked when a "reconcile" schedule fires.
-// The visibility indexer's Reconcile is the intended hook. It is optional; if
-// unset, fired reconcile schedules are ignored.
-func (e *Engine) OnReconcile(fn func(context.Context) error) { e.onReconcile = fn }
+// OnReconcileActive registers the callback fired by the active-set reconcile
+// schedule (the cheap, frequent pass over in-flight executions). Optional; if
+// unset, fired active schedules are ignored.
+func (e *Engine) OnReconcileActive(fn func(context.Context) error) { e.onReconcileActive = fn }
 
-// ScheduleReconcile installs a recurring schedule that fires reconciliation on
-// the given 6-field cron expression ("sec min hour dom mon dow"), e.g.
-// "0 */5 * * * *" for every five minutes. Pair it with OnReconcile.
-func (e *Engine) ScheduleReconcile(ctx context.Context, cronExpr string) error {
-	return e.sched.Cron(ctx, reconcileKey, reconcileKey, cronExpr, nil)
+// OnReconcileFull registers the callback fired by the full reconcile schedule
+// (the authoritative deep scan). Optional; if unset, fired full schedules are
+// ignored.
+func (e *Engine) OnReconcileFull(fn func(context.Context) error) { e.onReconcileFull = fn }
+
+// ScheduleReconcileActive installs the recurring active-set reconcile schedule
+// on the given 6-field cron expression ("sec min hour dom mon dow"), e.g.
+// "0 */5 * * * *". Pair it with OnReconcileActive.
+func (e *Engine) ScheduleReconcileActive(ctx context.Context, cronExpr string) error {
+	return e.sched.Cron(ctx, reconcileActiveKey, reconcileActiveKey, cronExpr, nil)
+}
+
+// ScheduleReconcileFull installs the recurring full reconcile schedule on the
+// given 6-field cron expression, e.g. "0 0 * * * *" for hourly. Run it less
+// often than the active schedule; pair it with OnReconcileFull.
+func (e *Engine) ScheduleReconcileFull(ctx context.Context, cronExpr string) error {
+	return e.sched.Cron(ctx, reconcileFullKey, reconcileFullKey, cronExpr, nil)
 }
 
 // enqueue publishes a work item to the execution's work subject.
@@ -309,10 +327,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	// stream. The fired payload is the original work item; its subject key is
 	// the execution id.
 	fc, err := e.sched.ConsumeFired(ctx, e.names.DurFired, func(key string, payload []byte) error {
-		// A "reconcile" key triggers a visibility reconciliation.
-		if key == reconcileKey {
-			if e.onReconcile != nil {
-				return e.onReconcile(ctx)
+		// A reconcile key triggers the matching visibility reconciliation.
+		switch key {
+		case reconcileActiveKey:
+			if e.onReconcileActive != nil {
+				return e.onReconcileActive(ctx)
+			}
+
+			return nil
+		case reconcileFullKey:
+			if e.onReconcileFull != nil {
+				return e.onReconcileFull(ctx)
 			}
 
 			return nil

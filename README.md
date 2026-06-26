@@ -51,7 +51,7 @@ id, _ := srv.Start(ctx, "agent-pipeline", payload)
 srv.Signal(ctx, id, "approval", data)
 ex, _ := srv.Get(ctx, id)
 
-srv.Run(ctx) // blocks: engine + indexer + reconcile
+srv.Run(ctx) // blocks: engine + indexer + reconcile + archival
 ```
 
 ## Built-in transport
@@ -303,10 +303,22 @@ srv.ScheduleFlow(ctx, "daily-report-schedule", "daily-report", "0 0 8 * * *", ni
 
 Calling `ScheduleFlow` again with the same name replaces the existing schedule.
 
-To also run a periodic visibility reconciliation, configure it at startup:
+To also run periodic visibility reconciliation, configure it at startup. There
+are two independent, durable schedules: a cheap active-set pass over in-flight
+executions and an authoritative full scan as the deep backstop:
 
 ```go
-packtrail.WithReconcile("0 */5 * * * *") // reconcile every 5 minutes
+packtrail.WithReconcileActive("0 */5 * * * *") // in-flight execs, every 5 minutes
+packtrail.WithReconcileFull("0 0 * * * *")     // full scan, hourly
+```
+
+To keep the executions bucket (and the scans over it) bounded, enable archival.
+Completed executions are swept into a cold archive bucket on the full-reconcile
+schedule and kept for the retention window; failed executions stay hot so they
+remain resumable:
+
+```go
+packtrail.WithArchive(30 * 24 * time.Hour) // keep completed execs queryable for 30 days
 ```
 
 ## Writing an Invoker
@@ -345,7 +357,9 @@ twice (LLM calls, writes, e-mails). See [`invoker/cache.go`](invoker/cache.go).
 | `WithInvoker(kind, inv)` | — | Register an Invoker under kind; overrides the built-in `"nats-task"` if reused |
 | `WithAsyncInvoker(kind, exec, opts…)` | — | Register an async Invoker under kind: nodes dispatch to a durable work-queue and `exec` runs on a hosted worker pool (see `invoker/asyncqueue`) |
 | `WithResultCache()` | disabled | Cache invocation results by `(execution, node, attempt)` for idempotent retries |
-| `WithReconcile(cronExpr)` | — | Schedule periodic visibility reconciliation (6-field cron) |
+| `WithReconcileActive(cronExpr)` | — | Schedule the cheap active-set reconcile over in-flight executions (6-field cron) |
+| `WithReconcileFull(cronExpr)` | — | Schedule the authoritative full reconcile; also runs the archival sweep and index GC. Keep it well below the active cadence |
+| `WithArchive(retention)` | disabled | Sweep completed executions into a cold archive bucket retained for `retention`; bounds the hot bucket. Runs on the full-reconcile schedule |
 | `WithOwnerID(id)` | random | Stable per-instance lease owner id |
 | `WithLeaseTTL(d)` | `30s` | Ownership lease TTL; a crashed instance's work becomes available after this |
 | `WithMaxConcurrency(n)` | `64` | Max work items processed concurrently per instance |

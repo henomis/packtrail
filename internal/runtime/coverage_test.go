@@ -51,30 +51,45 @@ func TestScheduleFlowUnknown(t *testing.T) {
 	}
 }
 
-// TestScheduleReconcileFires verifies a reconcile schedule fires the registered
-// OnReconcile callback.
+// TestScheduleReconcileFires verifies each reconcile schedule fires its own
+// registered callback (active and full are independent).
 func TestScheduleReconcileFires(t *testing.T) {
 	h := newHarness(t, linearFlow, Config{})
 
-	fired := make(chan struct{}, 1)
+	active := make(chan struct{}, 1)
+	full := make(chan struct{}, 1)
 
-	h.engine.OnReconcile(func(context.Context) error {
-		select {
-		case fired <- struct{}{}:
-		default:
+	signal := func(ch chan struct{}) func(context.Context) error {
+		return func(context.Context) error {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+
+			return nil
 		}
-
-		return nil
-	})
-
-	if err := h.engine.ScheduleReconcile(context.Background(), "* * * * * *"); err != nil {
-		t.Fatalf("schedule reconcile: %v", err)
 	}
 
-	select {
-	case <-fired:
-	case <-time.After(15 * time.Second):
-		t.Fatal("reconcile callback did not fire")
+	h.engine.OnReconcileActive(signal(active))
+	h.engine.OnReconcileFull(signal(full))
+
+	if err := h.engine.ScheduleReconcileActive(context.Background(), "* * * * * *"); err != nil {
+		t.Fatalf("schedule active reconcile: %v", err)
+	}
+
+	if err := h.engine.ScheduleReconcileFull(context.Background(), "* * * * * *"); err != nil {
+		t.Fatalf("schedule full reconcile: %v", err)
+	}
+
+	for _, c := range []struct {
+		name string
+		ch   chan struct{}
+	}{{"active", active}, {"full", full}} {
+		select {
+		case <-c.ch:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%s reconcile callback did not fire", c.name)
+		}
 	}
 }
 

@@ -261,8 +261,9 @@ func TestByStatusEventsCarryError(t *testing.T) {
 	}
 
 	// Corrupt and rebuild from the source of truth: the error must survive.
+	// Delete the status membership and the flow bookkeeping entry.
 	_ = st.IdxStatus().Delete(ctx, store.StatusFailed+sep+ex.ID)
-	_ = st.IdxStatus().Delete(ctx, metaPrefix+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "iota"+sep+ex.ID)
 
 	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
 		t.Fatalf("reconcile: %v", reconcileErr)
@@ -285,10 +286,10 @@ func TestReconcileRepairsDrift(t *testing.T) {
 	ex := mkExec(t, st, "epsilon")
 	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
 
-	// Corrupt the index: delete the membership and meta entries.
+	// Corrupt the index: delete the status membership and flow bookkeeping entries.
 	_ = st.IdxStatus().Delete(ctx, store.StatusRunning+sep+ex.ID)
 
-	_ = st.IdxStatus().Delete(ctx, metaPrefix+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "epsilon"+sep+ex.ID)
 	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); contains(ids, ex.ID) {
 		t.Fatalf("expected corrupted index to drop %s", ex.ID)
 	}
@@ -299,5 +300,97 @@ func TestReconcileRepairsDrift(t *testing.T) {
 
 	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); !contains(ids, ex.ID) {
 		t.Fatalf("reconcile did not restore %s: %v", ex.ID, ids)
+	}
+}
+
+// TestGCPrunesOrphans verifies GC deletes index entries whose execution is gone
+// from both the hot bucket and the archive, and leaves live entries intact.
+func TestGCPrunesOrphans(t *testing.T) {
+	ctx, st, ix := setup(t)
+
+	// A live completed execution: indexed and still present in the store.
+	live := mkExec(t, st, "kappa")
+
+	updated, err := st.Mutate(ctx, live.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	_ = st.EmitEvent(ctx, updated)
+
+	waitIndex(t, ix, store.StatusCompleted, live.ID, true)
+
+	// An orphan: index entries pointing at an execution that no longer exists
+	// (as if its archive entry expired). Write the membership and bookkeeping
+	// directly, with an old timestamp so the staleAfter filter selects it.
+	orphan := store.Event{
+		ExecID: "ghost", FlowName: "kappa", Status: store.StatusCompleted,
+		Revision: 1, Time: time.Now().Add(-48 * time.Hour),
+	}
+
+	val, err := json.Marshal(orphan)
+	if err != nil {
+		t.Fatalf("marshal orphan: %v", err)
+	}
+
+	if _, err = st.IdxStatus().Put(ctx, store.StatusCompleted+sep+"ghost", val); err != nil {
+		t.Fatalf("put orphan status: %v", err)
+	}
+
+	if _, err = st.IdxFlow().Put(ctx, "kappa"+sep+"ghost", val); err != nil {
+		t.Fatalf("put orphan flow: %v", err)
+	}
+
+	pruned, err := ix.GC(ctx, 24*time.Hour)
+	if err != nil || pruned != 1 {
+		t.Fatalf("GC = %d, %v; want 1, nil", pruned, err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, "ghost") {
+		t.Error("GC did not prune the orphan")
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, live.ID) {
+		t.Errorf("GC pruned a live entry: %v", ids)
+	}
+}
+
+// TestReconcileActiveFixesStaleStatus verifies the cheap active-set pass moves
+// an execution whose terminal transition was never projected (the event was
+// dropped, so the index still lists it as running) to its real status.
+func TestReconcileActiveFixesStaleStatus(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "zeta")
+	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
+
+	// Advance the source of truth to completed but drop the event, so the index
+	// is left stale (still running).
+	if _, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+		e.CurrentNode = ""
+
+		return nil
+	}); err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, ex.ID) {
+		t.Fatalf("precondition: %s already indexed completed", ex.ID)
+	}
+
+	if err := ix.ReconcileActive(ctx); err != nil {
+		t.Fatalf("reconcile active: %v", err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, ex.ID) {
+		t.Fatalf("active reconcile did not move %s to completed: %v", ex.ID, ids)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); contains(ids, ex.ID) {
+		t.Fatalf("active reconcile left stale running entry for %s: %v", ex.ID, ids)
 	}
 }

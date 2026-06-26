@@ -192,7 +192,14 @@ func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
 // under status, read directly from the visibility index without a per-execution
 // round-trip. The index is eventually consistent; use Get for authoritative state.
 func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, error) {
-	evs, err := s.indexer.ByStatusEvents(ctx, status)
+	return s.ByStatusEventsLimit(ctx, status, 0)
+}
+
+// ByStatusEventsLimit is ByStatusEvents capped at limit entries (0 = no cap).
+// Since KV keys have no inherent order the cap yields an arbitrary subset, not
+// an ordered page; it is a guardrail against an unbounded transfer.
+func (s *Server) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]Event, error) {
+	evs, err := s.indexer.ByStatusEventsLimit(ctx, status, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +210,13 @@ func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, er
 // ByFlowEvents returns a summary event for every execution belonging to flow,
 // read directly from the visibility index without a per-execution round-trip.
 func (s *Server) ByFlowEvents(ctx context.Context, flow string) ([]Event, error) {
-	evs, err := s.indexer.ByFlowEvents(ctx, flow)
+	return s.ByFlowEventsLimit(ctx, flow, 0)
+}
+
+// ByFlowEventsLimit is ByFlowEvents capped at limit entries (0 = no cap). The
+// same arbitrary-subset caveat as ByStatusEventsLimit applies.
+func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]Event, error) {
+	evs, err := s.indexer.ByFlowEventsLimit(ctx, flow, limit)
 	if err != nil {
 		return nil, err
 	}

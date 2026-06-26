@@ -121,15 +121,19 @@ var ErrNotFound = store.ErrNotFound
 // visibility indexer and (optionally) reconciliation, and can host built-in
 // nats-task workers in the same process.
 type Server struct {
-	nc            *nats.Conn
-	prefix        string
-	store         *store.Store
-	engine        *runtime.Engine
-	indexer       *visibility.Indexer
-	signals       *signal.Signals
-	flows         []string
-	flowsKV       jetstream.KeyValue
-	reconcileCron string
+	nc      *nats.Conn
+	prefix  string
+	store   *store.Store
+	engine  *runtime.Engine
+	indexer *visibility.Indexer
+	signals *signal.Signals
+	flows   []string
+	flowsKV jetstream.KeyValue
+
+	reconcileActiveCron string
+	reconcileFullCron   string
+	archiveRetention    time.Duration
+
 	asyncInvokers []asyncInvoker
 
 	mu   sync.Mutex
@@ -155,7 +159,7 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 
 	n := names.New(c.prefix)
 
-	st, err := store.Open(ctx, js, n)
+	st, err := openStore(ctx, js, n, c)
 	if err != nil {
 		return nil, err
 	}
@@ -234,17 +238,36 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 	}
 
 	return &Server{
-		nc:            nc,
-		prefix:        n.Prefix,
-		store:         st,
-		engine:        eng,
-		indexer:       visibility.New(st),
-		signals:       sig,
-		flows:         flowNames(flows),
-		flowsKV:       flowsKV,
-		reconcileCron: c.reconcileCron,
-		asyncInvokers: c.asyncInvokers,
+		nc:                  nc,
+		prefix:              n.Prefix,
+		store:               st,
+		engine:              eng,
+		indexer:             visibility.New(st),
+		signals:             sig,
+		flows:               flowNames(flows),
+		flowsKV:             flowsKV,
+		reconcileActiveCron: c.reconcileActiveCron,
+		reconcileFullCron:   c.reconcileFullCron,
+		archiveRetention:    c.archiveRetention,
+		asyncInvokers:       c.asyncInvokers,
 	}, nil
+}
+
+// openStore opens the store and, when archival is configured, enables the cold
+// archive bucket before returning.
+func openStore(ctx context.Context, js jetstream.JetStream, n names.Names, c config) (*store.Store, error) {
+	st, err := store.Open(ctx, js, n)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.archiveRetention > 0 {
+		if err = st.EnableArchive(ctx, c.archiveRetention); err != nil {
+			return nil, err
+		}
+	}
+
+	return st, nil
 }
 
 // Handle registers a built-in nats-task worker for subject (NATS wildcards
@@ -323,13 +346,77 @@ func (s *Server) ByFlow(ctx context.Context, flow string) ([]string, error) {
 	return s.indexer.ByFlow(ctx, flow)
 }
 
-// List returns every execution id in the store (the authoritative set).
+// List returns the execution ids in the hot bucket. With archival enabled (see
+// WithArchive) this is the active set plus recently-completed executions, not
+// every execution ever — archived executions are still readable via Get but are
+// not listed here. Without archival it is every execution.
 func (s *Server) List(ctx context.Context) ([]string, error) {
 	return s.store.ListExecutionKeys(ctx)
 }
 
-// Reconcile rebuilds the visibility indexes from the source of truth.
+// ListFunc streams the hot-bucket execution ids to fn instead of materialising
+// them into a slice, so a large active set can be rendered incrementally and a
+// caller can stop early by returning a sentinel error (returned as-is). It
+// covers the same set as List.
+func (s *Server) ListFunc(ctx context.Context, fn func(id string) error) error {
+	return s.store.ForEachExecutionKey(ctx, fn)
+}
+
+// Reconcile rebuilds the visibility indexes from the source of truth with a
+// full scan of every execution. It is the authoritative deep backstop; its cost
+// grows with total execution volume, so schedule it sparingly (the scheduled
+// reconcile already runs it periodically — see Run).
 func (s *Server) Reconcile(ctx context.Context) error { return s.indexer.Reconcile(ctx) }
+
+// ReconcileActive re-asserts the indexes for only the in-flight (running or
+// waiting) executions. It is cheap enough to run frequently and fixes the
+// common drift where a finished execution is still indexed as active; it does
+// not catch active executions missing from the index entirely, for which
+// Reconcile is the backstop.
+func (s *Server) ReconcileActive(ctx context.Context) error { return s.indexer.ReconcileActive(ctx) }
+
+// ArchiveCompleted sweeps completed executions out of the hot bucket into the
+// cold archive. It is a no-op unless archival is enabled (see WithArchive). The
+// full-reconcile schedule runs it automatically; it is exported for manual or
+// test-driven sweeps.
+func (s *Server) ArchiveCompleted(ctx context.Context) (int, error) {
+	return s.store.ArchiveCompleted(ctx)
+}
+
+// reconcileFull is the full-reconcile schedule's hook: it rebuilds the indexes
+// from the hot bucket and, when archival is enabled, sweeps completed executions
+// into the cold archive and prunes index entries orphaned by expired archives —
+// all on the same cadence.
+func (s *Server) reconcileFull(ctx context.Context) error {
+	if err := s.indexer.Reconcile(ctx); err != nil {
+		return err
+	}
+
+	if s.archiveRetention <= 0 {
+		return nil
+	}
+
+	if _, err := s.store.ArchiveCompleted(ctx); err != nil {
+		return err
+	}
+
+	if _, err := s.indexer.GC(ctx, s.archiveRetention); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// GCIndex prunes index entries whose execution has expired out of the archive.
+// It is a no-op unless archival is enabled. The full-reconcile schedule runs it
+// automatically; it is exported for manual or test-driven runs.
+func (s *Server) GCIndex(ctx context.Context) (int, error) {
+	if s.archiveRetention <= 0 {
+		return 0, nil
+	}
+
+	return s.indexer.GC(ctx, s.archiveRetention)
+}
 
 // Flows returns the names of the flows this server knows.
 func (s *Server) Flows() []string { return append([]string(nil), s.flows...) }
@@ -344,11 +431,20 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer cc.Stop()
 
-	s.engine.OnReconcile(s.indexer.Reconcile)
+	// The active-set and full reconciles run on independent durable schedules.
+	// Both schedules survive restarts and fire on a single instance, so the deep
+	// backstop runs on its own cadence regardless of process churn or HA.
+	s.engine.OnReconcileActive(s.indexer.ReconcileActive)
+	s.engine.OnReconcileFull(s.reconcileFull)
 
-	if s.reconcileCron != "" {
-		err = s.engine.ScheduleReconcile(ctx, s.reconcileCron)
-		if err != nil {
+	if s.reconcileActiveCron != "" {
+		if err = s.engine.ScheduleReconcileActive(ctx, s.reconcileActiveCron); err != nil {
+			return err
+		}
+	}
+
+	if s.reconcileFullCron != "" {
+		if err = s.engine.ScheduleReconcileFull(ctx, s.reconcileFullCron); err != nil {
 			return err
 		}
 	}

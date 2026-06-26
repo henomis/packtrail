@@ -34,11 +34,15 @@ type asyncInvoker struct {
 }
 
 type config struct {
-	prefix        string
-	flowsDir      string
-	flowDocs      [][]byte
-	flowDefs      []FlowDef
-	reconcileCron string
+	prefix   string
+	flowsDir string
+	flowDocs [][]byte
+	flowDefs []FlowDef
+
+	reconcileActiveCron string
+	reconcileFullCron   string
+	archiveRetention    time.Duration
+
 	invokers      map[string]invoker.Invoker
 	asyncInvokers []asyncInvoker
 	resultCache   bool
@@ -103,11 +107,35 @@ func WithAsyncInvoker(kind string, exec invoker.Invoker, opts ...asyncqueue.Opti
 // whenever invocations have side effects that must not run twice.
 func WithResultCache() Option { return func(c *config) { c.resultCache = true } }
 
-// WithReconcile installs a recurring visibility reconciliation on the given
-// 6-field cron expression ("sec min hour dom mon dow"), e.g. "0 */5 * * * *".
-// Without it, the indexer still runs but no periodic reconcile is scheduled.
-func WithReconcile(cronExpr string) Option {
-	return func(c *config) { c.reconcileCron = cronExpr }
+// WithReconcileActive installs the recurring active-set reconcile: a cheap pass
+// over only the in-flight (running/waiting) executions, on the given 6-field
+// cron expression ("sec min hour dom mon dow"), e.g. "0 */5 * * * *". Its cost
+// is independent of accumulated terminal executions, so it is safe to run
+// often. It fixes the common drift where a finished execution is still indexed
+// as active, but cannot recover an execution missing from the index entirely.
+func WithReconcileActive(cronExpr string) Option {
+	return func(c *config) { c.reconcileActiveCron = cronExpr }
+}
+
+// WithReconcileFull installs the recurring full reconcile: an authoritative scan
+// of every execution on the given 6-field cron expression, e.g. "0 0 * * * *"
+// for hourly. It is the deep backstop that recovers index entries the active
+// pass cannot see; its cost grows with total execution volume, so schedule it
+// well below the active cadence. Without either option the indexer still runs
+// but no periodic reconcile is scheduled.
+func WithReconcileFull(cronExpr string) Option {
+	return func(c *config) { c.reconcileFullCron = cronExpr }
+}
+
+// WithArchive enables execution archival: completed executions are swept out of
+// the hot executions bucket into a cold archive bucket that retains them for
+// roughly retention before they expire. This bounds the hot bucket — and the
+// List/Keys and full-reconcile scans over it — by in-flight volume rather than
+// all-time volume. The sweep runs on the full-reconcile schedule (see
+// WithReconcileFull), so pair the two. Failed executions are left hot so they
+// remain resumable. Without this option the hot bucket retains every execution.
+func WithArchive(retention time.Duration) Option {
+	return func(c *config) { c.archiveRetention = retention }
 }
 
 // WithOwnerID sets this instance's ownership-lease owner id. Defaults to a

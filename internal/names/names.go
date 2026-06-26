@@ -28,6 +28,7 @@ type Names struct {
 
 	// KV buckets
 	BucketExecutions  string
+	BucketExecArchive string
 	BucketLeases      string
 	BucketIdxStatus   string
 	BucketIdxFlow     string
@@ -65,6 +66,7 @@ func New(prefix string) Names {
 		Prefix: prefix,
 
 		BucketExecutions:  prefix + "-executions",
+		BucketExecArchive: prefix + "-executions-archive",
 		BucketLeases:      prefix + "-leases",
 		BucketIdxStatus:   prefix + "-idx-status",
 		BucketIdxFlow:     prefix + "-idx-flow",

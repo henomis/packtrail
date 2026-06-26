@@ -47,6 +47,7 @@ type Store struct {
 	js        jetstream.JetStream
 	names     names.Names
 	exec      jetstream.KeyValue
+	archive   jetstream.KeyValue // cold store for aged-out terminal execs; nil unless EnableArchive ran
 	leases    jetstream.KeyValue
 	idxStatus jetstream.KeyValue
 	idxFlow   jetstream.KeyValue
@@ -139,9 +140,32 @@ func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 	return rev, nil
 }
 
-// Get loads an execution and populates its Revision from the KV entry.
+// Get loads an execution and populates its Revision from the KV entry. If the
+// id is not in the hot bucket and archival is enabled, it falls back to the
+// cold archive, so reads of aged-out terminal executions still succeed until the
+// archive's retention expires. The hot bucket remains the source of truth for
+// mutations; archived executions are terminal and never mutated.
 func (s *Store) Get(ctx context.Context, id string) (*Execution, error) {
 	entry, err := s.exec.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return s.getArchived(ctx, id)
+		}
+
+		return nil, err
+	}
+
+	return decodeExecution(entry)
+}
+
+// getArchived loads an execution from the cold archive, or ErrNotFound when the
+// archive is disabled or the id is absent (e.g. retention expired).
+func (s *Store) getArchived(ctx context.Context, id string) (*Execution, error) {
+	if s.archive == nil {
+		return nil, ErrNotFound
+	}
+
+	entry, err := s.archive.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil, ErrNotFound
@@ -150,10 +174,13 @@ func (s *Store) Get(ctx context.Context, id string) (*Execution, error) {
 		return nil, err
 	}
 
-	var e Execution
+	return decodeExecution(entry)
+}
 
-	err = json.Unmarshal(entry.Value(), &e)
-	if err != nil {
+// decodeExecution unmarshals a KV entry into an Execution, carrying its revision.
+func decodeExecution(entry jetstream.KeyValueEntry) (*Execution, error) {
+	var e Execution
+	if err := json.Unmarshal(entry.Value(), &e); err != nil {
 		return nil, err
 	}
 
@@ -271,6 +298,154 @@ func (s *Store) ListExecutionKeys(ctx context.Context) ([]string, error) {
 	}
 
 	return keys, nil
+}
+
+// ForEachExecutionKey streams the id of every execution in the hot bucket to fn
+// via a metadata-only last-per-key watch, without collecting them into a slice.
+// fn returning a non-nil error stops the scan and propagates the error, so a
+// caller can cap the number it reads by returning a sentinel after N.
+func (s *Store) ForEachExecutionKey(ctx context.Context, fn func(string) error) error {
+	w, err := s.exec.WatchAll(ctx, jetstream.IgnoreDeletes(), jetstream.MetaOnly())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil
+		}
+
+		return err
+	}
+	defer func() { _ = w.Stop() }()
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				return nil
+			}
+
+			if fnErr := fn(entry.Key()); fnErr != nil {
+				return fnErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// ForEachExecution streams every stored execution to fn via a single
+// last-per-key watch over the executions bucket, so the caller reads the whole
+// set in one server round-trip instead of a key listing followed by a Get per
+// id. The watch delivers each key's latest value; a nil update marks the end of
+// the current set. A value that fails to unmarshal is skipped rather than
+// aborting the scan. fn must not retain the *Execution past its call.
+func (s *Store) ForEachExecution(ctx context.Context, fn func(*Execution) error) error {
+	w, err := s.exec.WatchAll(ctx, jetstream.IgnoreDeletes())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil
+		}
+
+		return err
+	}
+	defer func() { _ = w.Stop() }()
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				return nil
+			}
+
+			var e Execution
+			if json.Unmarshal(entry.Value(), &e) != nil {
+				continue
+			}
+
+			e.Revision = entry.Revision()
+
+			if fnErr := fn(&e); fnErr != nil {
+				return fnErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// EnableArchive creates (or attaches to) the cold archive bucket with a
+// bucket-wide retention TTL, so swept terminal executions are kept queryable for
+// roughly retention and then expire automatically. It must be called before the
+// archive is used; ArchiveCompleted and Get's fallback are no-ops until it runs.
+func (s *Store) EnableArchive(ctx context.Context, retention time.Duration) error {
+	archive, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:  s.names.BucketExecArchive,
+		History: 1,
+		TTL:     retention,
+	})
+	if err != nil {
+		return fmt.Errorf("archive bucket: %w", err)
+	}
+
+	s.archive = archive
+
+	return nil
+}
+
+// ArchiveCompleted moves every completed execution out of the hot bucket into
+// the cold archive, returning how many it moved. Only completed executions are
+// archived: they are truly terminal, whereas failed executions remain hot so
+// they can still be resumed. Each execution is written to the archive before it
+// is deleted from the hot bucket, so a crash mid-sweep can duplicate but never
+// lose one; a later sweep re-archives idempotently. It is a no-op when archival
+// is disabled.
+func (s *Store) ArchiveCompleted(ctx context.Context) (int, error) {
+	if s.archive == nil {
+		return 0, nil
+	}
+
+	// Collect first, then move: deleting while the watch is still streaming the
+	// hot bucket would mutate what we are iterating.
+	var pending [][]byte
+
+	err := s.ForEachExecution(ctx, func(e *Execution) error {
+		if e.Status != StatusCompleted {
+			return nil
+		}
+
+		data, marshalErr := json.Marshal(e)
+		if marshalErr != nil {
+			return marshalErr
+		}
+
+		pending = append(pending, data)
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	moved := 0
+
+	for _, data := range pending {
+		var e Execution
+		if json.Unmarshal(data, &e) != nil {
+			continue
+		}
+
+		if _, putErr := s.archive.Put(ctx, e.ID, data); putErr != nil {
+			return moved, putErr
+		}
+
+		// Completed is final, so a plain delete cannot race a concurrent
+		// transition; tolerate an already-deleted key.
+		if delErr := s.exec.Delete(ctx, e.ID); delErr != nil && !errors.Is(delErr, jetstream.ErrKeyNotFound) {
+			return moved, delErr
+		}
+
+		moved++
+	}
+
+	return moved, nil
 }
 
 // isWrongLastSeq reports whether err is the server's CAS rejection for KV

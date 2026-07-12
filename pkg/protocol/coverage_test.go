@@ -31,7 +31,7 @@ func TestServeAppliesDeadline(t *testing.T) {
 
 	var hasDeadline bool
 
-	sub, err := protocol.Serve(srv.NC, "tasks.deadline.*", func(ctx context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.deadline.*", func(ctx context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		_, hasDeadline = ctx.Deadline()
 		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
 	})
@@ -60,7 +60,7 @@ func TestServeAppliesDeadline(t *testing.T) {
 func TestReplyMarshalFallback(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.Serve(srv.NC, "tasks.badresp.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.badresp.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		// An invalid json.RawMessage makes json.Marshal of the response fail.
 		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage("{not json")}, nil
 	})

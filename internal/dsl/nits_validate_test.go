@@ -1,0 +1,115 @@
+// Copyright 2026 Simone Vellei
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dsl
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestValidateRejectsUnreachableNode: a node no transition can ever reach is
+// dead configuration — almost always a typo'd edge or rule target. A node with
+// no inbound transition at all is already caught by start-node detection, so
+// the interesting case is an island: nodes referencing each other but detached
+// from the start node.
+func TestValidateRejectsUnreachableNode(t *testing.T) {
+	_, err := Parse([]byte(`
+name: island
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: c, type: task, subject: "z"}
+  - {id: d, type: choice, rules: [{default: true, to: c}]}
+edges:
+  - {from: a, to: b}
+  - {from: c, to: d}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unreachable node(s) [c d]") {
+		t.Fatalf("err = %v, want unreachable-node rejection naming [c d]", err)
+	}
+}
+
+// TestValidateReachabilityFollowsAllTransitions: choice rules, on_timeout and
+// fanout branches all count as reachability edges — a flow wired only through
+// them must stay valid.
+func TestValidateReachabilityFollowsAllTransitions(t *testing.T) {
+	if _, err := Parse([]byte(`
+name: all-routes
+nodes:
+  - {id: pick, type: choice, rules: [{when: 'input.x == 1', to: gate}, {default: true, to: fo}]}
+  - {id: gate, type: signal, signal_name: go, timeout: 1m, on_timeout: fallback}
+  - {id: fallback, type: task, subject: "f"}
+  - {id: fo, type: fanout, branches: [b1]}
+  - {id: b1, type: task, subject: "x"}
+  - {id: j, type: fanin, wait_for: [b1]}
+edges:
+  - {from: fo, to: j}
+`)); err != nil {
+		t.Fatalf("fully-wired flow rejected: %v", err)
+	}
+}
+
+// TestValidateRejectsOnTimeoutWithoutTimeout: the wait schedule is only
+// installed for a positive timeout, so on_timeout without one can never fire.
+func TestValidateRejectsOnTimeoutWithoutTimeout(t *testing.T) {
+	_, err := Parse([]byte(`
+name: dead-route
+nodes:
+  - {id: gate, type: signal, signal_name: go, on_timeout: fallback}
+  - {id: fallback, type: task, subject: "f"}
+`))
+	if err == nil || !strings.Contains(err.Error(), "requires a positive timeout") {
+		t.Fatalf("err = %v, want dead on_timeout rejection", err)
+	}
+}
+
+// TestValidateRejectsWildcardSubject: a nats-task subject with wildcard or
+// whitespace characters can never be published to.
+func TestValidateRejectsWildcardSubject(t *testing.T) {
+	for _, subject := range []string{"tasks.>", "tasks.*.go", "tasks. spaced"} {
+		_, err := Parse([]byte(`
+name: bad-subject
+nodes:
+  - {id: a, type: task, subject: "` + subject + `"}
+`))
+		if err == nil || !strings.Contains(err.Error(), "NATS request subject") {
+			t.Errorf("subject %q: err = %v, want bad-subject rejection", subject, err)
+		}
+	}
+}
+
+// TestValidateAllowsPlaceholderSubject: the {execution_id} placeholder is part
+// of the nats-task contract and must stay legal.
+func TestValidateAllowsPlaceholderSubject(t *testing.T) {
+	if _, err := Parse([]byte(`
+name: placeholder
+nodes:
+  - {id: a, type: task, subject: "tasks.notify.{execution_id}"}
+`)); err != nil {
+		t.Fatalf("placeholder subject rejected: %v", err)
+	}
+}
+
+// TestValidateAllowsFreeFormCustomTarget: custom invoker kinds interpret Target
+// freely (it may be a URL), so the subject check applies to nats-task only.
+func TestValidateAllowsFreeFormCustomTarget(t *testing.T) {
+	if _, err := Parse([]byte(`
+name: custom-target
+nodes:
+  - {id: a, type: task, invoker: http, target: "https://example.com/hook?x=1 y"}
+`)); err != nil {
+		t.Fatalf("custom target rejected: %v", err)
+	}
+}

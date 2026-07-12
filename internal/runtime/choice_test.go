@@ -31,7 +31,7 @@ nodes:
   - id: route
     type: choice
     rules:
-      - when: "payload.risk_score > 80"
+      - when: "results.triage.risk_score > 80"
         to: escalation
       - default: true
         to: synthesis
@@ -44,8 +44,8 @@ edges:
 func runChoice(t *testing.T, riskScore int) string {
 	t.Helper()
 	h := newHarness(t, choiceFlow, Config{})
-	h.serve(t, "tasks.triage.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
-		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(req.Payload, "risk_score", riskScore)}, nil
+	h.serve(t, "tasks.triage.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(json.RawMessage(`{}`), "risk_score", riskScore)}, nil
 	})
 
 	reached := make(chan string, 2)

@@ -20,7 +20,9 @@ nodes:
   - id: route
     type: choice
     rules:
-      - when: 'payload.category == "billing"'
+      # Rules read the assembled context: the triage agent's own output lives
+      # under results.triage (the start payload would be input.<field>).
+      - when: 'results.triage.category == "billing"'
         to: billing-agent
       - default: true
         to: general-agent

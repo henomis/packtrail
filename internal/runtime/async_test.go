@@ -24,6 +24,7 @@ import (
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/internal/scheduler"
+	"github.com/henomis/packtrail/internal/signal"
 	"github.com/henomis/packtrail/internal/store"
 	"github.com/henomis/packtrail/invoker"
 )
@@ -37,6 +38,18 @@ func (p *pendingInvoker) Invoke(_ context.Context, req invoker.Request) (invoker
 	return invoker.Result{Status: invoker.StatusPending}, nil
 }
 
+// testSignals builds a Signals with its stream ensured, as New requires.
+func testSignals(t *testing.T, st *store.Store) *signal.Signals {
+	t.Helper()
+
+	sigs := signal.New(st.JS(), st.Names())
+	if err := sigs.EnsureStream(context.Background()); err != nil {
+		t.Fatalf("signals stream: %v", err)
+	}
+
+	return sigs
+}
+
 // asyncHarness wires an engine with a pendingInvoker.
 type asyncHarness struct {
 	store  *store.Store
@@ -45,6 +58,11 @@ type asyncHarness struct {
 }
 
 func newAsyncHarness(t *testing.T, flowYAML string) *asyncHarness {
+	t.Helper()
+	return newAsyncHarnessCfg(t, flowYAML, Config{})
+}
+
+func newAsyncHarnessCfg(t *testing.T, flowYAML string, cfg Config) *asyncHarness {
 	t.Helper()
 
 	ctx := context.Background()
@@ -55,8 +73,8 @@ func newAsyncHarness(t *testing.T, flowYAML string) *asyncHarness {
 		t.Fatalf("store: %v", err)
 	}
 
-	sch, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sch := scheduler.New(srv.JS, names.New(""))
+	if err := sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
@@ -67,7 +85,7 @@ func newAsyncHarness(t *testing.T, flowYAML string) *asyncHarness {
 
 	inv := &pendingInvoker{reqs: make(chan invoker.Request, 16)}
 
-	eng, err := New(inv, st, sch, map[string]*dsl.Flow{flow.Name: flow}, Config{})
+	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, cfg)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
@@ -90,6 +108,38 @@ func (h *asyncHarness) nextReq(t *testing.T) invoker.Request {
 		t.Fatal("no dispatch received")
 		return invoker.Request{}
 	}
+}
+
+// ctxDoc is the unpacked shape of an assembled invocation context — what an
+// Invoker's Request.Payload (and Engine.Results) carries.
+type ctxDoc struct {
+	Input   json.RawMessage            `json:"input"`
+	Results map[string]json.RawMessage `json:"results"`
+	Signals map[string]json.RawMessage `json:"signals"`
+}
+
+// parseCtx unpacks an assembled context document.
+func parseCtx(t *testing.T, doc json.RawMessage) ctxDoc {
+	t.Helper()
+
+	var c ctxDoc
+	if err := json.Unmarshal(doc, &c); err != nil {
+		t.Fatalf("context doc %s: %v", doc, err)
+	}
+
+	return c
+}
+
+// results assembles the execution's data-plane view via the engine.
+func (h *asyncHarness) results(t *testing.T, id string) ctxDoc {
+	t.Helper()
+
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results %s: %v", id, err)
+	}
+
+	return parseCtx(t, doc)
 }
 
 func (h *asyncHarness) get(t *testing.T, id string) *store.Execution {
@@ -161,8 +211,10 @@ func TestAsyncTaskParksAndCompletes(t *testing.T) {
 		t.Fatalf("second dispatch = %+v, want node b", rb)
 	}
 
-	if string(rb.Payload) != `{"n":1}` {
-		t.Fatalf("b payload = %s, want {\"n\":1}", rb.Payload)
+	// b sees a's output under results.a and the start input untouched.
+	bCtx := parseCtx(t, rb.Payload)
+	if string(bCtx.Results["a"]) != `{"n":1}` || string(bCtx.Input) != `{"n":0}` {
+		t.Fatalf("b context = %s, want results.a={\"n\":1} input={\"n\":0}", rb.Payload)
 	}
 
 	// Complete b; flow finishes.
@@ -170,9 +222,10 @@ func TestAsyncTaskParksAndCompletes(t *testing.T) {
 		t.Fatalf("complete b: %v", completeErr)
 	}
 
-	ex := h.waitStatus(t, id, store.StatusCompleted)
-	if string(ex.Payload) != `{"n":2}` {
-		t.Fatalf("final payload = %s, want {\"n\":2}", ex.Payload)
+	h.waitStatus(t, id, store.StatusCompleted)
+
+	if got := h.results(t, id); string(got.Results["b"]) != `{"n":2}` {
+		t.Fatalf("final results.b = %s, want {\"n\":2}", got.Results["b"])
 	}
 }
 
@@ -263,6 +316,64 @@ func TestAsyncFanout(t *testing.T) {
 	}
 }
 
+// TestAsyncBranchRetryDoesNotBlock is the non-blocking counterpart to the
+// (intentionally) slot-blocking synchronous branch retry documented on runBranch:
+// an async branch that asks to retry re-dispatches at the next attempt while the
+// execution stays parked (waiting) the whole time — so the retry never occupies
+// an engine slot. (asyncFanRetryFlow is defined in coverage_test.go.)
+func TestAsyncBranchRetryDoesNotBlock(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanRetryFlow)
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan-retry", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Both branches dispatch async; the execution parks waiting at the join,
+	// freeing its slot rather than holding one across the branches' lifetimes.
+	drainBranchDispatches(t, h)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	// Branch x asks to retry; it re-dispatches at attempt 1...
+	if retryErr := h.engine.CompleteActivity(ctx, id, "x", 0, invoker.Result{Status: invoker.StatusRetry, Error: "transient"}); retryErr != nil {
+		t.Fatalf("retry x: %v", retryErr)
+	}
+
+	if rx := h.nextReq(t); rx.NodeID != "x" || rx.Attempt != 1 {
+		t.Fatalf("re-dispatch = %+v, want branch x attempt 1", rx)
+	}
+
+	// ...and the execution is still parked, proving the branch retry held no slot.
+	if ex := h.get(t, id); ex.Status != store.StatusWaiting {
+		t.Fatalf("status during branch retry = %q, want waiting (no slot held)", ex.Status)
+	}
+
+	// Settle both branches; the join is satisfied and the flow advances to done.
+	if completeErr := h.engine.CompleteActivity(ctx, id, "x", 1, invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"x"}`)}); completeErr != nil {
+		t.Fatalf("complete x: %v", completeErr)
+	}
+
+	if completeErr := h.engine.CompleteActivity(ctx, id, "y", 0, invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"y"}`)}); completeErr != nil {
+		t.Fatalf("complete y: %v", completeErr)
+	}
+
+	if rd := h.nextReq(t); rd.NodeID != "done" {
+		t.Fatalf("after join, dispatch = %q, want done", rd.NodeID)
+	}
+
+	if completeErr := h.engine.CompleteActivity(ctx, id, "done", 0, invoker.Result{Status: invoker.StatusOK}); completeErr != nil {
+		t.Fatalf("complete done: %v", completeErr)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusCompleted)
+	for _, b := range []string{"x", "y"} {
+		if ex.Branches[b].Status != store.BranchCompleted {
+			t.Errorf("branch %s = %q, want completed", b, ex.Branches[b].Status)
+		}
+	}
+}
+
 const asyncRetryFlow = `
 version: "1.0"
 name: async-retry
@@ -300,8 +411,9 @@ func TestAsyncTaskRetry(t *testing.T) {
 		t.Fatalf("complete: %v", err)
 	}
 
-	ex := h.waitStatus(t, id, store.StatusCompleted)
-	if string(ex.Payload) != `{"ok":true}` {
-		t.Fatalf("payload = %s", ex.Payload)
+	h.waitStatus(t, id, store.StatusCompleted)
+
+	if got := h.results(t, id); string(got.Results["a"]) != `{"ok":true}` {
+		t.Fatalf("results.a = %s, want {\"ok\":true}", got.Results["a"])
 	}
 }

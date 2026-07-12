@@ -35,7 +35,7 @@ func TestConsumeHandlerErrorRedelivers(t *testing.T) {
 		done  = make(chan struct{})
 	)
 
-	cc, err := sigs.Consume(ctx, "redeliver", func(_ context.Context, _ signal.Delivery) error {
+	cc, err := sigs.Consume(ctx, "redeliver", 10, nil, func(_ context.Context, _ signal.Delivery) error {
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded // fail first delivery
 		}

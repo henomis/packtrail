@@ -15,7 +15,10 @@
 package dsl
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -52,11 +55,40 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // D returns the value as a time.Duration.
 func (d *Duration) D() time.Duration { return time.Duration(*d) }
 
-// Parse decodes and validates a Flow Definition from YAML bytes.
+// Parse decodes and validates a Flow Definition from YAML bytes. Decoding is
+// strict: an unknown field (a typo like "retires:" or "signal-name:") is an
+// error rather than a silently dropped setting, and extra YAML documents after
+// the first are rejected rather than silently ignored — one flow per document
+// (one WithFlow per flow, or one file per flow in the flows directory).
 func Parse(data []byte) (*Flow, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
 	var f Flow
-	if err := yaml.Unmarshal(data, &f); err != nil {
+	if err := dec.Decode(&f); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("yaml: empty flow definition")
+		}
+
 		return nil, fmt.Errorf("yaml: %w", err)
+	}
+
+	// Reject additional non-empty documents (a trailing "---" is fine).
+	for {
+		var extra any
+
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("yaml: %w", err)
+		}
+
+		if extra != nil {
+			return nil, errors.New("yaml: multiple flow documents in one input; define one flow per document")
+		}
 	}
 
 	if err := f.Validate(); err != nil {

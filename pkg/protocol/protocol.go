@@ -60,10 +60,15 @@ type Handler func(ctx context.Context, req TaskRequest) (TaskResponse, error)
 // "packtrail-workers"), decoding TaskRequest and replying with TaskResponse. It is
 // a convenience for task services and tests; the engine itself never calls it.
 //
+// ctx is the worker's lifetime: every handler invocation derives its context
+// from it (tightened by the request's per-call deadline), so cancelling ctx at
+// shutdown cancels in-flight handlers. Cancelling ctx does not unsubscribe —
+// the returned subscription should still be drained/unsubscribed by the caller
+// when done.
+//
 // subject may contain NATS wildcards (e.g. "tasks.triage.*") so a single worker
-// can serve every execution of a task. The returned subscription should be
-// drained/unsubscribed by the caller when done.
-func Serve(nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error) {
+// can serve every execution of a task.
+func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error) {
 	return nc.QueueSubscribe(subject, "packtrail-workers", func(msg *nats.Msg) {
 		var req TaskRequest
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
@@ -71,16 +76,16 @@ func Serve(nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error)
 			return
 		}
 
-		ctx := context.Background()
+		callCtx := ctx
 
 		if !req.Deadline.IsZero() {
 			var cancel context.CancelFunc
 
-			ctx, cancel = context.WithDeadline(ctx, req.Deadline)
+			callCtx, cancel = context.WithDeadline(ctx, req.Deadline)
 			defer cancel()
 		}
 
-		resp, err := h(ctx, req)
+		resp, err := h(callCtx, req)
 		if err != nil {
 			resp = TaskResponse{Status: StatusRetry, Error: err.Error()}
 		}
@@ -94,10 +99,10 @@ func Serve(nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error)
 // out-of-process workers so they subscribe to the right namespaced subject
 // without having to construct it manually.
 //
-//	protocol.ServeNamespaced(nc, "packtrail", "tasks.triage.*", handler)
+//	protocol.ServeNamespaced(ctx, nc, "packtrail", "tasks.triage.*", handler)
 //	// subscribes to "packtrail.tasks.triage.*"
-func ServeNamespaced(nc *nats.Conn, namespace, subject string, h Handler) (*nats.Subscription, error) {
-	return Serve(nc, namespace+"."+subject, h)
+func ServeNamespaced(ctx context.Context, nc *nats.Conn, namespace, subject string, h Handler) (*nats.Subscription, error) {
+	return Serve(ctx, nc, namespace+"."+subject, h)
 }
 
 func reply(msg *nats.Msg, resp TaskResponse) {

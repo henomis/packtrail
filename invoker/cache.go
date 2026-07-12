@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -41,6 +42,7 @@ import (
 type Cache struct {
 	kv       jetstream.KeyValue
 	delegate Invoker
+	prefix   string
 }
 
 // NewCache wraps delegate so its results are deduplicated through kv.
@@ -48,16 +50,26 @@ func NewCache(kv jetstream.KeyValue, delegate Invoker) *Cache {
 	return &Cache{kv: kv, delegate: delegate}
 }
 
-func cacheKey(req Request) string {
+// NewCacheKeyed wraps delegate like NewCache but namespaces every key with
+// prefix. Two Cache layers sharing one bucket must not collide on the same
+// (execution, node, attempt): packtrail's engine-side dispatch cache stores
+// StatusPending for an async node under that triple, while the async worker's
+// execution cache stores the real result of the same triple — a shared key
+// would either freeze the node at Pending or clobber the dispatch dedup.
+func NewCacheKeyed(kv jetstream.KeyValue, delegate Invoker, prefix string) *Cache {
+	return &Cache{kv: kv, delegate: delegate, prefix: prefix}
+}
+
+func (c *Cache) key(req Request) string {
 	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are token-safe.
-	return req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
+	return c.prefix + req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
 }
 
 // Invoke returns a cached Result for this (execution, node, attempt) if present;
 // otherwise it calls the delegate and caches a non-error result before
 // returning it.
 func (c *Cache) Invoke(ctx context.Context, req Request) (Result, error) {
-	key := cacheKey(req)
+	key := c.key(req)
 	if entry, err := c.kv.Get(ctx, key); err == nil {
 		var r Result
 		if json.Unmarshal(entry.Value(), &r) == nil {
@@ -80,8 +92,15 @@ func (c *Cache) Invoke(ctx context.Context, req Request) (Result, error) {
 	// settles it. Consequence: if the async worker is permanently lost and
 	// CompleteActivity is never called, the execution parks indefinitely —
 	// async workers should carry their own timeout/failure mechanism.
+	//
+	// A failed Put is logged, not surfaced: the result is still returned, only
+	// the dedup guarantee for a later redelivery of this attempt is lost. A
+	// persistently failing cache silently reopens the double-fire window, so it
+	// must at least be visible.
 	if data, mErr := json.Marshal(res); mErr == nil {
-		_, _ = c.kv.Put(ctx, key, data)
+		if _, putErr := c.kv.Put(ctx, key, data); putErr != nil {
+			slog.Debug("invoker cache: store result", "key", key, "err", putErr)
+		}
 	}
 
 	return res, nil

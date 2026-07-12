@@ -17,6 +17,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +43,7 @@ func TestCreateGetMutate(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
-	e := &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a", Payload: json.RawMessage(`{}`)}
+	e := &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a"}
 	if _, err := s.Create(ctx, e); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -70,7 +72,7 @@ func TestMutateConcurrent(t *testing.T) {
 	ctx := context.Background()
 
 	s := open(t)
-	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning, Payload: json.RawMessage(`{}`), Branches: map[string]BranchState{}}); err != nil {
+	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning, Branches: map[string]BranchState{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +107,7 @@ func TestMutateConcurrent(t *testing.T) {
 	}
 }
 
-func TestArchiveCompleted(t *testing.T) {
+func TestArchiveTerminal(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
@@ -114,21 +116,22 @@ func TestArchiveCompleted(t *testing.T) {
 	}
 
 	mk := func(id, status string) {
-		if _, err := s.Create(ctx, &Execution{ID: id, FlowName: "f", Status: status, Payload: json.RawMessage(`{}`)}); err != nil {
+		if _, err := s.Create(ctx, &Execution{ID: id, FlowName: "f", Status: status}); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
 	}
 
 	mk("done", StatusCompleted)
+	mk("gone", StatusCancelled)
 	mk("bust", StatusFailed)
 	mk("live", StatusRunning)
 
-	moved, err := s.ArchiveCompleted(ctx)
-	if err != nil || moved != 1 {
-		t.Fatalf("ArchiveCompleted = %d, %v; want 1, nil", moved, err)
+	// Completed and cancelled are archivable; failed (resumable) and running stay.
+	moved, err := s.ArchiveTerminal(ctx)
+	if err != nil || moved != 2 {
+		t.Fatalf("ArchiveTerminal = %d, %v; want 2, nil", moved, err)
 	}
 
-	// The completed exec left the hot bucket; failed and running stayed.
 	keys, err := s.ListExecutionKeys(ctx)
 	if err != nil {
 		t.Fatalf("keys: %v", err)
@@ -139,18 +142,21 @@ func TestArchiveCompleted(t *testing.T) {
 		hot[k] = true
 	}
 
-	if hot["done"] {
-		t.Error("completed exec still in hot bucket after archive")
+	if hot["done"] || hot["gone"] {
+		t.Errorf("archivable exec still in hot bucket after archive: hot=%v", keys)
 	}
 
 	if !hot["bust"] || !hot["live"] {
-		t.Errorf("non-completed execs were archived: hot=%v", keys)
+		t.Errorf("failed/running execs were archived: hot=%v", keys)
 	}
 
-	// The archived exec is still readable via Get's cold-store fallback.
-	got, err := s.Get(ctx, "done")
-	if err != nil || got.Status != StatusCompleted {
-		t.Fatalf("Get archived = %v, %v; want completed", got, err)
+	// Both archived execs are still readable via Get's cold-store fallback.
+	if got, gErr := s.Get(ctx, "done"); gErr != nil || got.Status != StatusCompleted {
+		t.Fatalf("Get archived completed = %v, %v; want completed", got, gErr)
+	}
+
+	if got, gErr := s.Get(ctx, "gone"); gErr != nil || got.Status != StatusCancelled {
+		t.Fatalf("Get archived cancelled = %v, %v; want cancelled", got, gErr)
 	}
 }
 
@@ -195,5 +201,70 @@ func TestLeaseExpiry(t *testing.T) {
 
 	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", 30*time.Second); !ok {
 		t.Fatal("B could not take over expired lease")
+	}
+}
+
+func TestPayloadSizeGuard(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxPayloadBytes(64)
+
+	big := json.RawMessage(`{"data":"` + strings.Repeat("x", 128) + `"}`)
+
+	// PutPayload rejects an oversized data-plane entry before it reaches NATS.
+	if err := s.PutPayload(ctx, OutputKey("e", "n"), big); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("PutPayload oversized: err = %v, want ErrPayloadTooLarge", err)
+	}
+
+	// The rejected write left nothing behind; a within-limit entry round-trips.
+	if _, err := s.GetPayload(ctx, OutputKey("e", "n")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected write left an entry: %v", err)
+	}
+
+	if err := s.PutPayload(ctx, OutputKey("e", "n"), json.RawMessage(`{"ok":1}`)); err != nil {
+		t.Fatalf("put small: %v", err)
+	}
+
+	got, err := s.GetPayload(ctx, OutputKey("e", "n"))
+	if err != nil || string(got) != `{"ok":1}` {
+		t.Fatalf("get = %s, %v; want {\"ok\":1}", got, err)
+	}
+}
+
+func TestPayloadGuardDisabled(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxPayloadBytes(0) // disabled
+
+	big := json.RawMessage(`{"data":"` + strings.Repeat("x", DefaultMaxPayloadBytes+1) + `"}`)
+	if err := s.PutPayload(ctx, InputKey("e"), big); err != nil {
+		t.Fatalf("put with guard disabled: %v", err)
+	}
+}
+
+// TestDeletePayloads verifies the per-execution sweep removes every data-plane
+// entry of one execution and leaves other executions' entries intact.
+func TestDeletePayloads(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	for _, key := range []string{InputKey("a"), OutputKey("a", "n1"), SignalKey("a", "go", 3), InputKey("b")} {
+		if err := s.PutPayload(ctx, key, json.RawMessage(`{}`)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	if err := s.DeletePayloads(ctx, "a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	for _, key := range []string{InputKey("a"), OutputKey("a", "n1"), SignalKey("a", "go", 3)} {
+		if _, err := s.GetPayload(ctx, key); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("entry %s survived the sweep: %v", key, err)
+		}
+	}
+
+	if _, err := s.GetPayload(ctx, InputKey("b")); err != nil {
+		t.Fatalf("other execution's entry was swept: %v", err)
 	}
 }

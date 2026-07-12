@@ -51,6 +51,7 @@ const (
 // purge stale membership entries for an execution under any other status.
 var allStatuses = []string{
 	store.StatusRunning, store.StatusWaiting, store.StatusCompleted, store.StatusFailed,
+	store.StatusCancelled,
 }
 
 // Indexer projects domain events into the visibility indexes and answers
@@ -121,63 +122,137 @@ func (ix *Indexer) Run(ctx context.Context) (jetstream.ConsumeContext, error) {
 	})
 }
 
-// index applies a single event idempotently. The flow-index entry doubles as
-// the per-execution bookkeeping record: there is exactly one per execution (the
-// flow never changes) and its stored event carries the last-indexed revision and
-// status. So index reads it to skip stale/duplicate events and to find the
-// previous status to clean up, then writes the status membership and refreshes
-// the flow entry last (the commit point). This avoids a separate per-execution
-// meta key, halving the status-bucket cardinality and dropping one write per
-// event.
+// metaPrefix namespaces the per-execution bookkeeping records inside the flow
+// bucket: '=' is a legal KV-key character but can never appear in a flow name
+// ([A-Za-z0-9_-]), so a bookkeeping key can never collide with a
+// "<flow>.<execID>" membership key — even for a flow literally named "meta".
+// The trailing '.' keeps the prefix a whole subject token, so prefix watches
+// ("meta=.>") work like the membership watches do.
+const metaPrefix = "meta=" + sep
+
+func metaKey(execID string) string { return metaPrefix + execID }
+
+// index applies a single event idempotently. The per-execution bookkeeping
+// record (meta key) carries the last-indexed revision and status: index reads
+// it to skip stale/duplicate events and to find the previous status to clean
+// up, writes the status and flow memberships (the read model), and commits the
+// meta record last.
+//
+// The commit is revision-guarded: multiple engine instances run indexers on the
+// same durable, so two events for one execution can be projected concurrently.
+// Without the guard the read-decide-write races and an older event's writes can
+// land after a newer one's, regressing the index until the next reconcile. On a
+// CAS conflict the whole projection retries against the fresh record.
 func (ix *Indexer) index(ctx context.Context, ev store.Event) error {
-	prevStatus, fresh, err := ix.lastIndexed(ctx, ev.FlowName, ev.ExecID)
-	if err != nil {
-		return err
+	const maxAttempts = 8
+
+	for range maxAttempts {
+		applied, err := ix.tryIndex(ctx, ev)
+		if err != nil {
+			return err
+		}
+
+		if applied {
+			return nil
+		}
 	}
 
-	if fresh >= ev.Revision {
-		return nil // stale or duplicate: already indexed at >= this revision
+	return fmt.Errorf("index %s: too many bookkeeping conflicts", ev.ExecID)
+}
+
+// tryIndex runs one guarded projection attempt. It returns (false, nil) when
+// the meta-record CAS lost to a concurrent indexer, in which case the caller
+// re-reads and retries.
+func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
+	prev, kvRev, exists, err := ix.lastIndexed(ctx, ev.ExecID)
+	if err != nil {
+		return false, err
+	}
+
+	if exists && prev.Revision >= ev.Revision {
+		// Stale or duplicate: already indexed at >= this revision. An earlier
+		// conflicted attempt of this very event may have written its status and
+		// flow memberships before losing the CAS; re-assert them from the
+		// authoritative record so the read model matches the winner.
+		if prev.Status != ev.Status {
+			_ = ix.idxStatus.Delete(ctx, ev.Status+sep+ev.ExecID)
+
+			if val, mErr := json.Marshal(prev); mErr == nil {
+				_, _ = ix.idxStatus.Put(ctx, prev.Status+sep+prev.ExecID, val)
+				_, _ = ix.idxFlow.Put(ctx, prev.FlowName+sep+prev.ExecID, val)
+			}
+		}
+
+		return true, nil
 	}
 
 	val, err := json.Marshal(ev)
 	if err != nil {
-		return err
+		return false, err
 	}
 
+	// Memberships are the read model: plain writes, re-assertable at any time
+	// (by a retry, reassert, or Reconcile). Correctness hangs on the meta CAS
+	// below, not on these.
 	if _, putErr := ix.idxStatus.Put(ctx, ev.Status+sep+ev.ExecID, val); putErr != nil {
-		return putErr
+		return false, putErr
 	}
 
-	if prevStatus != "" && prevStatus != ev.Status {
-		_ = ix.idxStatus.Delete(ctx, prevStatus+sep+ev.ExecID) // best-effort cleanup
+	if exists && prev.Status != "" && prev.Status != ev.Status {
+		_ = ix.idxStatus.Delete(ctx, prev.Status+sep+ev.ExecID) // best-effort cleanup
 	}
 
-	// The flow entry is written last: it is the bookkeeping record a later event
-	// reads, so a crash before this point simply reprocesses idempotently.
-	_, err = ix.idxFlow.Put(ctx, ev.FlowName+sep+ev.ExecID, val)
+	if _, putErr := ix.idxFlow.Put(ctx, ev.FlowName+sep+ev.ExecID, val); putErr != nil {
+		return false, putErr
+	}
 
-	return err
+	// The meta record is committed last: it is what a later event reads, so a
+	// crash before this point simply reprocesses idempotently. The CAS
+	// (create-if-absent / update-at-revision) fences concurrent indexers.
+	if !exists {
+		_, err = ix.idxFlow.Create(ctx, metaKey(ev.ExecID), val)
+	} else {
+		_, err = ix.idxFlow.Update(ctx, metaKey(ev.ExecID), val, kvRev)
+	}
+
+	if errors.Is(err, jetstream.ErrKeyExists) || isWrongLastSeq(err) {
+		return false, nil // lost to a concurrent indexer: re-read and retry
+	}
+
+	return err == nil, err
 }
 
-// lastIndexed reads the flow-index bookkeeping entry for an execution, returning
-// the status and revision last indexed for it. A revision of 0 (with no error)
-// means the execution has not been indexed yet.
-func (ix *Indexer) lastIndexed(ctx context.Context, flow, execID string) (status string, rev uint64, err error) {
-	entry, getErr := ix.idxFlow.Get(ctx, flow+sep+execID)
+// lastIndexed reads the per-execution bookkeeping record: the stored event
+// (whose Revision/Status are the last-indexed state), the KV entry revision for
+// CAS, and whether the record exists. A corrupt value is treated as
+// not-yet-indexed content but keeps its KV revision, so the rewrite still goes
+// through the CAS.
+func (ix *Indexer) lastIndexed(ctx context.Context, execID string) (prev store.Event, kvRev uint64, exists bool, err error) {
+	entry, getErr := ix.idxFlow.Get(ctx, metaKey(execID))
 	if getErr != nil {
 		if errors.Is(getErr, jetstream.ErrKeyNotFound) {
-			return "", 0, nil
+			return store.Event{}, 0, false, nil
 		}
 
-		return "", 0, getErr
+		return store.Event{}, 0, false, getErr
 	}
 
-	var prev store.Event
 	if json.Unmarshal(entry.Value(), &prev) != nil {
-		return "", 0, nil // corrupt: treat as not indexed so it gets rewritten
+		return store.Event{}, entry.Revision(), true, nil // corrupt: rewrite via CAS
 	}
 
-	return prev.Status, prev.Revision, nil
+	return prev, entry.Revision(), true, nil
+}
+
+// isWrongLastSeq reports whether err is the KV revision-conflict error a
+// guarded Update returns when the entry moved since it was read.
+func isWrongLastSeq(err error) bool {
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence
+	}
+
+	return false
 }
 
 // Reconcile rebuilds the indexes from the source of truth, closing any drift
@@ -241,9 +316,11 @@ func (ix *Indexer) ReconcileActive(ctx context.Context) error {
 }
 
 // reassert forces the indexes to match an execution's current state: it writes
-// the membership entry for the current status, removes entries under every other
-// status, and refreshes the flow entry (which doubles as the bookkeeping record)
-// last.
+// the membership entries for the current status and flow, removes entries under
+// every other status, and refreshes the bookkeeping record last. It is
+// authoritative (reads the source of truth), so its writes are unguarded —
+// last-writer-wins against a concurrent event projection, and the periodic
+// reconcile re-runs it anyway.
 func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 	ev := store.Event{
 		ExecID:   ex.ID,
@@ -270,7 +347,11 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 		}
 	}
 
-	_, err = ix.idxFlow.Put(ctx, ex.FlowName+sep+ex.ID, val)
+	if _, putErr := ix.idxFlow.Put(ctx, ex.FlowName+sep+ex.ID, val); putErr != nil {
+		return putErr
+	}
+
+	_, err = ix.idxFlow.Put(ctx, metaKey(ex.ID), val)
 
 	return err
 }
@@ -313,20 +394,22 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 
 		_ = ix.idxFlow.Delete(ctx, c.flow+sep+c.id)
 		_ = ix.idxStatus.Delete(ctx, c.status+sep+c.id)
+		_ = ix.idxFlow.Delete(ctx, metaKey(c.id))
+		_ = ix.store.DeletePayloads(ctx, c.id) // sweep any data-plane orphans the archive sweep missed
 		pruned++
 	}
 
 	return pruned, nil
 }
 
-// gcCandidates scans the flow index for terminal entries older than staleAfter
-// (a non-positive staleAfter selects every terminal entry).
+// gcCandidates scans the bookkeeping records for terminal entries older than
+// staleAfter (a non-positive staleAfter selects every terminal entry).
 func (ix *Indexer) gcCandidates(ctx context.Context, staleAfter time.Duration) ([]gcCandidate, error) {
 	cutoff := time.Now().Add(-staleAfter)
 
 	var out []gcCandidate
 
-	err := forEachAll(ctx, ix.idxFlow, func(entry jetstream.KeyValueEntry) error {
+	err := forEachByPrefix(ctx, ix.idxFlow, metaPrefix, false, func(entry jetstream.KeyValueEntry) error {
 		var ev store.Event
 		if json.Unmarshal(entry.Value(), &ev) != nil {
 			return nil
@@ -351,35 +434,9 @@ func (ix *Indexer) gcCandidates(ctx context.Context, staleAfter time.Duration) (
 // isTerminal reports whether a status is one an execution rests at (and so can
 // be archived and eventually expire).
 func isTerminal(status string) bool {
-	return status == store.StatusCompleted || status == store.StatusFailed
-}
-
-// forEachAll streams every entry in kv to fn via a whole-bucket watch.
-func forEachAll(ctx context.Context, kv jetstream.KeyValue, fn func(jetstream.KeyValueEntry) error) error {
-	w, err := kv.WatchAll(ctx, jetstream.IgnoreDeletes())
-	if err != nil {
-		if errors.Is(err, jetstream.ErrNoKeysFound) {
-			return nil
-		}
-
-		return err
-	}
-	defer func() { _ = w.Stop() }()
-
-	for {
-		select {
-		case entry, ok := <-w.Updates():
-			if !ok || entry == nil {
-				return nil
-			}
-
-			if cbErr := fn(entry); cbErr != nil {
-				return cbErr
-			}
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	return status == store.StatusCompleted ||
+		status == store.StatusFailed ||
+		status == store.StatusCancelled
 }
 
 // ByStatus returns the ids of executions currently indexed under status.

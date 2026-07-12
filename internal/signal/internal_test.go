@@ -63,7 +63,7 @@ func TestConsumeBadSubjectTermed(t *testing.T) {
 
 	ch := make(chan Delivery, 4)
 
-	cc, err := s.Consume(ctx, "bad-subj", func(_ context.Context, d Delivery) error {
+	cc, err := s.Consume(ctx, "bad-subj", 10, nil, func(_ context.Context, d Delivery) error {
 		ch <- d
 		return nil
 	})

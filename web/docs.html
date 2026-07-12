@@ -92,8 +92,8 @@
       <h2>Installation</h2>
       <p>
         Packtrail is a Go module. Add it to your project and import the root <code>packtrail</code> package —
-        the single public entry point. It requires Go 1.25+ and a reachable NATS server with
-        JetStream and the Message Scheduler enabled.
+        the single public entry point. It requires Go 1.26+ and a reachable NATS Server 2.12+ with
+        JetStream enabled — packtrail relies on the JetStream Message Scheduler (2.12) for every timer.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -150,9 +150,11 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
 }</code></pre>
       </div>
       <div class="callout">
-        <strong>No processing happens until <code>Run</code> is called.</strong> <code>New</code> bootstraps
-        every bucket and stream, registers invokers and publishes flow graphs — but the engine only
-        starts consuming work inside <code>Run</code>.
+        <strong>No processing happens until <code>Run</code> is called.</strong> <code>New</code> performs
+        no NATS I/O: it parses and validates the flows, and every bucket and stream is provisioned lazily
+        by the first call that needs NATS (<code>Start</code>, <code>Run</code>, <code>Get</code>, …).
+        Call <code>srv.Init(ctx)</code> explicitly at startup if you want provisioning errors (JetStream
+        disabled, missing permissions) to fail fast instead of surfacing on first use.
       </div>
     </section>
 
@@ -166,9 +168,14 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
 
       <h3>State on disk, never only in memory</h3>
       <p>
-        Every execution's state lives in the <code>packtrail-executions</code> KV bucket. Each transition is
-        a compare-and-swap write conditioned on the current KV revision. Crash an engine mid-flight and
-        another instance resumes from the durable state — there is nothing in memory to lose.
+        Every execution's control state — current node, status, attempt, branches, which outputs exist —
+        lives as one document in the <code>packtrail-executions</code> KV bucket; each transition is a
+        compare-and-swap write conditioned on the current KV revision. Every payload (the start input,
+        each node's output, each signal) is its own entry in a separate <code>packtrail-payloads</code>
+        bucket, written <em>before</em> the transition that references it commits. Each transition also
+        commits its follow-on work (the next work item, a retry timer, a join re-evaluation) in the same
+        CAS write — a transactional outbox — so state and the work that drives it can never disagree.
+        Crash an engine mid-flight and another instance resumes from the durable state.
       </p>
 
       <h3>One backend: NATS</h3>
@@ -178,12 +185,15 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         no second datastore to run, scale or back up.
       </p>
 
-      <h3>Ownership leases, not locks</h3>
+      <h3>Ownership leases, not locks — invocation is at-least-once</h3>
       <p>
         A durable pull consumer distributes work across all engine instances; a per-execution lease
-        (TTL, see <a href="#options"><code>WithLeaseTTL</code></a>) keeps a single writer at a time. A
-        crashed instance's lease simply expires and another instance acquires it on the next
-        redelivery — no coordinator, no lock to leak.
+        (TTL, see <a href="#options"><code>WithLeaseTTL</code></a>) is heartbeat-renewed while an
+        instance processes a work item. A crashed instance's lease simply expires and another instance
+        acquires it on the next redelivery — no coordinator, no lock to leak. The lease is not a hard
+        mutual-exclusion lock: the execution-doc CAS fences <em>state</em>, but it cannot un-fire an
+        external side effect, so node invocation is <strong>at-least-once</strong>. For non-idempotent
+        targets, enable <a href="#options"><code>WithResultCache</code></a> or make the target idempotent.
       </p>
 
       <h3>The Invoker is the only seam</h3>
@@ -221,6 +231,20 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         or <code>WithFlowDef</code> (one <code>FlowDef</code> Go struct, repeatable). All three can be
         combined freely. Duplicate flow names across any source are rejected at startup.
       </p>
+      <p>Validation is strict, so mistakes fail at load time rather than mid-execution:</p>
+      <ul>
+        <li><strong>YAML is strict.</strong> An unknown field (a typo like <code>retires:</code>) is a
+          parse error, and a file may hold exactly one flow document — extra <code>---</code> documents
+          are rejected, so none is silently ignored.</li>
+        <li>Flow names, node ids and signal names become NATS subject tokens and KV key segments, so
+          they must match <code>[A-Za-z0-9_-]{1,128}</code>.</li>
+        <li><strong>Every <code>invoker:</code> kind must be registered.</strong> A flow naming a kind
+          that is neither the built-in <code>nats-task</code> nor registered via
+          <code>WithInvoker</code>/<code>WithAsyncInvoker</code> is rejected by <code>New</code>.</li>
+        <li><strong>Every node must be reachable</strong> from the start node via an edge, choice rule,
+          fanout branch or <code>on_timeout</code> route — dead graph configuration is almost always a
+          typo'd target.</li>
+      </ul>
       <div class="codecard">
         <div class="codecard__bar">
           <span class="codecard__dots"><i></i><i></i><i></i></span>
@@ -249,8 +273,10 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <span class="eyebrow">Flow definitions · node types</span>
       <h2><span class="dot dot--task"></span> task</h2>
       <p>
-        A <code>task</code> node dispatches a single invocation through the configured Invoker. It is the
-        only node type that calls out to your code.
+        A <code>task</code> node dispatches a single invocation through the configured Invoker — with
+        the assembled context <code>{"input": …, "results": {…}, "signals": {…}}</code> as its payload —
+        and stores whatever it returns as this node's output, visible downstream as
+        <code>results.&lt;node&gt;</code>. It is the only node type that calls out to your code.
       </p>
       <table class="doctable">
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
@@ -299,6 +325,13 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         Branch nodes are reached only via the fan-out, so they do not count as start nodes and do not
         need an inbound edge. A branch may itself return <code>StatusPending</code> to run asynchronously.
       </div>
+      <p>
+        The fan graph is validated at load: every branch must be a <code>task</code> node, a node may be
+        a branch of at most one fanout, a fanout's single outgoing edge must lead to a <code>fanin</code>
+        (that is where the execution parks and the join is evaluated), and fanout/fanin nodes must not
+        lie on a cycle. Inside a fan, choice rules can also read <code>branches</code> — the current
+        fan's outputs.
+      </p>
     </section>
 
     <hr class="docs__hr" />
@@ -311,7 +344,7 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <table class="doctable">
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>wait_for</td><td>List of branch node ids to join on. Required, non-empty.</td></tr>
+          <tr><td>wait_for</td><td>List of branch node ids to join on — branches of this fanin's own fanout; a subset is fine (join on the critical branches, let the rest settle in the background). Required, non-empty.</td></tr>
           <tr><td>join_policy</td><td>How many branches must finish — see below. Defaults to <code>all</code>.</td></tr>
         </tbody>
       </table>
@@ -334,7 +367,7 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <p>
         A <code>choice</code> node routes to the first matching rule. Rules are
         <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr-lang</a>
-        expressions evaluated against the shared payload, compiled at startup (not per execution).
+        expressions evaluated against the assembled context, compiled at startup (not per execution).
       </p>
       <table class="doctable">
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
@@ -345,9 +378,13 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <p>
         Each rule's <code>to</code> must reference a known node. A non-default rule needs a
         <code>when</code> expression; the first rule whose <code>when</code> is true wins, and the
-        <code>default</code> rule is the fallback when none match. The expression environment exposes the
-        execution payload as <code>payload</code> — reach into it with dotted paths
-        (<code>payload.user.tier</code>, <code>payload.items[0].sku</code>) and the full expr-lang
+        <code>default</code> rule is the fallback when none match. The expression environment exposes
+        <code>input</code> (the start payload), <code>results</code> (each visited node's output, keyed
+        by node id), <code>signals</code> (received signal payloads, keyed by signal name),
+        <code>branches</code> (the current fan's outputs) and <code>last_node</code> (the id of the most
+        recently settled output — "the previous step's result" is <code>results[last_node]</code>).
+        Reach into them with dotted paths (<code>results.triage.risk_score</code>,
+        <code>input.user.tier</code>, <code>signals.approval.granted</code>) and the full expr-lang
         operator set (<code>==</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>in</code>, …).
       </p>
       <p>
@@ -366,9 +403,9 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
 <pre class="codecard__body" id="choice-src"><code>- <span class="k">id</span>: route
   <span class="k">type</span>: <span class="t">choice</span>
   <span class="k">rules</span>:
-    - {<span class="k">when</span>: <span class="s">'payload.risk_score &gt; 80'</span>,       <span class="k">to</span>: escalation}
-    - {<span class="k">when</span>: <span class="s">'payload.region in ["EU","UK"]'</span>, <span class="k">to</span>: gdpr_review}
-    - {<span class="k">default</span>: <span class="kw">true</span>,                        <span class="k">to</span>: synthesis}</code></pre>
+    - {<span class="k">when</span>: <span class="s">'results.triage.risk_score &gt; 80'</span>,  <span class="k">to</span>: escalation}
+    - {<span class="k">when</span>: <span class="s">'input.region in ["EU","UK"]'</span>,      <span class="k">to</span>: gdpr_review}
+    - {<span class="k">default</span>: <span class="kw">true</span>,                           <span class="k">to</span>: synthesis}</code></pre>
       </div>
     </section>
 
@@ -386,14 +423,19 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td>signal_name</td><td>The name the external caller delivers via <code>Server.Signal</code>. Required.</td></tr>
-          <tr><td>timeout</td><td>How long to wait before taking the timeout route, e.g. <code>24h</code>.</td></tr>
-          <tr><td>on_timeout</td><td>Node id to route to when the deadline passes. Must reference a known node.</td></tr>
+          <tr><td>timeout</td><td>How long to wait before taking the timeout route, e.g. <code>24h</code>. Evaluated by the Message Scheduler at roughly one-second granularity.</td></tr>
+          <tr><td>on_timeout</td><td>Node id to route to when the deadline passes. Must reference a known node, and requires a positive <code>timeout</code> — a route that could never fire is rejected at load.</td></tr>
         </tbody>
       </table>
       <p>
         Signal consumption is durable and idempotent — signals dedupe by JetStream sequence, so an
         at-least-once publisher is safe. The timeout is scheduled through the Message Scheduler and
-        survives restarts. Deliver a signal with:
+        survives restarts. Ordering is forgiving: a signal sent before the execution reaches its signal
+        node is stored and consumed on arrival, and one sent just before the execution is created is
+        redelivered until the execution exists. A genuinely orphaned signal (e.g. a typo'd execution id)
+        is dead-lettered after the delivery cap instead of vanishing silently. The received payload is
+        visible to downstream nodes and choice rules as <code>signals.&lt;name&gt;</code>. Deliver a
+        signal with:
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -469,7 +511,7 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
           <tr><td>Target</td><td>Invoker-specific target, with <code>{execution_id}</code> already resolved.</td></tr>
           <tr><td>ExecutionID</td><td>The owning execution id.</td></tr>
           <tr><td>NodeID</td><td>The node being executed.</td></tr>
-          <tr><td>Payload</td><td>Shared execution context as raw JSON.</td></tr>
+          <tr><td>Payload</td><td>The assembled execution context as raw JSON: <code>{"input": …, "results": {…}, "signals": {…}}</code>.</td></tr>
           <tr><td>Attempt</td><td>0-based attempt counter for retries.</td></tr>
           <tr><td>Deadline</td><td>Hard deadline for this attempt.</td></tr>
         </tbody>
@@ -477,15 +519,17 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
 
       <h3>Result &amp; statuses</h3>
       <p>
-        A <code>Result</code> carries a <code>Status</code>, an optional <code>Payload</code> (the new
-        shared context) and an optional <code>Error</code> string. A non-nil error from <code>Invoke</code>
+        A <code>Result</code> carries a <code>Status</code>, an optional <code>Payload</code> (this
+        node's output) and an optional <code>Error</code> string. A non-nil error from <code>Invoke</code>
         is treated as a transient transport failure (equivalent to <code>StatusRetry</code>) and is never
-        cached.
+        cached. A <code>StatusOK</code> payload is stored as its own data-plane entry and is visible to
+        every downstream node as <code>results.&lt;node&gt;</code> — outputs never merge into a shared
+        document, so any JSON shape is legal (only the start <code>input</code> must be an object).
       </p>
       <table class="doctable">
         <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td>StatusOK</td><td>Node succeeded; <code>Payload</code> becomes the new shared context and the flow advances.</td></tr>
+          <tr><td>StatusOK</td><td>Node succeeded; <code>Payload</code> is stored as the node's output and the flow advances.</td></tr>
           <tr><td>StatusError</td><td>Node failed permanently; the engine does not retry.</td></tr>
           <tr><td>StatusRetry</td><td>Retry per the node's retry policy.</td></tr>
           <tr><td>StatusPending</td><td>Dispatched asynchronously; the engine parks the execution and frees its slot. See <a href="#async">async activities</a>.</td></tr>
@@ -497,7 +541,10 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
         Enable <a href="#options"><code>WithResultCache()</code></a> to memoise results by
         <code>(execution, node, attempt)</code> in a KV bucket. A work item redelivered after a crash
         returns the cached result instead of re-invoking; a genuine retry (a new attempt) still calls the
-        Invoker. Turn it on whenever an invocation has side effects that must not run twice.
+        Invoker. Turn it on whenever an invocation has side effects that must not run twice. The cache
+        covers both invocation paths — the engine-side dispatch and the async worker's execution of your
+        Invoker — and entries expire after a TTL (default 24h, tunable via
+        <code>WithResultCacheTTL</code>).
       </p>
     </section>
 
@@ -520,7 +567,7 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
           <button class="copy" data-copy="#nt-src">Copy</button>
         </div>
 <pre class="codecard__body" id="nt-src"><code><span class="cm">// subject may contain wildcards; workers join queue group "packtrail-workers".</span>
-srv.<span class="fn">Handle</span>(<span class="s">"tasks.notify.*"</span>, <span class="kw">func</span>(ctx context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, <span class="kw">error</span>) {
+srv.<span class="fn">Handle</span>(ctx, <span class="s">"tasks.notify.*"</span>, <span class="kw">func</span>(ctx context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, <span class="kw">error</span>) {
     <span class="fn">notify</span>(req.Payload)
     <span class="kw">return</span> packtrail.TaskResponse{Status: packtrail.<span class="ok">TaskOK</span>}, <span class="kw">nil</span>
 })</code></pre>
@@ -612,9 +659,18 @@ srv.<span class="fn">CompleteActivity</span>(ctx, execID, nodeID, attempt,
       <h3>Resuming a failed execution</h3>
       <p>
         <code>Server.Resume(ctx, execID)</code> revives a <code>failed</code> execution, re-running the
-        node it failed on with a fresh retry budget. The durable payload is preserved, and only failed
-        executions can be resumed. It is durable — any running engine in the namespace picks up the
-        resumed work.
+        node it failed on with a fresh retry budget. The durable state and every stored output are
+        preserved, and only failed executions can be resumed. It is durable — any running engine in the
+        namespace picks up the resumed work.
+      </p>
+      <h3>Cancelling an execution</h3>
+      <p>
+        <code>Server.Cancel(ctx, execID, reason)</code> transitions a running or waiting execution to the
+        distinct terminal <code>cancelled</code> status — separate from <code>failed</code>, so it is
+        observably operator-driven and <code>Resume</code> (failed-only) won't revive it. Cancellation is
+        abandon, not interrupt: in-flight work is not stopped, but pending work items, join evaluations,
+        signal timeouts and a late <code>CompleteActivity</code> all no-op once the execution is
+        non-active. It is idempotent — a no-op on already-terminal or missing executions.
       </p>
     </section>
 
@@ -651,7 +707,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
     <section id="statuses">
       <span class="eyebrow">Execution</span>
       <h2>Statuses &amp; lifecycle</h2>
-      <p>An execution moves between four durable statuses:</p>
+      <p>An execution moves between five durable statuses:</p>
       <table class="doctable">
         <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
         <tbody>
@@ -659,14 +715,18 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>waiting</td><td>Parked on a signal or an async activity; no work slot held (<code>ExecWaiting</code>).</td></tr>
           <tr><td>completed</td><td>A terminal node was reached successfully (<code>ExecCompleted</code>).</td></tr>
           <tr><td>failed</td><td>A node failed permanently; can be revived with <code>Resume</code> (<code>ExecFailed</code>).</td></tr>
+          <tr><td>cancelled</td><td>Terminated by an operator via <code>Cancel</code>; terminal and not resumable (<code>ExecCancelled</code>).</td></tr>
         </tbody>
       </table>
       <p>
-        A read-only <code>Execution</code> snapshot (from <code>Get</code>) exposes <code>ID</code>,
-        <code>Flow</code>, <code>Status</code>, <code>CurrentNode</code>, <code>Payload</code>,
-        <code>Attempt</code>, per-branch state (<code>Branches</code>), received <code>Signals</code>,
-        the active <code>WaitSignal</code>, any <code>Error</code> and <code>UpdatedAt</code>. The
-        execution KV is the source of truth — read it (not the indexes) for correctness decisions.
+        A read-only <code>Execution</code> snapshot (from <code>Get</code>) exposes the control state:
+        <code>ID</code>, <code>Flow</code>, <code>Status</code>, <code>CurrentNode</code>,
+        <code>Attempt</code>, <code>Outputs</code> (which node outputs exist), per-branch state
+        (<code>Branches</code>), received <code>Signals</code>, the active <code>WaitSignal</code>, any
+        <code>Error</code> and <code>UpdatedAt</code>. Payloads live in the data plane and are not
+        carried on the snapshot — read the assembled <code>{input, results, signals}</code> view with
+        <code>Server.Results(ctx, id)</code>. The execution KV is the source of truth — read it (not
+        the indexes) for correctness decisions.
       </p>
     </section>
 
@@ -680,22 +740,31 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
       <table class="doctable">
         <thead><tr><th>Method</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>New(nc, …opts)</td><td>Build a server: bootstrap buckets/streams, register invokers, load flows. Does not start processing.</td></tr>
-          <tr><td>Run(ctx)</td><td>Start the engine, indexer and (if configured) the reconcile and archival schedules; blocks until ctx is cancelled. Drains workers on return.</td></tr>
-          <tr><td>Start(ctx, flow, payload)</td><td>Create a new execution and return its id.</td></tr>
+          <tr><td>New(nc, …opts)</td><td>Build a server: parse and validate flows, register invokers. No NATS I/O — resources are provisioned lazily on first use.</td></tr>
+          <tr><td>Init(ctx)</td><td>Provision every bucket and stream eagerly, so setup errors fail fast instead of surfacing on first use. Optional.</td></tr>
+          <tr><td>Run(ctx)</td><td>Start the engine, indexer and (if configured) the reconcile and archival schedules; blocks until ctx is cancelled. Drains in-flight work on return (see <code>WithDrainTimeout</code>).</td></tr>
+          <tr><td>Start(ctx, flow, payload)</td><td>Create a new execution with a random id and return it.</td></tr>
+          <tr><td>StartWithID(ctx, execID, flow, payload)</td><td>Idempotent start with a caller-supplied id (idempotency key, <code>[A-Za-z0-9_-]{1,128}</code>); a retry returns the existing id.</td></tr>
           <tr><td>ScheduleFlow(ctx, name, flow, cron, payload)</td><td>Install/replace a recurring schedule that starts a flow.</td></tr>
           <tr><td>Signal(ctx, execID, name, payload)</td><td>Deliver an external signal to an execution.</td></tr>
           <tr><td>CompleteActivity(ctx, execID, node, attempt, res)</td><td>Settle an async activity previously reported as <code>StatusPending</code>. Idempotent.</td></tr>
           <tr><td>Resume(ctx, execID)</td><td>Revive a failed execution with a fresh retry budget.</td></tr>
-          <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> snapshot, or <code>ErrNotFound</code>.</td></tr>
+          <tr><td>Cancel(ctx, execID, reason)</td><td>Transition a running/waiting execution to the terminal <code>cancelled</code> status. Abandon, not interrupt; idempotent.</td></tr>
+          <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> control-state snapshot, or <code>ErrNotFound</code>.</td></tr>
+          <tr><td>Results(ctx, execID)</td><td>The assembled <code>{input, results, signals}</code> data-plane view — what invokers and choice rules see.</td></tr>
+          <tr><td>History(ctx, execID, limit)</td><td>Ordered per-execution transition trace (requires <code>WithHistory</code>).</td></tr>
           <tr><td>ByStatus(ctx, status)</td><td>Execution ids indexed under a status (eventually consistent).</td></tr>
           <tr><td>ByFlow(ctx, flow)</td><td>Execution ids belonging to a flow.</td></tr>
           <tr><td>ByStatusEventsLimit(ctx, status, n)</td><td>Up to <code>n</code> summary events under a status (guardrail cap; <code>ByFlowEventsLimit</code> for flows).</td></tr>
-          <tr><td>List(ctx) / ListFunc(ctx, fn)</td><td>Hot-bucket execution ids (active + recently-completed when archival is on; every execution otherwise). <code>ListFunc</code> streams them.</td></tr>
+          <tr><td>List(ctx) / ListFunc(ctx, fn)</td><td>Hot-bucket execution ids (active + recently-terminal when archival is on; every execution otherwise). <code>ListFunc</code> streams them.</td></tr>
+          <tr><td>ListFlows(ctx) / FlowGraph(ctx, name)</td><td>Registered flow names; a flow's full graph (nodes + edges) from the flow registry.</td></tr>
+          <tr><td>WatchEvents(ctx)</td><td>Live channel of execution transitions published after the call.</td></tr>
+          <tr><td>DeadLetterCount(ctx) / RecentDeadLetters(ctx, n)</td><td>Durable dead-letter stream depth; the most recent dead-letter records.</td></tr>
           <tr><td>Reconcile(ctx) / ReconcileActive(ctx)</td><td>Rebuild the visibility indexes from the source of truth — full scan, or just in-flight executions.</td></tr>
-          <tr><td>ArchiveCompleted(ctx) / GCIndex(ctx)</td><td>Sweep completed executions into the cold archive; prune index entries orphaned by archive expiry. No-ops unless archival is enabled.</td></tr>
+          <tr><td>RedriveStalled(ctx)</td><td>Run the stall watchdog once: re-drive active executions quiet past the threshold (see <code>WithStallRedrive</code>).</td></tr>
+          <tr><td>ArchiveTerminal(ctx) / GCIndex(ctx)</td><td>Sweep terminal non-resumable executions into the cold archive; prune index entries orphaned by archive expiry. No-ops unless archival is enabled.</td></tr>
           <tr><td>Flows()</td><td>Names of the flows this server knows.</td></tr>
-          <tr><td>Handle(subject, h)</td><td>Register an in-process built-in nats-task worker.</td></tr>
+          <tr><td>Handle(ctx, subject, h)</td><td>Register an in-process built-in nats-task worker.</td></tr>
           <tr><td>Close()</td><td>Drain registered workers. Does not close the NATS connection.</td></tr>
         </tbody>
       </table>
@@ -715,12 +784,18 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; repeatable, combinable with the options above.</span></div>
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker under a kind; the built-in nats-task is always present and may be overridden.</span></div>
         <div class="optlist__row"><code>WithAsyncInvoker(kind, exec, opts…)</code><span>Register an async Invoker: nodes of this kind dispatch to a durable work-queue and <code>exec</code> runs on a hosted worker pool (see <a href="#async">async activities</a>).</span></div>
-        <div class="optlist__row"><code>WithResultCache()</code><span>Wrap the registry in a KV-backed idempotency cache keyed by (execution, node, attempt).</span></div>
-        <div class="optlist__row"><code>WithReconcileActive(cron)</code><span>Schedule the cheap active-set reconcile over in-flight executions (6-field cron).</span></div>
+        <div class="optlist__row"><code>WithResultCache()</code><span>Cache invocation results by (execution, node, attempt) for idempotent retries — engine dispatch and async worker execution alike.</span></div>
+        <div class="optlist__row"><code>WithResultCacheTTL(d)</code><span>Result-cache entry TTL (default 24h; implies <code>WithResultCache</code>); a negative value disables expiry.</span></div>
+        <div class="optlist__row"><code>WithHistory(retention)</code><span>Durable per-execution transition trace in a <code>&lt;ns&gt;-history</code> stream, queryable via <code>Server.History</code> for <code>retention</code>.</span></div>
+        <div class="optlist__row"><code>WithReconcileActive(cron)</code><span>Schedule the cheap active-set reconcile over in-flight executions (6-field cron); each pass also runs the stall watchdog.</span></div>
+        <div class="optlist__row"><code>WithStallRedrive(d)</code><span>Stall-watchdog quiet-time threshold (default 5× ack wait): an active execution quiet past <code>d</code> — outside any retry backoff and not lease-held — gets its work re-driven. Negative disables.</span></div>
         <div class="optlist__row"><code>WithReconcileFull(cron)</code><span>Schedule the authoritative full reconcile; also runs the archive sweep and index GC. Keep it well below the active cadence.</span></div>
-        <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep completed executions into a cold archive bucket retained for <code>retention</code>, bounding the hot store. Runs on the full-reconcile schedule.</span></div>
+        <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep terminal non-resumable executions into a cold archive bucket retained for <code>retention</code>, bounding the hot store. Failed executions stay hot so they remain resumable. Runs on the full-reconcile schedule.</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64).</span></div>
         <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Invocation timeout for nodes that omit one (default 30s).</span></div>
+        <div class="optlist__row"><code>WithMaxDeliver(n)</code><span>Deliveries of a work item, fired schedule or signal before it is dead-lettered instead of retried forever (default 10; the cap cannot be disabled).</span></div>
+        <div class="optlist__row"><code>WithDrainTimeout(d)</code><span>Graceful-shutdown window for in-flight work to settle before stragglers are abandoned to redelivery (default 30s).</span></div>
+        <div class="optlist__row"><code>WithMaxPayloadBytes(n)</code><span>Cap on a single data-plane entry — the start input, one node's output, one signal payload (default 512 KiB; negative disables). An over-limit output fails its node with a clear reason.</span></div>
         <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Per-execution ownership lease TTL (default 30s); a crashed instance's work frees after roughly this.</span></div>
         <div class="optlist__row"><code>WithOwnerID(id)</code><span>Stable ownership-lease owner id; defaults to a random id per instance.</span></div>
       </div>
@@ -737,7 +812,8 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         deployments can share a cluster. The buckets and streams a deployment creates:
       </p>
       <div class="arch__stores" style="margin:1.2rem 0">
-        <div class="store store--truth"><code>packtrail-executions</code><span>KV · source of truth</span></div>
+        <div class="store store--truth"><code>packtrail-executions</code><span>KV · control plane, source of truth</span></div>
+        <div class="store store--truth" style="border-left-color:var(--sky-hi)"><code>packtrail-payloads</code><span>KV · data plane: inputs, outputs, signals</span></div>
         <div class="store store--lease"><code>packtrail-leases</code><span>KV · ownership (TTL)</span></div>
         <div class="store store--stream"><code>packtrail-work</code><span>stream · work queue</span></div>
         <div class="store store--stream"><code>packtrail-events</code><span>stream · domain events</span></div>
@@ -745,6 +821,9 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="store store--timer"><code>packtrail-schedule</code><span>scheduler · timers &amp; cron</span></div>
         <div class="store store--truth" style="border-left-color:var(--sky-hi)"><code>packtrail-flows</code><span>KV · flow registry</span></div>
         <div class="store store--cache"><code>packtrail-result-cache</code><span>KV · idempotency (opt-in)</span></div>
+        <div class="store store--cache"><code>packtrail-executions-archive</code><span>KV · cold archive (opt-in)</span></div>
+        <div class="store store--stream"><code>packtrail-deadletter</code><span>stream · dead letters (~30d)</span></div>
+        <div class="store store--stream"><code>packtrail-history</code><span>stream · per-exec trace (opt-in)</span></div>
         <div class="store store--proj"><code>packtrail-idx-status</code><span>KV · projection</span></div>
         <div class="store store--proj"><code>packtrail-idx-flow</code><span>KV · projection</span></div>
       </div>
@@ -779,14 +858,29 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>GET /api/flows</td><td>Names of all registered flows.</td></tr>
           <tr><td>GET /api/flows/{name}</td><td>Full <code>FlowGraph</code> (nodes + edges).</td></tr>
           <tr><td>GET /api/executions</td><td>Execution summaries; filter with <code>?status=</code> or <code>?flow=</code>.</td></tr>
-          <tr><td>GET /api/executions/{id}</td><td>Full <code>Execution</code> snapshot.</td></tr>
+          <tr><td>GET /api/executions/{id}</td><td><code>Execution</code> control-state snapshot.</td></tr>
+          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals}</code> context (data plane).</td></tr>
+          <tr><td>GET /api/executions/{id}/history</td><td>Ordered transition trace (<code>?limit=</code>; empty unless <code>WithHistory</code>).</td></tr>
+          <tr><td>GET /api/deadletters</td><td>Dead-letter count and recent dead-letter records.</td></tr>
           <tr><td>GET /api/events</td><td>Live Server-Sent Events stream of every transition.</td></tr>
         </tbody>
       </table>
       <p>
         The same data is available programmatically through the <a href="#server-api">Server API</a>
-        (<code>Flows</code>, <code>Get</code>, <code>ByStatus</code>, <code>ByFlow</code>) and, for events,
-        a live watch channel.
+        (<code>ListFlows</code>, <code>FlowGraph</code>, <code>Get</code>, <code>ByStatus</code>,
+        <code>ByFlow</code>, <code>DeadLetterCount</code>, <code>RecentDeadLetters</code>) and, for
+        events, the <code>WatchEvents</code> live channel. With <code>WithHistory</code> enabled,
+        <code>Server.History</code> returns an execution's ordered step-by-step trace.
+      </p>
+      <h3>Dead letters</h3>
+      <p>
+        No message can loop forever: work items, fired schedules, signals and async jobs are all capped
+        by a delivery limit (<a href="#options"><code>WithMaxDeliver</code></a>), and a message that can
+        never succeed — an unknown flow, a removed node — is dead-lettered immediately. Every dead
+        letter is durable and observable: each consumer emits a record (kind, key, reason, deliveries)
+        to the <code>packtrail-deadletter</code> stream (~30-day retention), surfaced by
+        <code>Server.DeadLetterCount</code>, <code>Server.RecentDeadLetters</code> and the dashboard's
+        dead-letter tile.
       </p>
     </section>
 

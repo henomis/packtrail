@@ -16,11 +16,15 @@
 // and the task workers live in one process, importing only the public
 // github.com/henomis/packtrail package.
 //
-// Run an external NATS server and then:
+// Run a NATS server (2.12+, JetStream enabled) and, from the repo root (the
+// flow is loaded from examples/embedded/flows):
 //
 //	go run ./examples/embedded --nats nats://127.0.0.1:4222
 //
-// It starts one execution of the research pipeline and prints progress.
+// It starts one execution of the research pipeline, prints progress, and dumps
+// the assembled results when the flow settles. Workers are plain queue-group
+// subscribers, so ./examples/worker can be run alongside (same --namespace) to
+// load-balance the very same task subjects from a separate process.
 package main
 
 import (
@@ -39,6 +43,7 @@ import (
 
 func main() {
 	url := flag.String("nats", nats.DefaultURL, "NATS server URL")
+	namespace := flag.String("namespace", "acme", "packtrail namespace prefix")
 
 	flag.Parse()
 
@@ -48,10 +53,10 @@ func main() {
 	}
 	defer nc.Close()
 
-	// One process, custom namespace, flows loaded from ./examples.
+	// One process, custom namespace, flows loaded from this example's flows dir.
 	srv, err := packtrail.New(nc,
-		packtrail.WithNamespace("acme"),
-		packtrail.WithFlowsDir("examples"),
+		packtrail.WithNamespace(*namespace),
+		packtrail.WithFlowsDir("examples/embedded/flows"),
 		packtrail.WithReconcileActive("0 */5 * * * *"),
 		packtrail.WithReconcileFull("0 0 * * * *"),
 	)
@@ -59,18 +64,19 @@ func main() {
 		log.Fatalf("new: %v", err)
 	}
 
-	// Co-locate the task workers in the same binary. echo marks each node done.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Co-locate the task workers in the same binary. echo marks each node done;
+	// ctx bounds every handler invocation's lifetime.
 	for _, subject := range []string{
 		"tasks.triage.*", "tasks.tech-research.*", "tasks.market-research.*",
 		"tasks.legal-research.*", "tasks.synthesis.*", "tasks.escalation.*",
 	} {
-		if err := srv.Handle(subject, echo); err != nil {
+		if err := srv.Handle(ctx, subject, echo); err != nil {
 			log.Fatalf("handle %s: %v", subject, err)
 		}
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Kick off one execution shortly after the engine starts.
 	go func() {
@@ -99,25 +105,29 @@ func main() {
 			}
 
 			if ex.Status == packtrail.ExecCompleted || ex.Status == packtrail.ExecFailed {
+				// The assembled data-plane view: {input, results.<node>, signals.<name>}.
+				if res, rErr := srv.Results(ctx, id); rErr == nil {
+					log.Printf("results: %s", res)
+				}
+
 				break
 			}
 		}
 	}()
 
-	log.Printf("packtrail embedded — engine + workers in one process (namespace acme)")
+	log.Printf("packtrail embedded — engine + workers in one process (namespace %s)", *namespace)
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("run: %v", err)
 	}
 }
 
-// echo marks the current node done in the shared payload and returns it.
+// echo returns this node's output. The response payload is stored as the
+// node's own data-plane entry, visible downstream as results.<node> — there is
+// no shared document to merge into. req.Payload carries the assembled
+// {input, results, signals} context, would the handler need earlier outputs.
 func echo(_ context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, error) {
-	root := map[string]json.RawMessage{}
-	_ = json.Unmarshal(req.Payload, &root)
-	root[req.NodeID] = json.RawMessage(`"done"`)
-
-	out, err := json.Marshal(root)
+	out, err := json.Marshal(map[string]string{"node": req.NodeID, "state": "done"})
 	if err != nil {
 		return packtrail.TaskResponse{Status: packtrail.TaskError, Error: err.Error()}, nil
 	}

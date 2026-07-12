@@ -20,7 +20,10 @@ package signal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -28,6 +31,12 @@ import (
 
 	"github.com/henomis/packtrail/internal/names"
 )
+
+// tokenPattern bounds the execution id and signal name, which become NATS
+// subject tokens on the signals stream. Validating at publish time turns a
+// malformed (or injection-shaped) input into a clear error instead of an opaque
+// NATS rejection or a misrouted subject.
+var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // Signals publishes and consumes external signals within one namespace.
 type Signals struct {
@@ -60,9 +69,19 @@ func (s *Signals) EnsureStream(ctx context.Context) error {
 	return nil
 }
 
-// Publish sends a signal for execID/name with the given payload.
+// Publish sends a signal for execID/name with the given payload. Both execID
+// and name must match [A-Za-z0-9_-]{1,128} (they become subject tokens).
 func (s *Signals) Publish(ctx context.Context, execID, name string, payload []byte) error {
+	if !tokenPattern.MatchString(execID) {
+		return fmt.Errorf("signal: invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
+	if !tokenPattern.MatchString(name) {
+		return fmt.Errorf("signal: invalid signal name %q: must match [A-Za-z0-9_-]{1,128}", name)
+	}
+
 	_, err := s.js.Publish(ctx, s.Subject(execID, name), payload)
+
 	return err
 }
 
@@ -83,8 +102,17 @@ const (
 // handler must persist state before returning nil; only then is the message
 // acked (CAS-before-ack). A returned error triggers redelivery. The returned
 // ConsumeContext must be stopped by the caller.
+//
+// A handler error normally Naks for redelivery, but a signal is dead-lettered
+// (Term) when the handler returns a terminal error (interface{ Terminal() bool }
+// → true) or after maxDeliver deliveries, so a persistently unappliable signal
+// cannot Nak-loop forever (the waiting execution falls back to its wait timeout).
+// onDeadLetter (when non-nil) is called with the execution id, signal name, reason
+// and delivery count just before a Term, so the caller can record a durable trace.
 func (s *Signals) Consume(
-	ctx context.Context, durable string, handler func(context.Context, Delivery) error,
+	ctx context.Context, durable string, maxDeliver int,
+	onDeadLetter func(execID, name, reason string, deliveries uint64),
+	handler func(context.Context, Delivery) error,
 ) (jetstream.ConsumeContext, error) {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
 		Durable:       durable,
@@ -99,7 +127,21 @@ func (s *Signals) Consume(
 	return cons.Consume(func(msg jetstream.Msg) {
 		execID, name, ok := s.parseSubject(msg.Subject())
 		if !ok {
+			// Unparseable subjects can never be applied; Term, but leave a
+			// durable trace instead of dropping the signal invisibly.
+			slog.Warn("dead-lettering signal with unparseable subject", "subject", msg.Subject())
+
+			if onDeadLetter != nil {
+				var deliveries uint64
+				if meta, metaErr := msg.Metadata(); metaErr == nil {
+					deliveries = meta.NumDelivered
+				}
+
+				onDeadLetter(msg.Subject(), "", "unparseable signal subject", deliveries)
+			}
+
 			_ = msg.Term()
+
 			return
 		}
 
@@ -110,13 +152,38 @@ func (s *Signals) Consume(
 		}
 
 		d := Delivery{ExecID: execID, Name: name, Seq: meta.Sequence.Stream, Payload: msg.Data()}
-		if handlerErr := handler(ctx, d); handlerErr != nil {
-			_ = msg.NakWithDelay(signalNakDelay)
+
+		handlerErr := handler(ctx, d)
+		if handlerErr == nil {
+			_ = msg.Ack()
 			return
 		}
 
-		_ = msg.Ack()
+		//nolint:gosec // maxDeliver is a small positive config value
+		exhausted := maxDeliver > 0 && meta.NumDelivered >= uint64(maxDeliver)
+		if isTerminal(handlerErr) || exhausted {
+			slog.Warn("dead-lettering signal", "exec", execID, "name", name, "err", handlerErr)
+
+			if onDeadLetter != nil {
+				onDeadLetter(execID, name, handlerErr.Error(), meta.NumDelivered)
+			}
+
+			_ = msg.Term()
+
+			return
+		}
+
+		_ = msg.NakWithDelay(signalNakDelay)
 	})
+}
+
+// isTerminal reports whether err (or one it wraps) declares itself non-retryable
+// via interface{ Terminal() bool }. Structural so this package need not import
+// the runtime package that defines the terminal error.
+func isTerminal(err error) bool {
+	var t interface{ Terminal() bool }
+
+	return errors.As(err, &t) && t.Terminal()
 }
 
 // parseSubject extracts execID and signal name from "<prefix><exec>.<name>".

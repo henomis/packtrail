@@ -48,7 +48,7 @@ func consume(ctx context.Context, t *testing.T, sigs *signal.Signals, durable st
 
 	ch := make(chan signal.Delivery, 8)
 
-	cc, err := sigs.Consume(ctx, durable, func(_ context.Context, d signal.Delivery) error {
+	cc, err := sigs.Consume(ctx, durable, 10, nil, func(_ context.Context, d signal.Delivery) error {
 		ch <- d
 		return nil
 	})

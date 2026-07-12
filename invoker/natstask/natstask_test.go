@@ -34,7 +34,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 	var gotReq protocol.TaskRequest
 
 	// Worker subscribes under the namespaced subject the invoker will use.
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
 		gotReq = req
 		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage(`{"ok":true}`)}, nil
 	})
@@ -75,7 +75,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 func TestInvokeMapsError(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusError, Error: "permanent"}, nil
 	})
 	if err != nil {
@@ -116,7 +116,7 @@ func TestInvokeNoWorkerReturnsError(t *testing.T) {
 func TestNewDefaultsPrefix(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
 	})
 	if err != nil {

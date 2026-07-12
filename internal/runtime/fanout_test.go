@@ -84,12 +84,18 @@ func TestFanoutFaninAll(t *testing.T) {
 	if !doneCalled.Load() {
 		t.Error("done task was not reached")
 	}
-	// Branch results were merged into the shared payload.
-	var root map[string]json.RawMessage
 
-	_ = json.Unmarshal(ex.Payload, &root)
-	if _, ok := root["branches"]; !ok {
-		t.Errorf("merged branch results missing from payload: %s", ex.Payload)
+	// Branch outputs live in the data plane under results.<branch>.
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	got := parseCtx(t, doc)
+	for _, b := range []string{"x", "y", "z"} {
+		if len(got.Results[b]) == 0 {
+			t.Errorf("results.%s missing from the assembled context: %s", b, doc)
+		}
 	}
 }
 

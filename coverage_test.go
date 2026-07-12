@@ -67,7 +67,8 @@ func TestWithFlowsDir(t *testing.T) {
 		t.Fatalf("write flow: %v", err)
 	}
 
-	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("fdir"), packtrail.WithFlowsDir(dir))
+	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("fdir"), packtrail.WithFlowsDir(dir),
+		packtrail.WithInvoker("custom", okInvoker()))
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -154,7 +155,8 @@ func TestObservabilityMethods(t *testing.T) {
 func TestGetNotFound(t *testing.T) {
 	srv := natstest.Start(t)
 
-	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("gnf"), packtrail.WithFlow([]byte(oneTaskFlow)))
+	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("gnf"), packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()))
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -248,6 +250,133 @@ edges:
 		return getErr == nil && ex.Status == packtrail.ExecCompleted
 	}); !ok {
 		t.Fatal("execution did not complete after signal")
+	}
+}
+
+// TestServerStartWithID verifies the public idempotent Start: a retry with the
+// same id returns the same id and leaves exactly one execution.
+func TestServerStartWithID(t *testing.T) {
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("idem"),
+		packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	const key = "invoice-987"
+
+	id1, err := s.StartWithID(ctx, key, "one", nil)
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+
+	id2, err := s.StartWithID(ctx, key, "one", nil)
+	if err != nil {
+		t.Fatalf("retry start: %v", err)
+	}
+
+	if id1 != key || id2 != key {
+		t.Fatalf("ids = %q, %q; want both %q", id1, id2, key)
+	}
+
+	if ok := poll(t, 10*time.Second, func() bool {
+		ex, getErr := s.Get(ctx, key)
+		return getErr == nil && ex.Status == packtrail.ExecCompleted
+	}); !ok {
+		t.Fatal("execution did not complete")
+	}
+
+	// Exactly one execution exists despite the duplicate Start.
+	ids, err := s.List(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != key {
+		t.Fatalf("List = %v, %v; want exactly [%s]", ids, err, key)
+	}
+
+	// An invalid id is rejected.
+	if _, badErr := s.StartWithID(ctx, "bad id.with*chars", "one", nil); badErr == nil {
+		t.Fatal("StartWithID with invalid id: got nil error, want rejection")
+	}
+}
+
+// TestServerCancel cancels an execution parked on a signal via Server.Cancel and
+// verifies it settles to cancelled, the visibility index reflects the cancelled
+// status, and a later signal does not revive it.
+func TestServerCancel(t *testing.T) {
+	const sigFlow = `
+version: "1.0"
+name: cancelflow
+nodes:
+  - {id: gate, type: signal, signal_name: approval, timeout: 24h}
+  - {id: done, type: task, invoker: custom, target: t}
+edges:
+  - {from: gate, to: done}
+`
+
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("cancel"),
+		packtrail.WithFlow([]byte(sigFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+		packtrail.WithReconcileActive("* * * * * *"),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	id, err := s.Start(ctx, "cancelflow", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	if ok := poll(t, 10*time.Second, func() bool {
+		ex, getErr := s.Get(ctx, id)
+		return getErr == nil && ex.Status == packtrail.ExecWaiting
+	}); !ok {
+		t.Fatal("execution did not reach waiting state")
+	}
+
+	if cancelErr := s.Cancel(ctx, id, "operator abort"); cancelErr != nil {
+		t.Fatalf("cancel: %v", cancelErr)
+	}
+
+	ex, err := s.Get(ctx, id)
+	if err != nil || ex.Status != packtrail.ExecCancelled || ex.Error != "operator abort" {
+		t.Fatalf("after cancel: status=%q reason=%q err=%v, want cancelled/operator abort", ex.Status, ex.Error, err)
+	}
+
+	// The visibility index (eventually consistent) reflects the cancelled status.
+	if ok := poll(t, 10*time.Second, func() bool {
+		byStatus, _ := s.ByStatus(ctx, packtrail.ExecCancelled)
+		return len(byStatus) == 1 && byStatus[0] == id
+	}); !ok {
+		t.Fatal("ByStatus did not index the cancelled execution")
+	}
+
+	// A late signal must not revive a cancelled execution.
+	if signalErr := s.Signal(ctx, id, "approval", json.RawMessage(`{"approved":true}`)); signalErr != nil {
+		t.Fatalf("signal: %v", signalErr)
+	}
+
+	if ok := poll(t, 2*time.Second, func() bool {
+		cur, getErr := s.Get(ctx, id)
+		return getErr == nil && cur.Status != packtrail.ExecCancelled
+	}); ok {
+		t.Fatal("cancelled execution was revived by a late signal")
 	}
 }
 

@@ -1,4 +1,4 @@
-.PHONY: all test lint fmt vet clean coverage help license tidy fix doc check ui modernize
+.PHONY: all test lint fmt vet clean coverage help license tidy fix doc check ui build-ui modernize
 
 # Variables
 GO := go
@@ -6,6 +6,7 @@ GOFLAGS := -v
 MODULE := $(shell $(GO) list -m)
 PKGS := $(shell $(GO) list ./... | grep -v /examples/)
 GOLANGCI_LINT := golangci-lint
+BIN_DIR := bin
 
 # Default target
 all: test lint
@@ -21,6 +22,7 @@ help:
 	@echo "  make tidy        - Tidy and verify go modules"
 	@echo "  make coverage    - Generate test coverage report"
 	@echo "  make ui          - Run the packtrail-ui dashboard"
+	@echo "  make build-ui    - Build the packtrail-ui binary into bin/"
 	@echo "  make clean       - Clean build artifacts and cache"
 	@echo "  make license     - Add license headers to all Go files"
 	@echo "  make modernize   - Apply Go modernization fixes (go tool modernize)"
@@ -42,6 +44,11 @@ coverage:
 ui:
 	@echo "Starting packtrail-ui on :8088 (NATS_URL defaults to nats://localhost:4222)..."
 	$(GO) run ./cmd/packtrail-ui --namespace packtrail --addr :8088
+
+## build-ui: Build the packtrail-ui binary (static assets are embedded; honors GOOS/GOARCH)
+build-ui:
+	@echo "Building $(BIN_DIR)/packtrail-ui..."
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $(BIN_DIR)/packtrail-ui ./cmd/packtrail-ui
 
 ## lint: Run golangci-lint
 lint:
@@ -75,6 +82,7 @@ tidy:
 clean:
 	@echo "Cleaning..."
 	rm -f coverage.out coverage.html
+	rm -rf $(BIN_DIR)
 
 ## license: Add Apache license headers to all Go files
 license:

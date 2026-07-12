@@ -10,6 +10,7 @@
   --waiting: #6ea8fe;
   --completed: #3ecf8e;
   --failed: #ff5d5d;
+  --cancelled: #9aa0a6;
 }
 * { box-sizing: border-box; }
 body {
@@ -22,8 +23,25 @@ header {
 }
 header h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
 header .sub { color: var(--muted); font-size: 13px; }
+header .dlq {
+  margin-left: auto; cursor: pointer;
+  background: rgba(255,93,93,.14); color: var(--failed);
+  border: 1px solid rgba(255,93,93,.4); border-radius: 999px;
+  padding: 2px 12px; font-size: 12px; font-weight: 600;
+}
+header .dlq:hover { background: rgba(255,93,93,.24); }
+header .dlq[hidden] { display: none; }
 header .conn { margin-left: auto; color: var(--failed); font-size: 12px; }
+header .dlq + .conn { margin-left: 10px; }
 header .conn.live { color: var(--completed); }
+
+.data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.data-table th {
+  text-align: left; color: var(--muted); font-weight: 600; text-transform: uppercase;
+  letter-spacing: .5px; font-size: 11px; padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.data-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.data-table .id { font-family: ui-monospace, monospace; color: var(--muted); }
 
 main { display: grid; grid-template-columns: 340px 1fr; height: calc(100vh - 49px); }
 #sidebar { border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel); }
@@ -49,8 +67,18 @@ main { display: grid; grid-template-columns: 340px 1fr; height: calc(100vh - 49p
 }
 .badge.running { background: rgba(245,166,35,.18); color: var(--running); }
 .badge.waiting { background: rgba(110,168,254,.18); color: var(--waiting); }
+.badge.pending { background: rgba(110,168,254,.18); color: var(--waiting); }
 .badge.completed { background: rgba(62,207,142,.18); color: var(--completed); }
 .badge.failed { background: rgba(255,93,93,.18); color: var(--failed); }
+.badge.cancelled { background: rgba(154,160,166,.18); color: var(--cancelled); }
+
+.chips { margin: 8px 0; color: var(--muted); font-size: 12px; }
+.chip {
+  display: inline-block; padding: 1px 10px; border-radius: 999px;
+  background: rgba(110,168,254,.14); color: var(--waiting);
+  border: 1px solid rgba(110,168,254,.35); font-size: 11px; font-weight: 600;
+}
+.hint { color: var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
 
 #detail { overflow-y: auto; padding: 18px 22px; }
 #detail .empty { color: var(--muted); }
@@ -66,10 +94,14 @@ pre {
 
 .graph { width: 100%; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 .gnode rect { fill: var(--panel2); stroke: var(--border); stroke-width: 1.5; }
+.gnode.done rect { stroke: var(--completed); }
+.gnode.done .nid { fill: var(--completed); }
 .gnode.current rect { stroke-width: 2.5; }
 .gnode.current.running rect { stroke: var(--running); }
 .gnode.current.waiting rect { stroke: var(--waiting); }
 .gnode.current.failed rect { stroke: var(--failed); }
+.gnode.current.completed rect { stroke: var(--completed); }
+.gnode.current.cancelled rect { stroke: var(--cancelled); }
 .gnode .nid { fill: var(--text); font-size: 12px; font-weight: 600; }
 .gnode .ntype { fill: var(--muted); font-size: 10px; }
 .gedge { stroke: var(--border); stroke-width: 1.5; fill: none; }

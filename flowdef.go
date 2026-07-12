@@ -74,6 +74,22 @@ type RetryPolicy struct {
 	Backoff     string // "exponential" | "linear" | "fixed"
 }
 
+// ValidateFlowDef validates one or more FlowDefs against the full flow-graph
+// rules — node/edge structure, a unique start node, choice defaults, fan-in join
+// policy, retry bounds, etc. — without a NATS connection, so a builder can verify
+// programmatic flows offline (e.g. in a `validate` command) and catch the same
+// errors New would raise at startup. It returns the first validation error (which
+// already names the offending flow).
+func ValidateFlowDef(defs ...FlowDef) error {
+	for _, d := range defs {
+		if _, err := flowDefToDSL(d); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // flowDefToDSL converts a FlowDef into a validated *dsl.Flow.
 func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 	nodes := make([]dsl.Node, len(f.Nodes))

@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -28,12 +30,21 @@ import (
 )
 
 const (
-	execBucketHistory = 64
-	leasesBucketTTL   = 5 * time.Minute
-	eventsMaxAge      = 24 * time.Hour
-	casBackoffBase    = 250 * time.Microsecond
-	casBackoffCap     = 5 * time.Millisecond
+	execBucketHistory  = 64
+	leasesBucketTTL    = 5 * time.Minute
+	eventsMaxAge       = 24 * time.Hour
+	deadLetterMaxAge   = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
+	deadLetterReadWait = 500 * time.Millisecond
+	defaultDLQReadCap  = 100
+	casBackoffBase     = 250 * time.Microsecond
+	casBackoffCap      = 5 * time.Millisecond
 )
+
+// DefaultMaxPayloadBytes caps a single data-plane entry (a start input, one
+// node's output, one signal payload) by default. It sits well below NATS's
+// 1 MiB max message size. Override with SetMaxPayloadBytes; a non-positive
+// limit disables the guard.
+const DefaultMaxPayloadBytes = 512 << 10 // 512 KiB
 
 // ErrConflict is returned when a CAS write loses to a concurrent writer and the
 // caller's revision is stale.
@@ -42,21 +53,39 @@ var ErrConflict = errors.New("store: revision conflict")
 // ErrNotFound is returned when an execution key does not exist.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrAlreadyExists is returned by Create when an execution with the same id
+// already exists. Callers use it to make Create idempotent (e.g. a caller-supplied
+// execution id that dedups a retried Start).
+var ErrAlreadyExists = errors.New("store: already exists")
+
+// ErrPayloadTooLarge is returned when a write would persist an execution whose
+// payload exceeds the configured max size. The write is rejected before it
+// reaches NATS, so the previously persisted (within-limit) state is preserved and
+// callers can still record a failure against it.
+var ErrPayloadTooLarge = errors.New("store: payload exceeds max size")
+
 // Store provides access to all Packtrail KV buckets and streams.
 type Store struct {
-	js        jetstream.JetStream
-	names     names.Names
-	exec      jetstream.KeyValue
-	archive   jetstream.KeyValue // cold store for aged-out terminal execs; nil unless EnableArchive ran
-	leases    jetstream.KeyValue
-	idxStatus jetstream.KeyValue
-	idxFlow   jetstream.KeyValue
+	js              jetstream.JetStream
+	names           names.Names
+	exec            jetstream.KeyValue
+	archive         jetstream.KeyValue // cold store for aged-out terminal execs; nil unless EnableArchive ran
+	leases          jetstream.KeyValue
+	idxStatus       jetstream.KeyValue
+	idxFlow         jetstream.KeyValue
+	payloads        jetstream.KeyValue // the data plane: start inputs, node outputs, signal payloads
+	maxPayloadBytes int                // per-entry payload-size guard; <= 0 disables it
+
+	casConflicts atomic.Uint64 // cumulative CAS-conflict retries across all Mutate calls
+	deadLetters  atomic.Uint64 // cumulative dead-letters emitted by this instance
+
+	historyEnabled atomic.Bool // set by EnableHistory; EmitEvent mirrors events into the history stream
 }
 
 // Open ensures every bucket and stream exists, under the given namespace, and
 // returns a ready Store.
 func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, error) {
-	s := &Store{js: js, names: n}
+	s := &Store{js: js, names: n, maxPayloadBytes: DefaultMaxPayloadBytes}
 
 	var err error
 
@@ -85,6 +114,10 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 		return nil, fmt.Errorf("idx-flow bucket: %w", err)
 	}
 
+	if s.payloads, err = js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: n.BucketPayloads}); err != nil {
+		return nil, fmt.Errorf("payloads bucket: %w", err)
+	}
+
 	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      n.StreamEvents,
 		Subjects:  []string{n.SubjEventsPrefix + ">"},
@@ -104,6 +137,16 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 		return nil, fmt.Errorf("work stream: %w", err)
 	}
 
+	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      n.StreamDeadLetter,
+		Subjects:  []string{n.SubjDeadLetterPrefix + ">"},
+		MaxAge:    deadLetterMaxAge,
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+	}); err != nil {
+		return nil, fmt.Errorf("deadletter stream: %w", err)
+	}
+
 	return s, nil
 }
 
@@ -121,8 +164,135 @@ func (s *Store) IdxStatus() jetstream.KeyValue { return s.idxStatus }
 // IdxFlow exposes the by-flow visibility index bucket.
 func (s *Store) IdxFlow() jetstream.KeyValue { return s.idxFlow }
 
-// Create persists a new execution and returns its initial revision.
+// CASConflicts returns the cumulative number of CAS-conflict retries observed
+// across all Mutate calls. It is a monotonic counter useful for observing
+// write-contention pressure (e.g. wide fanout on a single execution key).
+func (s *Store) CASConflicts() uint64 { return s.casConflicts.Load() }
+
+// DeadLetters returns the cumulative number of dead-letter records this Store
+// instance has emitted since start. It is an in-process counter (resets on
+// restart); for a durable, cross-instance total use DeadLetterCount, which reads
+// the dead-letter stream's depth.
+func (s *Store) DeadLetters() uint64 { return s.deadLetters.Load() }
+
+// EmitDeadLetter appends a dead-letter record to the packtrail-deadletter stream
+// and bumps the in-process counter, so a consumer that gives up on poisoned work
+// (Term) leaves a durable, queryable trace instead of only a log line.
+func (s *Store) EmitDeadLetter(ctx context.Context, dl DeadLetter) error {
+	if dl.Time.IsZero() {
+		dl.Time = time.Now().UTC()
+	}
+
+	data, err := json.Marshal(dl)
+	if err != nil {
+		return err
+	}
+
+	if _, err = s.js.Publish(ctx, s.names.SubjDeadLetterPrefix+dl.Kind, data); err != nil {
+		return err
+	}
+
+	s.deadLetters.Add(1)
+
+	return nil
+}
+
+// DeadLetterCount returns the durable number of dead-letter records currently
+// retained in the packtrail-deadletter stream (bounded by its retention). Unlike
+// DeadLetters it is cross-instance and survives restarts.
+func (s *Store) DeadLetterCount(ctx context.Context) (uint64, error) {
+	stream, err := s.js.Stream(ctx, s.names.StreamDeadLetter)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.State.Msgs, nil
+}
+
+// RecentDeadLetters returns up to limit of the most recent dead-letter records,
+// oldest-first (limit <= 0 uses a default cap). It reads the tail of the
+// dead-letter stream via an ordered consumer, so the cost is bounded by limit, not
+// by total volume.
+func (s *Store) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	if limit <= 0 {
+		limit = defaultDLQReadCap
+	}
+
+	stream, err := s.js.Stream(ctx, s.names.StreamDeadLetter)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.State.Msgs == 0 {
+		return nil, nil
+	}
+
+	start := uint64(1)
+	if last := info.State.LastSeq; last > uint64(limit) { //nolint:gosec // limit is a small positive cap
+		start = last - uint64(limit) + 1
+	}
+
+	cons, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:   start,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	batch, err := cons.Fetch(limit, jetstream.FetchMaxWait(deadLetterReadWait))
+	if err != nil {
+		return nil, err
+	}
+
+	var out []DeadLetter
+
+	for msg := range batch.Messages() {
+		var dl DeadLetter
+		if json.Unmarshal(msg.Data(), &dl) == nil {
+			out = append(out, dl)
+		}
+	}
+
+	if batch.Error() != nil {
+		return out, batch.Error()
+	}
+
+	return out, nil
+}
+
+// SetMaxPayloadBytes sets the maximum size, in bytes, of a single data-plane
+// entry (a start input, one node's output, one signal payload). A write that
+// exceeds it is rejected with ErrPayloadTooLarge before it reaches NATS (see
+// PutPayload). A non-positive limit disables the guard. Call before the store
+// is used (it is not safe to change concurrently with writes).
+func (s *Store) SetMaxPayloadBytes(n int) { s.maxPayloadBytes = n }
+
+// Create persists a new execution and returns its initial revision. The id is
+// deduped against the cold archive as well as the hot bucket: a retried
+// StartWithID whose original execution was already swept into the archive must
+// return ErrAlreadyExists, not silently re-run the whole flow under the same
+// idempotency key. (Residual race: a sweep moving the id between this check and
+// the hot create can still let a concurrent re-create through — NATS offers no
+// cross-bucket atomicity — but that requires retrying a key whose execution is
+// simultaneously being archived.)
 func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
+	if _, err := s.getArchived(ctx, e.ID); err == nil {
+		return 0, fmt.Errorf("%w: execution %s (archived)", ErrAlreadyExists, e.ID)
+	} else if !errors.Is(err, ErrNotFound) {
+		return 0, err
+	}
+
 	e.UpdatedAt = time.Now().UTC()
 
 	data, err := json.Marshal(e)
@@ -132,6 +302,10 @@ func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 
 	rev, err := s.exec.Create(ctx, e.ID, data)
 	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyExists) {
+			return 0, fmt.Errorf("%w: execution %s", ErrAlreadyExists, e.ID)
+		}
+
 		return 0, err
 	}
 
@@ -146,10 +320,24 @@ func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 // archive's retention expires. The hot bucket remains the source of truth for
 // mutations; archived executions are terminal and never mutated.
 func (s *Store) Get(ctx context.Context, id string) (*Execution, error) {
+	e, err := s.getHot(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return s.getArchived(ctx, id)
+	}
+
+	return e, err
+}
+
+// getHot loads an execution from the hot bucket only, with no archive fallback.
+// Mutate uses it because mutations target the hot bucket exclusively: an archived
+// execution is terminal and immutable, and a CAS write against a revision read
+// from the archive could never succeed (the hot key does not exist) — it would
+// burn the whole Mutate retry budget before failing.
+func (s *Store) getHot(ctx context.Context, id string) (*Execution, error) {
 	entry, err := s.exec.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			return s.getArchived(ctx, id)
+			return nil, ErrNotFound
 		}
 
 		return nil, err
@@ -214,11 +402,13 @@ func (s *Store) update(ctx context.Context, e *Execution) (uint64, error) {
 
 // Mutate runs a read-modify-write CAS loop: it loads the execution, applies fn,
 // and writes it back, retrying the whole cycle on a concurrent-write conflict.
-// The mutated execution (with its new revision) is returned.
+// The mutated execution (with its new revision) is returned. Mutate reads the
+// hot bucket only (no archive fallback): archived executions are terminal and
+// immutable, so mutating one returns ErrNotFound.
 func (s *Store) Mutate(ctx context.Context, id string, fn func(*Execution) error) (*Execution, error) {
 	const maxAttempts = 64
 	for attempt := range maxAttempts {
-		e, err := s.Get(ctx, id)
+		e, err := s.getHot(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -231,6 +421,7 @@ func (s *Store) Mutate(ctx context.Context, id string, fn func(*Execution) error
 		_, updateErr := s.update(ctx, e)
 		if updateErr != nil {
 			if errors.Is(updateErr, ErrConflict) {
+				s.casConflicts.Add(1)
 				// Back off with jitter to break livelock under contention
 				// (e.g. many fanout branches writing the same execution).
 				select {
@@ -280,9 +471,19 @@ func (s *Store) EmitEvent(ctx context.Context, e *Execution) error {
 		return err
 	}
 
-	_, err = s.js.Publish(ctx, s.names.SubjEventsPrefix+e.ID, data)
+	if _, err = s.js.Publish(ctx, s.names.SubjEventsPrefix+e.ID, data); err != nil {
+		return err
+	}
 
-	return err
+	// History mirrors the event, best-effort: a lost trace record must never
+	// fail (or retry) the transition that emitted it.
+	if s.historyEnabled.Load() {
+		if _, histErr := s.js.Publish(ctx, s.names.SubjHistoryPrefix+e.ID, data); histErr != nil {
+			slog.Debug("emit history", "exec", e.ID, "err", histErr)
+		}
+	}
+
+	return nil
 }
 
 // ListExecutionKeys returns all execution ids currently stored. Used by the
@@ -374,7 +575,7 @@ func (s *Store) ForEachExecution(ctx context.Context, fn func(*Execution) error)
 // EnableArchive creates (or attaches to) the cold archive bucket with a
 // bucket-wide retention TTL, so swept terminal executions are kept queryable for
 // roughly retention and then expire automatically. It must be called before the
-// archive is used; ArchiveCompleted and Get's fallback are no-ops until it runs.
+// archive is used; ArchiveTerminal and Get's fallback are no-ops until it runs.
 func (s *Store) EnableArchive(ctx context.Context, retention time.Duration) error {
 	archive, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:  s.names.BucketExecArchive,
@@ -390,14 +591,14 @@ func (s *Store) EnableArchive(ctx context.Context, retention time.Duration) erro
 	return nil
 }
 
-// ArchiveCompleted moves every completed execution out of the hot bucket into
-// the cold archive, returning how many it moved. Only completed executions are
-// archived: they are truly terminal, whereas failed executions remain hot so
+// ArchiveTerminal moves every archivable execution (terminal and non-resumable:
+// completed or cancelled — see Execution.Archivable) out of the hot bucket into
+// the cold archive, returning how many it moved. Failed executions remain hot so
 // they can still be resumed. Each execution is written to the archive before it
 // is deleted from the hot bucket, so a crash mid-sweep can duplicate but never
 // lose one; a later sweep re-archives idempotently. It is a no-op when archival
 // is disabled.
-func (s *Store) ArchiveCompleted(ctx context.Context) (int, error) {
+func (s *Store) ArchiveTerminal(ctx context.Context) (int, error) {
 	if s.archive == nil {
 		return 0, nil
 	}
@@ -407,7 +608,7 @@ func (s *Store) ArchiveCompleted(ctx context.Context) (int, error) {
 	var pending [][]byte
 
 	err := s.ForEachExecution(ctx, func(e *Execution) error {
-		if e.Status != StatusCompleted {
+		if !e.Archivable() {
 			return nil
 		}
 
@@ -436,10 +637,19 @@ func (s *Store) ArchiveCompleted(ctx context.Context) (int, error) {
 			return moved, putErr
 		}
 
-		// Completed is final, so a plain delete cannot race a concurrent
-		// transition; tolerate an already-deleted key.
+		// An archivable execution is terminal and non-resumable, so a plain delete
+		// cannot race a concurrent transition; tolerate an already-deleted key.
 		if delErr := s.exec.Delete(ctx, e.ID); delErr != nil && !errors.Is(delErr, jetstream.ErrKeyNotFound) {
 			return moved, delErr
+		}
+
+		// The archive keeps the control metadata; the data plane is dropped —
+		// an archived execution's outputs are no longer readable. Best-effort:
+		// a failure leaves orphaned entries (the visibility GC re-deletes them
+		// when the archive record eventually expires) and never blocks the
+		// sweep.
+		if delErr := s.DeletePayloads(ctx, e.ID); delErr != nil {
+			slog.Debug("archive: delete payloads", "exec", e.ID, "err", delErr)
 		}
 
 		moved++

@@ -222,3 +222,81 @@ func TestWorkerErrorMapsToRetry(t *testing.T) {
 		t.Errorf("status: got %q, want retry", calls[0].res.Status)
 	}
 }
+
+// observeCallBudget dispatches one job whose node deadline is now+nodeTimeout
+// (nodeTimeout==0 means "no node deadline") to a worker configured with the given
+// activity-timeout backstop, and returns the call budget (ctx deadline) the
+// embedder's Invoker actually received.
+func observeCallBudget(t *testing.T, activityTimeout, nodeTimeout time.Duration) time.Duration {
+	t.Helper()
+
+	srv := natstest.Start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	const prefix, kind = "t", "echo"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	budget := make(chan time.Duration, 1)
+	exec := invoker.Func(func(callCtx context.Context, _ invoker.Request) (invoker.Result, error) {
+		dl, ok := callCtx.Deadline()
+		if !ok {
+			budget <- 0
+		} else {
+			budget <- time.Until(dl)
+		}
+
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+
+	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, newFakeCompleter(),
+		asyncqueue.WithActivityTimeout(activityTimeout))
+
+	go func() { _ = w.Run(ctx) }()
+
+	req := invoker.Request{ExecutionID: "e1", NodeID: "n1", Target: "agentA"}
+	if nodeTimeout > 0 {
+		req.Deadline = time.Now().Add(nodeTimeout)
+	}
+
+	if _, err := asyncqueue.NewDispatcher(srv.JS, prefix, kind).Invoke(ctx, req); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	select {
+	case d := <-budget:
+		return d
+	case <-time.After(5 * time.Second):
+		t.Fatal("exec never ran")
+		return 0
+	}
+}
+
+// TestWorkerHonorsNodeTimeout is the §4b fix: a per-node timeout shorter than the
+// worker's activityTimeout backstop must bound the actual invocation (previously
+// it was silently widened to the backstop).
+func TestWorkerHonorsNodeTimeout(t *testing.T) {
+	// Large backstop, small node timeout: the call must reflect the node timeout.
+	got := observeCallBudget(t, time.Hour, 200*time.Millisecond)
+	if got <= 0 || got > 30*time.Second {
+		t.Fatalf("call budget = %v, want ~200ms (the node timeout, not the 1h backstop)", got)
+	}
+}
+
+// TestWorkerActivityTimeoutCaps verifies the backstop relationship in both
+// directions: a node timeout longer than the backstop is capped at it, and a
+// node with no timeout runs at the full backstop.
+func TestWorkerActivityTimeoutCaps(t *testing.T) {
+	// Node timeout (1h) longer than the 200ms backstop → capped at the backstop.
+	if got := observeCallBudget(t, 200*time.Millisecond, time.Hour); got <= 0 || got > 30*time.Second {
+		t.Fatalf("capped budget = %v, want ~200ms (the activityTimeout backstop)", got)
+	}
+
+	// No node timeout → the full backstop applies.
+	if got := observeCallBudget(t, 90*time.Second, 0); got < 30*time.Second {
+		t.Fatalf("budget without node timeout = %v, want ~90s (the activityTimeout)", got)
+	}
+}

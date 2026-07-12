@@ -10,6 +10,7 @@
   <header>
     <h1>packtrail</h1>
     <span class="sub">observability</span>
+    <button id="dlq" class="dlq" hidden title="dead-lettered work — click to inspect"></button>
     <span id="conn" class="conn" title="live event stream">●</span>
   </header>
 
@@ -23,6 +24,7 @@
           <option value="waiting">waiting</option>
           <option value="completed">completed</option>
           <option value="failed">failed</option>
+          <option value="cancelled">cancelled</option>
         </select>
       </div>
       <ul id="exec-list"></ul>

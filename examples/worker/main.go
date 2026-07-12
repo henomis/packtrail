@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command worker is a tiny example task service for the research-pipeline flow.
-// It serves every tasks.* subject with an echo handler that records which node
-// ran into the shared payload, demonstrating the pkg/protocol contract.
+// Command worker is a tiny external task service for the research-pipeline
+// flow, demonstrating the pkg/protocol request/reply contract without
+// importing the packtrail engine at all.
 //
-//	go run ./examples/worker --nats nats://127.0.0.1:4222
+// Workers join the "packtrail-workers" queue group, so this process can run
+// alongside an engine that co-hosts its own handlers (./examples/embedded) and
+// the two will load-balance the same subjects:
+//
+//	go run ./examples/embedded --namespace acme &
+//	go run ./examples/worker  --namespace acme
 package main
 
 import (
@@ -50,6 +55,11 @@ func main() {
 	}
 	defer nc.Close()
 
+	// The worker's lifetime context: cancelling it (SIGINT/SIGTERM) cancels
+	// in-flight handler invocations.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// One wildcard subscription per task type. The trailing "*" matches the
 	// execution id segment templated by {execution_id}.
 	// ServeNamespaced prepends the namespace so subjects become e.g.
@@ -64,30 +74,25 @@ func main() {
 	}
 	for _, subj := range subjects {
 		s := subj
-		if _, err := protocol.ServeNamespaced(nc, *namespace, s, echo(s)); err != nil {
+		if _, err := protocol.ServeNamespaced(ctx, nc, *namespace, s, echo(s)); err != nil {
 			log.Fatalf("serve %s: %v", s, err)
 		}
 	}
 
 	fmt.Printf("worker serving %d task subjects (namespace %s) on %s\n", len(subjects), *namespace, *url)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	<-ctx.Done()
 }
 
-// echo returns a handler that marks the node as done in the shared payload and
-// echoes it back.
+// echo returns a handler that reports this node's own output — stored by the
+// engine as the node's data-plane entry and visible downstream as
+// results.<node>. req.Payload carries the assembled {input, results, signals}
+// context if the handler needs earlier outputs.
 func echo(subject string) protocol.Handler {
 	return func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
 		fmt.Printf("[%s] node=%s exec=%s attempt=%d\n", subject, req.NodeID, req.ExecutionID, req.Attempt)
 
-		root := map[string]json.RawMessage{}
-		_ = json.Unmarshal(req.Payload, &root)
-		root[req.NodeID] = json.RawMessage(`"done"`)
-
-		out, err := json.Marshal(root)
+		out, err := json.Marshal(map[string]string{"node": req.NodeID, "served_by": "external-worker"})
 		if err != nil {
 			return protocol.TaskResponse{Status: protocol.StatusError, Error: err.Error()}, nil
 		}

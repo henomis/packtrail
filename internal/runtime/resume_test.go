@@ -57,15 +57,15 @@ func TestResumeFailedExecution(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 
-	sch, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sch := scheduler.New(srv.JS, names.New(""))
+	if err := sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
 	flow, _ := dsl.Parse([]byte(resumeFlow))
 	inv := &flakyInvoker{}
 
-	eng, err := New(inv, st, sch, map[string]*dsl.Flow{flow.Name: flow}, Config{})
+	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, Config{})
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
@@ -105,9 +105,15 @@ func TestResumeFailedExecution(t *testing.T) {
 		t.Fatalf("resume: %v", resumeErr)
 	}
 
-	ex := waitFor(id, store.StatusCompleted)
-	if string(ex.Payload) != `{"done":true}` {
-		t.Errorf("payload = %s, want {\"done\":true}", ex.Payload)
+	waitFor(id, store.StatusCompleted)
+
+	doc, err := eng.Results(ctx, id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	if got := parseCtx(t, doc); string(got.Results["a"]) != `{"done":true}` {
+		t.Errorf("results.a = %s, want {\"done\":true}", got.Results["a"])
 	}
 
 	// Resuming a non-failed (now completed) execution is an error.

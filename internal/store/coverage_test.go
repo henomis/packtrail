@@ -81,12 +81,12 @@ func TestCreateDuplicate(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
-	e := &Execution{ID: "dup", Status: StatusRunning, Payload: json.RawMessage(`{}`)}
+	e := &Execution{ID: "dup", Status: StatusRunning}
 	if _, err := s.Create(ctx, e); err != nil {
 		t.Fatalf("first create: %v", err)
 	}
 
-	if _, err := s.Create(ctx, &Execution{ID: "dup", Status: StatusRunning, Payload: json.RawMessage(`{}`)}); err == nil {
+	if _, err := s.Create(ctx, &Execution{ID: "dup", Status: StatusRunning}); err == nil {
 		t.Fatal("second create on same id succeeded, want error")
 	}
 }
@@ -107,7 +107,7 @@ func TestMutateFnError(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
-	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning, Payload: json.RawMessage(`{}`)}); err != nil {
+	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +168,7 @@ func TestListExecutionKeys(t *testing.T) {
 	}
 
 	for _, id := range []string{"a", "b", "c"} {
-		if _, createErr := s.Create(ctx, &Execution{ID: id, Status: StatusRunning, Payload: json.RawMessage(`{}`)}); createErr != nil {
+		if _, createErr := s.Create(ctx, &Execution{ID: id, Status: StatusRunning}); createErr != nil {
 			t.Fatal(createErr)
 		}
 	}
@@ -288,7 +288,7 @@ func TestOperationsContextError(t *testing.T) {
 	s := open(t)
 
 	// Seed one execution while the context is still live.
-	if _, err := s.Create(context.Background(), &Execution{ID: "x", Status: StatusRunning, Payload: json.RawMessage(`{}`)}); err != nil {
+	if _, err := s.Create(context.Background(), &Execution{ID: "x", Status: StatusRunning}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -299,7 +299,7 @@ func TestOperationsContextError(t *testing.T) {
 		t.Error("Get with cancelled context: want error")
 	}
 
-	if _, err := s.Create(ctx, &Execution{ID: "y", Status: StatusRunning, Payload: json.RawMessage(`{}`)}); err == nil {
+	if _, err := s.Create(ctx, &Execution{ID: "y", Status: StatusRunning}); err == nil {
 		t.Error("Create with cancelled context: want error")
 	}
 

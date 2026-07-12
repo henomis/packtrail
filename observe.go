@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -75,6 +76,34 @@ type Event struct {
 	Time     time.Time `json:"time"`
 }
 
+// DeadLetter is a durable record of a work item a durable consumer gave up on
+// (Term'd) — a terminal error or an exhausted delivery cap. Kind is the source
+// consumer ("work", "schedule", "signal" or "async").
+type DeadLetter = store.DeadLetter
+
+// DeadLetterCount returns the durable number of dead-letter records retained in
+// the dead-letter stream (bounded by its ~30-day retention). It is the
+// operational signal that poisoned work is being dropped; a non-zero, growing
+// count warrants investigation.
+func (s *Server) DeadLetterCount(ctx context.Context) (uint64, error) {
+	if err := s.Init(ctx); err != nil {
+		return 0, err
+	}
+
+	return s.store.DeadLetterCount(ctx)
+}
+
+// RecentDeadLetters returns up to limit of the most recent dead-letter records,
+// oldest-first (limit <= 0 uses a sane default). Use it to inspect what poisoned
+// work was dropped and why, without scanning logs.
+func (s *Server) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	return s.store.RecentDeadLetters(ctx, limit)
+}
+
 // buildFlowGraph projects a parsed flow into its public, serialisable graph.
 func buildFlowGraph(f *dsl.Flow) FlowGraph {
 	g := FlowGraph{Name: f.Name}
@@ -110,6 +139,10 @@ func buildFlowGraph(f *dsl.Flow) FlowGraph {
 // flows this Server instance loaded), this reads the shared KV registry, so an
 // observer process that loaded no flows still sees them.
 func (s *Server) ListFlows(ctx context.Context) ([]string, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
 	keys, err := s.flowsKV.Keys(ctx)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrNoKeysFound) {
@@ -124,6 +157,10 @@ func (s *Server) ListFlows(ctx context.Context) ([]string, error) {
 
 // FlowGraph returns a flow's graph from the registry, or ErrNotFound.
 func (s *Server) FlowGraph(ctx context.Context, name string) (*FlowGraph, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
 	entry, err := s.flowsKV.Get(ctx, name)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
@@ -148,6 +185,10 @@ func (s *Server) FlowGraph(ctx context.Context, name string) (*FlowGraph, error)
 // state via Get/ByStatus first, then apply events live. The channel is closed
 // when ctx is cancelled.
 func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
 	js := s.store.JS()
 	n := s.store.Names()
 
@@ -164,9 +205,27 @@ func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
 
 	out := make(chan Event, eventChanBuf)
 
+	// cc.Stop does not wait for a callback already executing, so closing out
+	// right after it races a late sender into a send-on-closed-channel panic.
+	// The closed flag (under mu) fences that: a sender inside the critical
+	// section blocks the close until its select returns — and it always returns
+	// promptly, because the close only happens after ctx is cancelled, which is
+	// the select's other case.
+	var (
+		mu     sync.Mutex
+		closed bool
+	)
+
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
 		var ev store.Event
 		if unmarshalErr := json.Unmarshal(msg.Data(), &ev); unmarshalErr != nil {
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if closed {
 			return
 		}
 
@@ -182,6 +241,11 @@ func (s *Server) WatchEvents(ctx context.Context) (<-chan Event, error) {
 	go func() {
 		<-ctx.Done()
 		cc.Stop()
+
+		mu.Lock()
+		closed = true
+		mu.Unlock()
+
 		close(out)
 	}()
 
@@ -199,6 +263,10 @@ func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, er
 // Since KV keys have no inherent order the cap yields an arbitrary subset, not
 // an ordered page; it is a guardrail against an unbounded transfer.
 func (s *Server) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]Event, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
 	evs, err := s.indexer.ByStatusEventsLimit(ctx, status, limit)
 	if err != nil {
 		return nil, err
@@ -216,7 +284,28 @@ func (s *Server) ByFlowEvents(ctx context.Context, flow string) ([]Event, error)
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (0 = no cap). The
 // same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]Event, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
 	evs, err := s.indexer.ByFlowEventsLimit(ctx, flow, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	return convertStoreEvents(evs), nil
+}
+
+// History returns an execution's ordered transition trace (oldest first, up to
+// limit; non-positive = a generous default). It requires WithHistory —
+// otherwise it returns nothing — and records expire after the configured
+// retention.
+func (s *Server) History(ctx context.Context, execID string, limit int) ([]Event, error) {
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	evs, err := s.store.History(ctx, execID, limit)
 	if err != nil {
 		return nil, err
 	}

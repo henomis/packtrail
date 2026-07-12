@@ -22,11 +22,16 @@ import (
 	"github.com/henomis/packtrail/internal/store"
 )
 
-// stepChoice evaluates a choice node's rules in order against the shared payload
-// and advances to the first matching rule's target, or the default. A rule whose
-// expression errors (e.g. a missing field) is treated as no-match so the default
-// still applies.
+// stepChoice evaluates a choice node's rules in order against the assembled
+// invocation context ({input, results, signals}) and advances to the first
+// matching rule's target, or the default. A rule whose expression errors (e.g.
+// a missing field) is treated as no-match so the default still applies.
 func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, exec *store.Execution) error {
+	contextDoc, err := e.assembleContext(ctx, exec)
+	if err != nil {
+		return err
+	}
+
 	defaultTo := ""
 
 	for _, r := range node.Rules {
@@ -40,14 +45,14 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 			return fmt.Errorf("choice %q: expression not compiled: %q", node.ID, r.When)
 		}
 
-		match, err := prog.Match(exec.Payload)
+		match, err := prog.Match(contextDoc)
 		if err != nil {
 			e.log.Warn("choice rule eval", "node", node.ID, "when", r.When, "err", err)
 			continue
 		}
 
 		if match {
-			return e.advanceTo(ctx, exec.ID, r.To, nil)
+			return e.advanceTo(ctx, exec.ID, node.ID, r.To, nil)
 		}
 	}
 
@@ -55,5 +60,5 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 		return fmt.Errorf("choice %q: no rule matched and no default", node.ID)
 	}
 
-	return e.advanceTo(ctx, exec.ID, defaultTo, nil)
+	return e.advanceTo(ctx, exec.ID, node.ID, defaultTo, nil)
 }

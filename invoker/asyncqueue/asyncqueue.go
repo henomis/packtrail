@@ -40,6 +40,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -60,6 +61,12 @@ type job struct {
 	Attempt int             `json:"attempt"`
 	Target  string          `json:"target"`
 	Payload json.RawMessage `json:"payload"`
+	// Timeout is the node's per-call duration budget, captured at dispatch from
+	// req.Deadline. It is a duration (not the absolute deadline) on purpose: an
+	// async job may sit queued arbitrarily long before a worker runs it, and that
+	// wait must not eat the node's invocation budget. Zero means "no node bound —
+	// use the worker's activityTimeout". See Worker.invoke.
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 // StreamName derives the work-queue stream name for an async invoker kind.
@@ -112,6 +119,7 @@ func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.R
 		Attempt: req.Attempt,
 		Target:  req.Target,
 		Payload: req.Payload,
+		Timeout: nodeTimeout(req.Deadline),
 	})
 	if err != nil {
 		return invoker.Result{}, err
@@ -126,4 +134,22 @@ func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.R
 	}
 
 	return invoker.Result{Status: invoker.StatusPending}, nil
+}
+
+// nodeTimeout converts the request's absolute deadline (set by the engine to
+// now+node-timeout at dispatch) into the per-call duration budget carried on the
+// job. A zero deadline (no node timeout) maps to 0, meaning "use the worker
+// default". The conversion happens at dispatch so queue wait does not consume the
+// budget.
+func nodeTimeout(deadline time.Time) time.Duration {
+	if deadline.IsZero() {
+		return 0
+	}
+
+	d := time.Until(deadline)
+	if d < 0 {
+		d = 0
+	}
+
+	return d
 }

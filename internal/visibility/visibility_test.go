@@ -80,7 +80,7 @@ func mkExec(t *testing.T, st *store.Store, flow string) *store.Execution {
 
 	id := "exec-" + flow + "-" + time.Now().Format("150405.000000")
 
-	ex := &store.Execution{ID: id, FlowName: flow, CurrentNode: "start", Status: store.StatusRunning, Payload: json.RawMessage("{}")}
+	ex := &store.Execution{ID: id, FlowName: flow, Status: store.StatusRunning, CurrentNode: "start"}
 	if _, err := st.Create(context.Background(), ex); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -345,6 +345,10 @@ func TestGCPrunesOrphans(t *testing.T) {
 		t.Fatalf("put orphan flow: %v", err)
 	}
 
+	if _, err = st.IdxFlow().Put(ctx, metaKey("ghost"), val); err != nil {
+		t.Fatalf("put orphan meta: %v", err)
+	}
+
 	pruned, err := ix.GC(ctx, 24*time.Hour)
 	if err != nil || pruned != 1 {
 		t.Fatalf("GC = %d, %v; want 1, nil", pruned, err)
@@ -352,6 +356,10 @@ func TestGCPrunesOrphans(t *testing.T) {
 
 	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, "ghost") {
 		t.Error("GC did not prune the orphan")
+	}
+
+	if _, err = st.IdxFlow().Get(ctx, metaKey("ghost")); err == nil {
+		t.Error("GC did not prune the orphan's bookkeeping record")
 	}
 
 	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, live.ID) {

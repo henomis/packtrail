@@ -78,6 +78,62 @@ func TestCacheDedupesSameAttempt(t *testing.T) {
 	}
 }
 
+// TestCacheKeyedSeparatesKeyspaces encodes the two-layer contract behind
+// packtrail's async result caching: the engine-side dispatch cache stores
+// StatusPending for an async node under (execution, node, attempt), and the
+// worker-side execution cache stores the real result of the *same* triple in
+// the same bucket. With distinct key prefixes each layer sees only its own
+// entry; sharing a key would freeze the node at Pending (the worker would read
+// the dispatcher's entry and never invoke) or clobber the dispatch dedup.
+func TestCacheKeyedSeparatesKeyspaces(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-keyed"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var dispatches, execs atomic.Int32
+
+	dispatch := invoker.NewCache(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		dispatches.Add(1)
+		return invoker.Result{Status: invoker.StatusPending}, nil
+	}))
+
+	work := invoker.NewCacheKeyed(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		execs.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"done":true}`)}, nil
+	}), "w.")
+
+	req := invoker.Request{ExecutionID: "exec-1", NodeID: "agent", Attempt: 0}
+
+	// Dispatch caches Pending under the unprefixed key.
+	if res, invokeErr := dispatch.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch: res=%+v err=%v, want pending", res, invokeErr)
+	}
+
+	// The worker must not see the cached Pending: it invokes and gets OK.
+	res, invokeErr := work.Invoke(ctx, req)
+	if invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("worker: res=%+v err=%v, want ok (collided with dispatch entry?)", res, invokeErr)
+	}
+
+	// A redelivered job serves the worker's cached result without re-invoking.
+	if res, invokeErr = work.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("worker redelivery: res=%+v err=%v, want cached ok", res, invokeErr)
+	}
+
+	// And the dispatch layer still sees its own Pending, untouched by the worker.
+	if res, invokeErr = dispatch.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch redelivery: res=%+v err=%v, want cached pending", res, invokeErr)
+	}
+
+	if d, e := dispatches.Load(), execs.Load(); d != 1 || e != 1 {
+		t.Fatalf("dispatches=%d execs=%d, want 1/1 (each layer invoked once, then cached)", d, e)
+	}
+}
+
 // TestCacheDoesNotCacheTransportError ensures a transport failure is not cached,
 // so a redelivery retries the call rather than replaying the error.
 func TestCacheDoesNotCacheTransportError(t *testing.T) {

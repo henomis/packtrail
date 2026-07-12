@@ -21,12 +21,16 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -72,11 +76,33 @@ const (
 	defaultRetryMaxDelay = 60 * time.Second
 	defaultTimeout       = 30 * time.Second
 	defaultConcurrency   = 64
+	defaultMaxDeliver    = 10
+	defaultDrainTimeout  = 30 * time.Second
 	nakDelayShort        = 2 * time.Second
 	nakDelayLong         = 5 * time.Second
 	heartbeatDivisor     = 3
 	maxAckPendingMult    = 2
 )
+
+// terminalError marks a process error as non-retryable: the work item can never
+// succeed (e.g. its flow or node was removed, or its kind is unknown), so
+// redelivering it would Nak-loop forever and burn a concurrency slot each cycle.
+// handle dead-letters such items — failing the execution with a descriptive
+// reason and Term-ing the message — instead of retrying.
+type terminalError struct{ reason string }
+
+func (e *terminalError) Error() string { return e.reason }
+
+// Terminal reports that this error is non-retryable. The fired-schedule, signal
+// and async-worker consumers detect it structurally (via an
+// interface{ Terminal() bool } check) and dead-letter instead of Nak-looping,
+// without importing this package.
+func (e *terminalError) Terminal() bool { return true }
+
+// terminal builds a non-retryable process error.
+func terminal(format string, args ...any) error {
+	return &terminalError{reason: fmt.Sprintf(format, args...)}
+}
 
 // Config tunes engine behaviour. Zero values fall back to sensible defaults.
 type Config struct {
@@ -87,6 +113,8 @@ type Config struct {
 	RetryMaxDelay  time.Duration // cap on backoff (default 60s)
 	MaxConcurrency int           // max work items processed at once (default 64)
 	DefaultTimeout time.Duration // task timeout when a node omits one (default 30s)
+	MaxDeliver     int           // max deliveries of a work item before dead-lettering (default 10)
+	DrainTimeout   time.Duration // max time a graceful shutdown waits for in-flight work (default 30s)
 }
 
 // Engine processes executions for a set of flows.
@@ -106,13 +134,26 @@ type Engine struct {
 	onReconcileFull   func(context.Context) error // optional authoritative full reconcile hook
 
 	sem chan struct{}
+
+	// leaseRefs reference-counts the ownership lease per execution across this
+	// instance's concurrent work items (e.g. an advance racing a fanin_eval for
+	// the same execution). Without it, the first item to finish would release
+	// the KV lease out from under the one still processing, opening the door
+	// for another instance to acquire mid-flight. The KV lease is acquired on
+	// 0→1 and released on 1→0 only.
+	leaseMu   sync.Mutex
+	leaseRefs map[string]int
 }
 
 // New builds an engine and precompiles every choice expression in flows. flows
 // maps flow name -> definition. inv executes task/branch nodes; it is typically
 // an *invoker.Registry (optionally wrapped in an *invoker.Cache for idempotency).
+// New performs no NATS I/O: sched and signals must already have their streams
+// ensured by the caller (scheduler.EnsureStream / signal.Signals.EnsureStream),
+// which keeps all stream creation in the caller's single-threaded, context-
+// carrying setup phase.
 func New(
-	inv invoker.Invoker, st *store.Store, sched *scheduler.Scheduler,
+	inv invoker.Invoker, st *store.Store, sched *scheduler.Scheduler, signals *signal.Signals,
 	flows map[string]*dsl.Flow, cfg Config,
 ) (*Engine, error) {
 	if cfg.OwnerID == "" {
@@ -143,34 +184,76 @@ func New(
 		cfg.DefaultTimeout = defaultTimeout
 	}
 
+	// Non-positive clamps to the default rather than disabling the cap: the
+	// dead-letter discipline promises no message can loop forever, and a
+	// negative value would otherwise disable it silently (uint64 conversion on
+	// the work path, the >0 guards on the fired/signal paths).
+	if cfg.MaxDeliver <= 0 {
+		cfg.MaxDeliver = defaultMaxDeliver
+	}
+
+	if cfg.DrainTimeout == 0 {
+		cfg.DrainTimeout = defaultDrainTimeout
+	}
+
 	programs, err := compilePrograms(flows)
 	if err != nil {
 		return nil, err
 	}
 
-	// Ensure the signals stream during construction. This is the only piece of
-	// JetStream setup the engine owns; doing it here (rather than in Run) keeps
-	// all stream creation in the single-threaded setup phase. Two engines whose
-	// Run methods race would otherwise issue concurrent CreateOrUpdateStream
-	// calls, which nats-server does not serialise across an account.
-	signals := signal.New(st.JS(), st.Names())
-	if err = signals.EnsureStream(context.Background()); err != nil {
-		return nil, err
+	return &Engine{
+		invoker:   inv,
+		js:        st.JS(),
+		store:     st,
+		sched:     sched,
+		signals:   signals,
+		names:     st.Names(),
+		flows:     flows,
+		programs:  programs,
+		cfg:       cfg,
+		log:       slog.Default().With("owner", cfg.OwnerID),
+		sem:       make(chan struct{}, cfg.MaxConcurrency),
+		leaseRefs: map[string]int{},
+	}, nil
+}
+
+// retainLease increments the in-process lease refcount if this instance already
+// holds the lease (refcount > 0), reporting whether it did. The fast path skips
+// the KV round-trip entirely for concurrent work items of one execution.
+func (e *Engine) retainLease(execID string) bool {
+	e.leaseMu.Lock()
+	defer e.leaseMu.Unlock()
+
+	if e.leaseRefs[execID] > 0 {
+		e.leaseRefs[execID]++
+		return true
 	}
 
-	return &Engine{
-		invoker:  inv,
-		js:       st.JS(),
-		store:    st,
-		sched:    sched,
-		signals:  signals,
-		names:    st.Names(),
-		flows:    flows,
-		programs: programs,
-		cfg:      cfg,
-		log:      slog.Default().With("owner", cfg.OwnerID),
-		sem:      make(chan struct{}, cfg.MaxConcurrency),
-	}, nil
+	return false
+}
+
+// trackLease registers a freshly KV-acquired lease in the refcount.
+func (e *Engine) trackLease(execID string) {
+	e.leaseMu.Lock()
+	e.leaseRefs[execID]++
+	e.leaseMu.Unlock()
+}
+
+// releaseLease decrements the refcount and, on the last holder, deletes the KV
+// lease. The KV delete happens under the mutex so a concurrent retain/acquire
+// for the same execution cannot interleave between the decision and the delete.
+func (e *Engine) releaseLease(ctx context.Context, execID string) {
+	e.leaseMu.Lock()
+	defer e.leaseMu.Unlock()
+
+	if n := e.leaseRefs[execID] - 1; n > 0 {
+		e.leaseRefs[execID] = n
+		return
+	}
+
+	delete(e.leaseRefs, execID)
+
+	_ = e.store.ReleaseLease(ctx, execID, e.cfg.OwnerID)
 }
 
 // compilePrograms compiles every non-default choice rule expression up front so
@@ -209,9 +292,60 @@ func compilePrograms(flows map[string]*dsl.Flow) (map[string]*rules.Program, err
 	return programs, nil
 }
 
-// Start creates a new execution of flowName with the given initial payload and
-// enqueues the first step. It returns the new execution id.
+// Start creates a new execution of flowName with the given initial payload,
+// minting a fresh execution id, and enqueues the first step. It returns the id.
+// The payload must be a JSON object (or empty, defaulted to {}); it becomes the
+// `input` field of every invocation context and choice expression. nil is
+// treated as an empty object.
 func (e *Engine) Start(ctx context.Context, flowName string, payload json.RawMessage) (string, error) {
+	return e.start(ctx, "exec-"+nuid.Next(), flowName, payload)
+}
+
+// StartWithID is an idempotent Start keyed by a caller-supplied execution id (an
+// idempotency key). The first call creates and enqueues the execution; any later
+// call with the same id is a no-op that returns the id unchanged — so a
+// timed-out-then-retried Start produces exactly one execution. First-write wins:
+// the id is bound to the first call's flow and payload; a repeat with a different
+// flow/payload still returns the existing execution and does not overwrite it.
+// The id must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV
+// key); supply a stable key such as your domain id (e.g. "order-12345"). Like
+// Start, the payload must be a JSON object (or empty).
+func (e *Engine) StartWithID(ctx context.Context, execID, flowName string, payload json.RawMessage) (string, error) {
+	if !validExecID(execID) {
+		return "", fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
+	return e.start(ctx, execID, flowName, payload)
+}
+
+// execIDPattern bounds caller-supplied execution ids to characters safe as a
+// single NATS subject token and KV key.
+var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func validExecID(id string) bool { return execIDPattern.MatchString(id) }
+
+// requireObjectPayload rejects a start input that is not a JSON object. The
+// input is addressed field-wise from choice expressions (`input.tier`) and
+// documented as an object throughout; node outputs, by contrast, are free-form
+// (each lives under its own results.<node> key). An empty payload is defaulted
+// to {} before this check, so it is always a valid object.
+func requireObjectPayload(payload json.RawMessage) error {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("initial payload must be a JSON object")
+	}
+
+	if !json.Valid(trimmed) {
+		return fmt.Errorf("initial payload is not valid JSON")
+	}
+
+	return nil
+}
+
+// start creates the execution under id and enqueues its first step. A repeated id
+// (store.ErrAlreadyExists) is treated as idempotent success: the existing
+// execution's id is returned without re-creating or re-enqueueing it.
+func (e *Engine) start(ctx context.Context, id, flowName string, payload json.RawMessage) (string, error) {
 	flow, ok := e.flows[flowName]
 	if !ok {
 		return "", fmt.Errorf("unknown flow %q", flowName)
@@ -221,32 +355,229 @@ func (e *Engine) Start(ctx context.Context, flowName string, payload json.RawMes
 		payload = json.RawMessage("{}")
 	}
 
-	id := "exec-" + nuid.Next()
+	if err := requireObjectPayload(payload); err != nil {
+		return "", err
+	}
+
+	// Data before control: the input is written to the data plane first, so
+	// the execution can never exist without its input being readable. The
+	// write is create-if-absent — first write wins — so an idempotent Start
+	// retry carrying a different payload cannot overwrite the input the
+	// original execution runs on. A crash before Create leaves a tiny orphaned
+	// entry the retry reuses.
+	if err := e.store.CreatePayload(ctx, store.InputKey(id), payload); err != nil {
+		return "", err
+	}
 
 	exec := &store.Execution{
 		ID:          id,
 		FlowName:    flowName,
 		CurrentNode: flow.StartNode(),
 		Status:      store.StatusRunning,
-		Payload:     payload,
 	}
+
+	// The first work item is committed in the same write that creates the
+	// execution (transactional outbox): the document and its driving message
+	// can never disagree, whatever crashes.
+	item, err := json.Marshal(workItem{ExecID: id, Kind: kindAdvance})
+	if err != nil {
+		return "", err
+	}
+
+	exec.AppendWork(item)
+
 	if _, err := e.store.Create(ctx, exec); err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			// Idempotent: this id already started. Re-flush anything the
+			// original commit left unpublished before returning it.
+			if repairErr := e.repairStart(ctx, id); repairErr != nil {
+				return "", repairErr
+			}
+
+			return id, nil
+		}
+
 		return "", err
 	}
 
 	e.emitEvent(ctx, exec)
 
-	if err := e.enqueue(ctx, id, workItem{ExecID: id, Kind: kindAdvance}); err != nil {
-		return "", err
+	if err := e.flushOutbox(ctx, exec); err != nil {
+		return "", fmt.Errorf(
+			"execution %s created and its first work item committed, but publishing is failing (retry StartWithID with the same id, or the stall watchdog re-publishes it): %w",
+			id, err)
 	}
 
 	return id, nil
+}
+
+// repairStart heals the crash window between the create and the first outbox
+// flush: a retried Start/StartWithID re-flushes whatever the original commit
+// left unpublished. The flush is msg-id-deduped, so nudging an id whose first
+// item is merely still in the queue publishes nothing new.
+func (e *Engine) repairStart(ctx context.Context, id string) error {
+	ex, err := e.store.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil // archived or pruned: nothing to repair
+		}
+
+		return err
+	}
+
+	return e.flushOutbox(ctx, ex)
+}
+
+// flushOutbox publishes the execution's committed follow-on messages and clears
+// the ones that made it out. It is the second half of the transactional-outbox
+// pattern: the transition and its outbox items commit in one CAS write, then
+// this flush moves them onto the work/schedule streams. A crash or fault at any
+// point is safe — unpublished items stay durably on the document and are
+// re-flushed by the next touch (work delivery, completion, retried Start, or
+// the stall watchdog); re-published items are dropped by the streams' msg-id
+// dedup window, and beyond it a duplicate is state-safe against the guarded
+// transitions.
+func (e *Engine) flushOutbox(ctx context.Context, exec *store.Execution) error {
+	if len(exec.Outbox) == 0 {
+		return nil
+	}
+
+	flushed := make(map[uint64]bool, len(exec.Outbox))
+
+	var pubErr error
+
+	for _, it := range exec.Outbox {
+		msgID := exec.ID + "." + strconv.FormatUint(it.Seq, 10)
+
+		switch it.Kind {
+		case store.OutboxWork:
+			pubErr = e.publishWork(ctx, exec.ID, it.Item, msgID)
+		case store.OutboxSched:
+			pubErr = e.sched.AtID(ctx, exec.ID, msgID, it.At, it.Item)
+		default:
+			// Unknown kind (a newer writer?): it can never publish, so clear it
+			// rather than poisoning the outbox forever.
+			e.log.Error("dropping outbox item of unknown kind", "exec", exec.ID, "kind", it.Kind, "seq", it.Seq)
+
+			flushed[it.Seq] = true
+
+			continue
+		}
+
+		if pubErr != nil {
+			break // publish the prefix; the remainder re-flushes on the next touch
+		}
+
+		flushed[it.Seq] = true
+	}
+
+	if len(flushed) > 0 {
+		if _, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+			if !ex.DropOutbox(flushed) {
+				return errSkip // another flusher already cleared them
+			}
+
+			return nil
+		}); err != nil && !errors.Is(err, errSkip) && !errors.Is(err, store.ErrNotFound) {
+			return err // items published but not cleared: a re-flush dedups
+		}
+	}
+
+	return pubErr
+}
+
+// stallRedriveDefaultMult sets the default stall threshold as a multiple of
+// AckWait: anything legitimately in flight refreshes its work item within one
+// AckWait (heartbeat InProgress), so several multiples of quiet is a strong
+// signal the driving work item was lost in a crash window.
+const stallRedriveDefaultMult = 5
+
+// RedriveStalled re-drives one execution if it looks stranded: still active,
+// quiet for longer than olderThan (non-positive means the default of
+// 5×AckWait), not inside a scheduled retry backoff, and with no live ownership
+// lease (a held lease means an instance is processing it right now). A stalled
+// running execution gets an advance; a stalled fanin wait gets a join
+// re-evaluation. Signal waits are excluded (their timeout owns them) and so
+// are async task waits (CompleteActivity owns them, and it may legitimately
+// take arbitrarily long).
+//
+// Every transition is guarded, so a false-positive re-drive is state-safe —
+// at worst it duplicates an invocation within the documented at-least-once
+// contract. It returns whether a work item was enqueued.
+//
+// This is the operational backstop for the transactional outbox: an execution
+// whose committed follow-on messages were never flushed (crash between the CAS
+// write and the publish) self-heals within one watchdog pass instead of
+// waiting for a manual Resume; the blind re-drives below additionally cover
+// anything with an empty outbox that still looks stranded.
+func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan time.Duration) (bool, error) {
+	if olderThan <= 0 {
+		olderThan = stallRedriveDefaultMult * e.cfg.AckWait
+	}
+
+	ex, err := e.store.Get(ctx, execID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if !ex.Active() {
+		return false, nil
+	}
+
+	// Measure quiet time from the later of the last write and the scheduled
+	// retry fire time, so a long backoff is never mistaken for a stall.
+	quietSince := ex.UpdatedAt
+	if ex.RetryAt.After(quietSince) {
+		quietSince = ex.RetryAt
+	}
+
+	if time.Since(quietSince) < olderThan {
+		return false, nil
+	}
+
+	held, err := e.store.LeaseHeld(ctx, execID)
+	if err != nil || held {
+		return false, err // in-flight work heartbeats its lease: not stalled
+	}
+
+	// A non-empty outbox is the precise diagnosis: a transition committed its
+	// follow-on work but the flush never landed. Re-flush exactly that instead
+	// of guessing a blind re-drive.
+	if len(ex.Outbox) > 0 {
+		return true, e.flushOutbox(ctx, ex)
+	}
+
+	switch {
+	case ex.Status == store.StatusRunning:
+		return true, e.enqueue(ctx, execID, workItem{Kind: kindAdvance})
+	case ex.Status == store.StatusWaiting && ex.WaitSignal == "":
+		flow, ok := e.flows[ex.FlowName]
+		if !ok {
+			return false, nil
+		}
+
+		if node := flow.Node(ex.CurrentNode); node == nil || node.Type != dsl.NodeFanin {
+			return false, nil // async task wait: CompleteActivity owns it
+		}
+
+		return true, e.enqueue(ctx, execID, workItem{Kind: kindFaninEval})
+	default:
+		return false, nil // signal wait: the wait timeout owns it
+	}
 }
 
 // ScheduleFlow installs a recurring schedule that starts a new execution of
 // flowName on the given 6-field cron expression ("sec min hour dom mon dow").
 // name uniquely identifies the schedule; reusing it replaces the schedule.
 func (e *Engine) ScheduleFlow(ctx context.Context, name, flowName, cronExpr string, payload json.RawMessage) error {
+	if !validExecID(name) {
+		return fmt.Errorf("invalid schedule name %q: must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token)", name)
+	}
+
 	if _, ok := e.flows[flowName]; !ok {
 		return fmt.Errorf("unknown flow %q", flowName)
 	}
@@ -282,6 +613,93 @@ func (e *Engine) ScheduleReconcileFull(ctx context.Context, cronExpr string) err
 	return e.sched.Cron(ctx, reconcileFullKey, reconcileFullKey, cronExpr, nil)
 }
 
+// assembleContext builds the invocation context an Invoker (or a choice rule)
+// sees — {"input": …, "results": {node: output, …}, "signals": {name: payload,
+// …}, "branches": {branch: output, …}, "last_node": "…"} — by reading the
+// execution's data-plane entries: the start input, every settled node output
+// (Outputs), and every received signal (LastSeq keys). A missing entry
+// (archived/pruned) is skipped rather than failing the assembly.
+//
+// Two navigation aids come with the raw maps, because results alone is
+// unordered: last_node is the id of the most recently settled output (chain
+// flows read "the previous step's result" as results[last_node]), and branches
+// is the subset of results produced by the current fan's branches (a node
+// after a join reads its inputs there; whether the join just happened is
+// last_node ∈ branches).
+func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json.RawMessage, error) {
+	in, err := e.store.GetPayload(ctx, store.InputKey(ex.ID))
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+
+	results := make(map[string]json.RawMessage, len(ex.Outputs))
+
+	for _, node := range ex.Outputs {
+		out, getErr := e.store.GetPayload(ctx, store.OutputKey(ex.ID, node))
+		if getErr != nil {
+			if errors.Is(getErr, store.ErrNotFound) {
+				continue
+			}
+
+			return nil, getErr
+		}
+
+		results[node] = out
+	}
+
+	signals := make(map[string]json.RawMessage, len(ex.LastSeq))
+
+	for name, seq := range ex.LastSeq {
+		p, getErr := e.store.GetPayload(ctx, store.SignalKey(ex.ID, name, seq))
+		if getErr != nil {
+			if errors.Is(getErr, store.ErrNotFound) {
+				continue
+			}
+
+			return nil, getErr
+		}
+
+		signals[name] = p
+	}
+
+	if len(in) == 0 {
+		in = json.RawMessage("{}")
+	}
+
+	branches := map[string]json.RawMessage{}
+
+	for b := range ex.Branches {
+		if out, ok := results[b]; ok {
+			branches[b] = out
+		}
+	}
+
+	lastNode := ""
+	if len(ex.Outputs) > 0 {
+		lastNode = ex.Outputs[len(ex.Outputs)-1]
+	}
+
+	return json.Marshal(struct {
+		Input    json.RawMessage            `json:"input"`
+		Results  map[string]json.RawMessage `json:"results"`
+		Signals  map[string]json.RawMessage `json:"signals"`
+		Branches map[string]json.RawMessage `json:"branches"`
+		LastNode string                     `json:"last_node"`
+	}{Input: in, Results: results, Signals: signals, Branches: branches, LastNode: lastNode})
+}
+
+// Results assembles the execution's data-plane view — the same context
+// document invokers and choice rules see. ErrNotFound if the execution does
+// not exist.
+func (e *Engine) Results(ctx context.Context, execID string) (json.RawMessage, error) {
+	ex, err := e.store.Get(ctx, execID)
+	if err != nil {
+		return nil, err
+	}
+
+	return e.assembleContext(ctx, ex)
+}
+
 // enqueue publishes a work item to the execution's work subject.
 func (e *Engine) enqueue(ctx context.Context, execID string, wi workItem) error {
 	wi.ExecID = execID
@@ -291,7 +709,19 @@ func (e *Engine) enqueue(ctx context.Context, execID string, wi workItem) error 
 		return err
 	}
 
-	_, err = e.js.Publish(ctx, e.names.SubjWorkPrefix+execID, data)
+	return e.publishWork(ctx, execID, data, "")
+}
+
+// publishWork publishes raw work-item bytes to the execution's work subject.
+// A non-empty msgID rides as Nats-Msg-Id, so a re-publish of the same outbox
+// item inside the stream's dedup window is dropped.
+func (e *Engine) publishWork(ctx context.Context, execID string, data []byte, msgID string) error {
+	var opts []jetstream.PublishOpt
+	if msgID != "" {
+		opts = append(opts, jetstream.WithMsgID(msgID))
+	}
+
+	_, err := e.js.Publish(ctx, e.names.SubjWorkPrefix+execID, data, opts...)
 
 	return err
 }
@@ -309,25 +739,112 @@ func (e *Engine) Run(ctx context.Context) error {
 		return fmt.Errorf("work consumer: %w", err)
 	}
 
+	// In-flight handlers run under procParent, which is detached from ctx's
+	// cancellation (it keeps ctx's values but is not cancelled when ctx is). That
+	// lets a graceful shutdown drain work already in flight within DrainTimeout
+	// instead of aborting it mid-invocation: cancelling ctx alone would otherwise
+	// cancel each handler's derived context and turn the invocation into a transient
+	// failure to be redelivered. A hard crash still relies on redelivery
+	// (at-least-once); a clean restart no longer double-fires in-flight work for
+	// naturally non-idempotent targets. stopProc force-aborts any stragglers still
+	// running past the drain deadline.
+	procParent, stopProc := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopProc()
+
+	// draining (under drainMu) fences handler registration against the drain:
+	// cc.Stop does not wait for a callback already executing, so without the
+	// fence such a callback could inflight.Add(1) concurrently with drain's
+	// inflight.Wait() on a zero counter — a WaitGroup misuse the race detector
+	// flags — and its handler could outlive Run un-drained.
+	var (
+		inflight sync.WaitGroup
+		drainMu  sync.Mutex
+		draining bool
+	)
+
 	cc, err := cons.Consume(func(msg jetstream.Msg) {
+		// Don't pick up new work once shutdown has begun; let it redeliver.
+		if ctx.Err() != nil {
+			_ = msg.NakWithDelay(nakDelayShort)
+			return
+		}
+
 		e.sem <- struct{}{}
 
+		drainMu.Lock()
+		if draining {
+			drainMu.Unlock()
+			<-e.sem
+
+			_ = msg.NakWithDelay(nakDelayShort)
+
+			return
+		}
+
+		inflight.Add(1)
+		drainMu.Unlock()
+
 		go func() {
+			defer inflight.Done()
 			defer func() { <-e.sem }()
 
-			e.handle(ctx, msg)
+			e.handle(procParent, msg)
 		}()
 	})
 	if err != nil {
 		return fmt.Errorf("consume: %w", err)
 	}
-	defer cc.Stop()
+
+	// On shutdown: stop delivery, then wait for in-flight handlers to settle and
+	// ack, bounded by DrainTimeout. If the drain window elapses, stopProc cancels
+	// the stragglers so they unwind (their work redelivers) and Run can return.
+	defer func() {
+		cc.Stop()
+
+		drainMu.Lock()
+		draining = true
+		drainMu.Unlock()
+
+		e.drain(&inflight, stopProc)
+	}()
 
 	// Forward fired schedules (retry backoff, wait timeouts) back onto the work
 	// stream. The fired payload is the original work item; its subject key is
 	// the execution id.
-	fc, err := e.sched.ConsumeFired(ctx, e.names.DurFired, func(key string, payload []byte) error {
-		// A reconcile key triggers the matching visibility reconciliation.
+	firedDeadLetter := func(key, reason string, n uint64) {
+		e.emitDeadLetter(ctx, store.DeadLetterSchedule, key, reason, n)
+	}
+
+	fc, err := e.sched.ConsumeFired(ctx, e.names.DurFired, e.cfg.MaxDeliver, firedDeadLetter, e.handleFired(ctx))
+	if err != nil {
+		return fmt.Errorf("fired consumer: %w", err)
+	}
+	defer fc.Stop()
+
+	// Apply external signals idempotently (CAS before ack). The signals stream is
+	// ensured once at construction (see New), not here, so concurrent engines do
+	// not issue racing stream updates.
+	signalDeadLetter := func(execID, name, reason string, n uint64) {
+		e.emitDeadLetter(ctx, store.DeadLetterSignal, execID+"/"+name, reason, n)
+	}
+
+	sc, err := e.signals.Consume(ctx, e.names.DurSignals, e.cfg.MaxDeliver, signalDeadLetter, e.applySignal)
+	if err != nil {
+		return fmt.Errorf("signal consumer: %w", err)
+	}
+	defer sc.Stop()
+
+	<-ctx.Done()
+
+	return nil
+}
+
+// handleFired returns the fired-schedule handler: it forwards reconcile ticks to
+// the matching callback, starts a new execution for a "start.<flow>" cron key (a
+// removed flow is terminal, so the tick dead-letters rather than Nak-looping), and
+// otherwise re-injects the fired payload as a work item on its execution subject.
+func (e *Engine) handleFired(ctx context.Context) func(key string, payload []byte) error {
+	return func(key string, payload []byte) error {
 		switch key {
 		case reconcileActiveKey:
 			if e.onReconcileActive != nil {
@@ -342,34 +859,45 @@ func (e *Engine) Run(ctx context.Context) error {
 
 			return nil
 		}
-		// A "start.<flow>" key triggers a new execution (recurring cron starts);
-		// any other key is an execution id whose work item we re-inject.
+
 		if flowName, ok := strings.CutPrefix(key, "start."); ok {
+			if _, known := e.flows[flowName]; !known {
+				// The scheduled flow was removed; every cron tick would Nak forever.
+				// Terminal: the fired consumer dead-letters this tick.
+				return terminal("cron start: unknown flow %q", flowName)
+			}
+
 			_, startErr := e.Start(ctx, flowName, payload)
+
 			return startErr
 		}
 
 		_, pubErr := e.js.Publish(ctx, e.names.SubjWorkPrefix+key, payload)
 
 		return pubErr
-	})
-	if err != nil {
-		return fmt.Errorf("fired consumer: %w", err)
 	}
-	defer fc.Stop()
+}
 
-	// Apply external signals idempotently (CAS before ack). The signals stream is
-	// ensured once at construction (see New), not here, so concurrent engines do
-	// not issue racing stream updates.
-	sc, err := e.signals.Consume(ctx, e.names.DurSignals, e.applySignal)
-	if err != nil {
-		return fmt.Errorf("signal consumer: %w", err)
+// drain waits for in-flight handlers to finish, bounded by DrainTimeout. If they
+// all settle within the window it returns cleanly; otherwise it cancels the
+// stragglers (via stopProc) so they unwind — their work redelivers later — and
+// waits for them to return so no handler goroutine outlives Run.
+func (e *Engine) drain(inflight *sync.WaitGroup, stopProc context.CancelFunc) {
+	done := make(chan struct{})
+
+	go func() {
+		inflight.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(e.cfg.DrainTimeout):
+		e.log.Warn("drain timeout: aborting in-flight work", "timeout", e.cfg.DrainTimeout)
+		stopProc()
+		inflight.Wait()
 	}
-	defer sc.Stop()
-
-	<-ctx.Done()
-
-	return nil
 }
 
 // handle processes one work item under the ownership lease.
@@ -384,34 +912,63 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	// Acquire ownership. If another instance owns this execution, back off and
-	// let it (or a later redelivery) make progress.
-	ok, err := e.store.AcquireLease(ctx, wi.ExecID, e.cfg.OwnerID, e.cfg.LeaseTTL)
-	if err != nil {
-		e.log.Error("lease acquire", "exec", wi.ExecID, "err", err)
+	// let it (or a later redelivery) make progress. When another work item for
+	// the same execution is already running on this instance, retain its lease
+	// in-process instead of a redundant KV acquire.
+	if !e.retainLease(wi.ExecID) {
+		ok, err := e.store.AcquireLease(ctx, wi.ExecID, e.cfg.OwnerID, e.cfg.LeaseTTL)
+		if err != nil {
+			e.log.Error("lease acquire", "exec", wi.ExecID, "err", err)
 
-		_ = msg.NakWithDelay(nakDelayShort)
+			_ = msg.NakWithDelay(nakDelayShort)
 
-		return
+			return
+		}
+
+		if !ok {
+			_ = msg.NakWithDelay(nakDelayShort)
+			return
+		}
+
+		e.trackLease(wi.ExecID)
 	}
 
-	if !ok {
-		_ = msg.NakWithDelay(nakDelayShort)
-		return
-	}
-
-	// Heartbeat: renew the lease and extend the ack window while we work.
-	hb, cancelHB := context.WithCancel(ctx)
-	go e.heartbeat(hb, msg, wi.ExecID)
+	// Heartbeat: renew the lease and extend the ack window while we work. It runs
+	// against procCtx and, if it detects the lease was lost (another instance took
+	// over after a pause longer than LeaseTTL), cancels procCtx so processing
+	// aborts early — narrowing, though not eliminating, the window in which both
+	// instances run the node. ReleaseLease below uses the outer ctx so it still
+	// runs after a cancel.
+	procCtx, cancelProc := context.WithCancel(ctx)
+	go e.heartbeat(procCtx, cancelProc, msg, wi.ExecID)
 
 	defer func() {
-		cancelHB()
+		cancelProc()
 
-		_ = e.store.ReleaseLease(ctx, wi.ExecID, e.cfg.OwnerID)
+		e.releaseLease(ctx, wi.ExecID)
 	}()
 
-	err = e.process(ctx, wi)
+	err := e.process(procCtx, wi)
 	if err != nil {
 		e.log.Error("process", "exec", wi.ExecID, "kind", wi.Kind, "err", err)
+
+		// Terminal error: the item can never succeed (removed flow/node, unknown
+		// kind). Dead-letter it instead of Nak-looping forever.
+		var termErr *terminalError
+		if errors.As(err, &termErr) {
+			e.deadLetter(ctx, msg, wi.ExecID, termErr.reason)
+			return
+		}
+
+		// Transient error (store/NATS fault): retry, but cap the number of
+		// deliveries so a persistently failing item is eventually dead-lettered
+		// rather than burning a slot every nakDelayLong forever.
+		if e.deliveriesExhausted(msg) {
+			e.deadLetter(ctx, msg, wi.ExecID,
+				fmt.Sprintf("work item %q exhausted %d deliveries: %v", wi.Kind, e.cfg.MaxDeliver, err))
+
+			return
+		}
 
 		_ = msg.NakWithDelay(nakDelayLong)
 
@@ -419,6 +976,61 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	_ = msg.Ack()
+}
+
+// deliveriesExhausted reports whether this message has been delivered at least
+// MaxDeliver times. A metadata read failure is treated as not-exhausted so a
+// transient fault keeps retrying rather than prematurely dead-lettering.
+func (e *Engine) deliveriesExhausted(msg jetstream.Msg) bool {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return false
+	}
+
+	return meta.NumDelivered >= uint64(e.cfg.MaxDeliver) //nolint:gosec // MaxDeliver is a small positive config value
+}
+
+// deadLetter settles a poisoned work item: it fails the execution with reason
+// (best-effort — a missing or already-terminal execution is fine), records a
+// durable dead-letter trace, and Terms the message so it is never redelivered. If
+// the failure cannot be recorded, the message is Naked so a later delivery retries
+// the dead-lettering rather than silently dropping the work.
+func (e *Engine) deadLetter(ctx context.Context, msg jetstream.Msg, execID, reason string) {
+	if err := e.fail(ctx, execID, reason); err != nil && !errors.Is(err, store.ErrNotFound) {
+		e.log.Error("dead-letter: record failure", "exec", execID, "err", err)
+
+		_ = msg.NakWithDelay(nakDelayLong)
+
+		return
+	}
+
+	e.emitDeadLetter(ctx, store.DeadLetterWork, execID, reason, deliveries(msg))
+	e.log.Warn("dead-lettered work item", "exec", execID, "reason", reason)
+
+	_ = msg.Term()
+}
+
+// emitDeadLetter records a durable dead-letter trace (best-effort: a failure to
+// record only loses observability, never correctness). It is also the sink the
+// fired-schedule and signal consumers call when they Term poisoned work.
+func (e *Engine) emitDeadLetter(ctx context.Context, kind, key, reason string, deliveries uint64) {
+	dl := store.DeadLetter{Kind: kind, Key: key, Reason: reason, Deliveries: deliveries}
+	if err := e.store.EmitDeadLetter(ctx, dl); err != nil {
+		e.log.Debug("emit dead-letter", "kind", kind, "key", key, "err", err)
+	}
+}
+
+// deliveries reads a message's delivery count, or 0 when metadata is unavailable.
+func deliveries(msg jetstream.Msg) uint64 {
+	if msg == nil {
+		return 0
+	}
+
+	if meta, err := msg.Metadata(); err == nil {
+		return meta.NumDelivered
+	}
+
+	return 0
 }
 
 // emitEvent publishes a domain event, logging at debug level on failure. Event
@@ -430,9 +1042,18 @@ func (e *Engine) emitEvent(ctx context.Context, ex *store.Execution) {
 	}
 }
 
-func (e *Engine) heartbeat(ctx context.Context, msg jetstream.Msg, execID string) {
+// heartbeat renews the lease and extends the ack window while a work item runs.
+// If a renewal reports the lease is no longer held by this instance — another
+// instance took over after this one paused past LeaseTTL — it calls onLost to
+// cancel processing. This narrows but does not eliminate double-firing: an
+// invocation already in flight may still complete on both instances, so node
+// invocation is at-least-once (the execution-doc CAS fences *state*, not external
+// side-effects). Use invoker.Cache / WithResultCache for non-idempotent targets.
+func (e *Engine) heartbeat(ctx context.Context, onLost context.CancelFunc, msg jetstream.Msg, execID string) {
 	t := time.NewTicker(e.cfg.LeaseTTL / heartbeatDivisor)
 	defer t.Stop()
+
+	renewalErrs := 0
 
 	for {
 		select {
@@ -440,7 +1061,34 @@ func (e *Engine) heartbeat(ctx context.Context, msg jetstream.Msg, execID string
 			return
 		case <-t.C:
 			_ = msg.InProgress()
-			_, _ = e.store.AcquireLease(ctx, execID, e.cfg.OwnerID, e.cfg.LeaseTTL)
+
+			held, err := e.store.AcquireLease(ctx, execID, e.cfg.OwnerID, e.cfg.LeaseTTL)
+			if err != nil {
+				// A single failed renewal is a blip; a full TTL of them means
+				// the lease may have expired and been taken over while this
+				// instance runs blind — exactly the double-fire window the
+				// heartbeat exists to narrow. Assume lost and abort: the CAS
+				// still fences state and the work redelivers.
+				renewalErrs++
+				if renewalErrs >= heartbeatDivisor {
+					e.log.Warn("lease renewal failing; assuming lost and aborting",
+						"exec", execID, "err", err)
+					onLost()
+
+					return
+				}
+
+				continue
+			}
+
+			renewalErrs = 0
+
+			if !held {
+				e.log.Warn("lease lost during processing; aborting", "exec", execID)
+				onLost()
+
+				return
+			}
 		}
 	}
 }
@@ -460,14 +1108,23 @@ func (e *Engine) process(ctx context.Context, wi workItem) error {
 		return nil // terminal; drop the item
 	}
 
+	// Re-publish anything a previous transition committed but failed to flush
+	// (crash between the CAS write and the publish): any delivery for the
+	// execution heals its outbox immediately, without waiting for the watchdog.
+	// Re-publishing this very item is possible and harmless (msg-id dedup, then
+	// the guarded transitions).
+	if err := e.flushOutbox(ctx, exec); err != nil {
+		return err // transient: Nak and retry
+	}
+
 	flow, ok := e.flows[exec.FlowName]
 	if !ok {
-		return fmt.Errorf("unknown flow %q", exec.FlowName)
+		return terminal("unknown flow %q", exec.FlowName)
 	}
 
 	node := flow.Node(exec.CurrentNode)
 	if node == nil {
-		return fmt.Errorf("unknown node %q in flow %q", exec.CurrentNode, exec.FlowName)
+		return terminal("unknown node %q in flow %q", exec.CurrentNode, exec.FlowName)
 	}
 
 	switch wi.Kind {
@@ -478,7 +1135,7 @@ func (e *Engine) process(ctx context.Context, wi workItem) error {
 	case kindWaitTimeout:
 		return e.onWaitTimeout(ctx, flow, exec, wi)
 	default:
-		return fmt.Errorf("unknown work kind %q", wi.Kind)
+		return terminal("unknown work kind %q", wi.Kind)
 	}
 }
 
@@ -496,41 +1153,77 @@ func (e *Engine) stepNode(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 	case dsl.NodeSignal:
 		return e.stepSignal(ctx, flow, node, exec)
 	default:
-		return fmt.Errorf("unsupported node type %q", node.Type)
+		return terminal("unsupported node type %q", node.Type)
 	}
 }
 
-// advanceTo moves the execution to nextNode (or completes it if nextNode == "")
-// via a CAS write, then enqueues the next step. mutate may apply additional
+// advanceTo moves the execution from fromNode to nextNode (or completes it if
+// nextNode == "") via a CAS write that also commits the next step's work item
+// (transactional outbox), then flushes the outbox. mutate may apply additional
 // changes (e.g. merge payload) within the same CAS write.
-func (e *Engine) advanceTo(ctx context.Context, execID, nextNode string, mutate func(*store.Execution)) error {
+//
+// The write is guarded: it applies only while the execution is still active and
+// still at fromNode. A stale caller — a duplicate delivery, or an instance that
+// lost its lease mid-invocation and settles late — must not rewind CurrentNode
+// or resurrect a terminal (notably cancelled) execution; its advance is a no-op.
+func (e *Engine) advanceTo(ctx context.Context, execID, fromNode, nextNode string, mutate func(*store.Execution)) error {
+	var item json.RawMessage
+
+	if nextNode != "" {
+		data, err := json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+		if err != nil {
+			return err
+		}
+
+		item = data
+	}
+
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		if !ex.Active() || ex.CurrentNode != fromNode {
+			return errSkip // cancelled, completed, or already moved on: stale advance
+		}
+
 		if mutate != nil {
 			mutate(ex)
 		}
 
 		ex.Attempt = 0
+		// Drop any unconsumed early-completion stash: it belongs to the node
+		// being left, and — because attempts reset to 0 and task cycles are
+		// legal — a stale stash could otherwise satisfy a later revisit of the
+		// same node with the old result instead of invoking it. RetryAt is
+		// likewise per-node state and must not survive the move.
+		ex.Activity = nil
+		ex.RetryAt = time.Time{}
+
 		if nextNode == "" {
 			ex.Status = store.StatusCompleted
 			ex.CurrentNode = ""
 		} else {
 			ex.Status = store.StatusRunning
 			ex.CurrentNode = nextNode
+			ex.AppendWork(item)
 		}
 
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil // guard failed: nothing advanced, nothing to enqueue
+		}
+		// An over-limit payload can never be persisted: retrying produces the same
+		// oversized write. Fail the execution with the actionable reason instead.
+		// failNode keeps the prior (within-limit) payload, so its write succeeds.
+		if errors.Is(err, store.ErrPayloadTooLarge) {
+			return e.failNode(ctx, execID, fromNode, err.Error())
+		}
+
 		return err
 	}
 
 	e.emitEvent(ctx, updated)
 
-	if nextNode == "" {
-		return nil
-	}
-
-	return e.enqueue(ctx, execID, workItem{Kind: kindAdvance})
+	return e.flushOutbox(ctx, updated)
 }
 
 // CompleteActivity settles an asynchronous activity that an Invoker previously
@@ -554,12 +1247,26 @@ func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, atte
 		return nil // terminal: drop
 	}
 
-	flow, ok := e.flows[exec.FlowName]
-	if !ok {
-		return fmt.Errorf("unknown flow %q", exec.FlowName)
+	// Re-flush anything a previous transition committed but failed to publish
+	// (e.g. a redelivered completion whose original settle lost its fanin
+	// eval): the outbox on the document is the source of truth for follow-on
+	// work, so a duplicate delivery heals it here instead of being dropped.
+	if err := e.flushOutbox(ctx, exec); err != nil {
+		return err
 	}
 
-	// Branch path: node is a pending fanout branch.
+	flow, ok := e.flows[exec.FlowName]
+	if !ok {
+		// This engine does not know the flow (e.g. it was renamed/removed across a
+		// rolling deploy). Re-dispatching the async job can never succeed, so this
+		// is terminal: the async worker dead-letters it instead of Nak-looping.
+		return terminal("unknown flow %q", exec.FlowName)
+	}
+
+	// Branch path: node is a pending fanout branch. A completion for an
+	// already-settled branch is a duplicate: its follow-on eval was committed
+	// with the settle (transactional outbox) and re-flushed above, so it drops
+	// through to the stale no-op below.
 	if bs, found := exec.Branches[node]; found && bs.Status == store.BranchPending {
 		return e.completeBranch(ctx, flow, exec, node, attempt, res)
 	}
@@ -644,9 +1351,32 @@ func (e *Engine) completeBranch(
 		actionRedispatch = "redispatch"
 	)
 
+	evalItem, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindFaninEval})
+	if marshalErr != nil {
+		return marshalErr
+	}
+
+	// Data before control: a completed branch's output is readable before the
+	// settle commits, so the flow can never join on a result that is missing.
+	// A stale completion that loses the guarded settle below leaves a harmless
+	// overwritable entry.
+	if res.Status == invoker.StatusOK && len(res.Payload) > 0 {
+		if err := e.store.PutPayload(ctx, store.OutputKey(exec.ID, branchID), res.Payload); err != nil {
+			return err
+		}
+	}
+
 	action := actionSkip
 
 	claimed, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+		action = actionSkip // fresh per attempt: Mutate may retry fn
+
+		// Decide on the fresh document: a Cancel (or completion) that landed
+		// after the caller's snapshot must not have a branch settled onto it.
+		if !ex.Active() {
+			return errSkip
+		}
+
 		bs, ok := ex.Branches[branchID]
 		if !ok || bs.Status != store.BranchPending || bs.Attempt != attempt {
 			return errSkip
@@ -655,9 +1385,13 @@ func (e *Engine) completeBranch(
 		switch res.Status {
 		case invoker.StatusOK:
 			ex.Branches[branchID] = store.BranchState{
-				NodeID: branchID, Status: store.BranchCompleted,
-				Result: res.Payload, Attempt: attempt,
+				NodeID: branchID, Status: store.BranchCompleted, Attempt: attempt,
 			}
+
+			if len(res.Payload) > 0 {
+				ex.AddOutput(branchID)
+			}
+
 			action = actionSettled
 		case invoker.StatusError:
 			ex.Branches[branchID] = store.BranchState{
@@ -679,6 +1413,12 @@ func (e *Engine) completeBranch(
 			}
 		}
 
+		if action == actionSettled {
+			// The join re-evaluation is committed with the settle (transactional
+			// outbox): a crash between this write and the flush can never lose it.
+			ex.AppendWork(evalItem)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -690,15 +1430,20 @@ func (e *Engine) completeBranch(
 	}
 
 	if action == actionRedispatch {
-		res2, callErr := e.invoke(ctx, node, exec.ID, claimed.Payload, attempt+1)
+		contextDoc, asmErr := e.assembleContext(ctx, claimed)
+		if asmErr != nil {
+			return asmErr
+		}
+
+		res2, callErr := e.invoke(ctx, node, exec.ID, contextDoc, attempt+1)
 		if callErr == nil && res2.Status == invoker.StatusPending {
 			return nil // re-dispatched; await the next CompleteActivity
 		}
 		// A synchronous branch invoker settled immediately.
 		return e.completeBranch(ctx, flow, claimed, branchID, attempt+1, settleResult(res2, callErr))
 	}
-	// Terminal branch state: re-evaluate the fanin join.
-	return e.enqueue(ctx, exec.ID, workItem{Kind: kindFaninEval})
+
+	return e.flushOutbox(ctx, claimed)
 }
 
 // settleResult normalises a raw invoke outcome (result + transport error) into a
@@ -731,6 +1476,11 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 		return fmt.Errorf("execution %s has no current node to resume", execID)
 	}
 
+	item, err := json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+	if err != nil {
+		return err
+	}
+
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if ex.Status != store.StatusFailed {
 			return errSkip // raced with another transition
@@ -740,6 +1490,8 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 		ex.Attempt = 0
 		ex.Error = ""
 		ex.Activity = nil
+		ex.RetryAt = time.Time{}
+		ex.AppendWork(item) // committed with the revival (transactional outbox)
 
 		return nil
 	})
@@ -753,18 +1505,70 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 
 	e.emitEvent(ctx, updated)
 
-	return e.enqueue(ctx, execID, workItem{Kind: kindAdvance})
+	return e.flushOutbox(ctx, updated)
 }
 
-// fail marks an execution failed via CAS and emits an event.
-func (e *Engine) fail(ctx context.Context, execID, reason string) error {
+// Cancel transitions a running or waiting execution to the terminal cancelled
+// state with the given reason. It is idempotent and stale-safe: cancelling an
+// already-terminal execution (completed/failed/cancelled) — or one that no longer
+// exists — is a no-op. In-flight work is abandoned rather than interrupted: any
+// later work item or async CompleteActivity for this execution finds it
+// non-active and no-ops (process and CompleteActivity both drop non-active
+// executions), so pending retries, fanin evaluations and signal timeouts settle
+// harmlessly. Unlike Resume, a cancelled execution is terminal and cannot be
+// revived.
+func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		if !ex.Active() {
+			return errSkip // already terminal: no-op
+		}
+
+		ex.Status = store.StatusCancelled
+		ex.Error = reason
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSkip) || errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return err
+	}
+
+	e.emitEvent(ctx, updated)
+
+	return nil
+}
+
+// fail marks an execution failed via CAS and emits an event. It applies only
+// while the execution is still active: a terminal execution — notably cancelled —
+// is never overwritten to failed (which would make it resumable again). Callers
+// that know which node produced the failure should prefer failNode.
+func (e *Engine) fail(ctx context.Context, execID, reason string) error {
+	return e.failNode(ctx, execID, "", reason)
+}
+
+// failNode is fail additionally guarded on the failing node: when nodeID is
+// non-empty the write applies only while the execution is still at nodeID, so a
+// stale failure — from a duplicate delivery or an instance that lost its lease
+// mid-invocation — cannot fail an execution that has already moved on.
+func (e *Engine) failNode(ctx context.Context, execID, nodeID, reason string) error {
+	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		if !ex.Active() || (nodeID != "" && ex.CurrentNode != nodeID) {
+			return errSkip // terminal or moved on: stale failure, leave unchanged
+		}
+
 		ex.Status = store.StatusFailed
 		ex.Error = reason
 
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil
+		}
+
 		return err
 	}
 

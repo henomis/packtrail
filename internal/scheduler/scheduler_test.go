@@ -37,14 +37,14 @@ func setup(t *testing.T) (context.Context, *scheduler.Scheduler, <-chan fired) {
 	ctx := context.Background()
 	srv := natstest.Start(t)
 
-	sched, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sched := scheduler.New(srv.JS, names.New(""))
+	if err := sched.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
 	ch := make(chan fired, 4)
 
-	cc, err := sched.ConsumeFired(ctx, "test-fired", func(key string, payload []byte) error {
+	cc, err := sched.ConsumeFired(ctx, "test-fired", 10, nil, func(key string, payload []byte) error {
 		ch <- fired{key: key, payload: append([]byte(nil), payload...)}
 		return nil
 	})

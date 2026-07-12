@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -305,11 +306,14 @@ func (e *Engine) Start(ctx context.Context, flowName string, payload json.RawMes
 // idempotency key). The first call creates and enqueues the execution; any later
 // call with the same id is a no-op that returns the id unchanged — so a
 // timed-out-then-retried Start produces exactly one execution. First-write wins:
-// the id is bound to the first call's flow and payload; a repeat with a different
-// flow/payload still returns the existing execution and does not overwrite it.
-// The id must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV
-// key); supply a stable key such as your domain id (e.g. "order-12345"). Like
-// Start, the payload must be a JSON object (or empty).
+// the id is bound to the first call's flow and payload; a repeat with a
+// still-valid but different flow/payload returns the existing execution and does
+// not overwrite it. (Note the arguments are validated before the existence check,
+// so a retry that supplies an unknown flow or a non-object payload returns that
+// validation error rather than the existing id — retries should replay the same
+// arguments.) The id must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject
+// token and KV key); supply a stable key such as your domain id (e.g.
+// "order-12345"). Like Start, the payload must be a JSON object (or empty).
 func (e *Engine) StartWithID(ctx context.Context, execID, flowName string, payload json.RawMessage) (string, error) {
 	if !validExecID(execID) {
 		return "", fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
@@ -949,7 +953,7 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		e.releaseLease(ctx, wi.ExecID)
 	}()
 
-	err := e.process(procCtx, wi)
+	err := e.processGuarded(procCtx, wi)
 	if err != nil {
 		e.log.Error("process", "exec", wi.ExecID, "kind", wi.Kind, "err", err)
 
@@ -1092,6 +1096,28 @@ func (e *Engine) heartbeat(ctx context.Context, onLost context.CancelFunc, msg j
 			}
 		}
 	}
+}
+
+// processGuarded runs process under a top-level panic recovery. process runs on
+// the work-consumer goroutine, which has no recovery above it, so a panic
+// anywhere it reaches — choice-expression evaluation (prog.Match), JSON
+// (un)marshaling, or any engine-code bug — would otherwise crash the whole
+// engine process, taking every other in-flight execution with it. Recovering
+// here converts the panic into a terminal error so only the offending execution
+// is dead-lettered: a redelivery would likely re-panic, so retrying is pointless
+// (the same reasoning as invoke's Invoker-panic guard, one layer out).
+func (e *Engine) processGuarded(ctx context.Context, wi workItem) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("process panic",
+				"exec", wi.ExecID, "kind", wi.Kind,
+				"panic", r, "stack", string(debug.Stack()))
+
+			err = terminal("process panic: %v", r)
+		}
+	}()
+
+	return e.process(ctx, wi)
 }
 
 // process dispatches a work item to the right handler.

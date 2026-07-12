@@ -161,6 +161,26 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
+	// Top-level panic guard for the whole job goroutine. invoke has its own
+	// recover, but a panic in the settle path (CompleteActivity) or heartbeat
+	// setup would otherwise be unrecovered on this goroutine and crash the entire
+	// hosting process, taking every other in-flight job with it. A panic is a bug
+	// that a redelivery would re-hit, so Term (dead-letter) it rather than loop.
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("job panic",
+				"exec", j.ExecID, "node", j.Node,
+				"panic", r, "stack", string(debug.Stack()))
+
+			if w.cfg.deadLetterSink != nil {
+				w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node,
+					fmt.Sprintf("job panic: %v", r), numDelivered(msg))
+			}
+
+			_ = msg.Term()
+		}
+	}()
+
 	hb, cancelHB := context.WithCancel(ctx)
 	go w.heartbeat(hb, msg)
 

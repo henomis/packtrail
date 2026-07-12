@@ -70,6 +70,14 @@ func Compile(code string) (*Program, error) {
 // non-nil error are returned when evaluation fails (e.g. a referenced field is
 // missing); callers typically treat that as "no match" and fall through to the
 // default rule.
+//
+// Evaluation runs with no memory budget or deadline. Flow definitions (and thus
+// their choice expressions) are trusted operator input, so a pathological
+// expression is treated as a self-inflicted bug, not a security boundary. A
+// panic from evaluation is still contained by the engine's process-level
+// recover, so it fails only its own execution. If flows ever become
+// less-trusted (multi-tenant authoring), add an expr memory budget and a bounded
+// run deadline here.
 func (p *Program) Match(contextDoc json.RawMessage) (bool, error) {
 	var m map[string]any
 	if len(contextDoc) > 0 {

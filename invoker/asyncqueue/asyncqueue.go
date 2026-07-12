@@ -141,6 +141,13 @@ func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.R
 // job. A zero deadline (no node timeout) maps to 0, meaning "use the worker
 // default". The conversion happens at dispatch so queue wait does not consume the
 // budget.
+//
+// Caveat: 0 is overloaded — both "no node timeout" and "deadline already expired"
+// (d < 0) map to 0, which effectiveTimeout reads as "run at the full
+// activityTimeout backstop". This is unreachable today because the engine sets
+// Deadline = now+timeout immediately before dispatch, so time.Until is
+// essentially the full budget and never negative; it is only a latent fragility
+// if the dispatch path ever gains latency between setting the deadline and here.
 func nodeTimeout(deadline time.Time) time.Duration {
 	if deadline.IsZero() {
 		return 0

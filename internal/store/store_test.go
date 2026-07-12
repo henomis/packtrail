@@ -231,6 +231,46 @@ func TestPayloadSizeGuard(t *testing.T) {
 	}
 }
 
+func TestDocumentSizeGuard(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxDocumentBytes(256)
+
+	if _, err := s.Create(ctx, &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A Mutate that would grow the control document past the limit is rejected
+	// before it reaches NATS.
+	_, err := s.Mutate(ctx, "e1", func(e *Execution) error {
+		e.Error = strings.Repeat("x", 512)
+
+		return nil
+	})
+	if !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("oversized Mutate: err = %v, want ErrDocumentTooLarge", err)
+	}
+
+	// The rejected write left the last within-limit document intact.
+	got, err := s.Get(ctx, "e1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.Error != "" {
+		t.Fatalf("rejected write persisted: Error = %q, want empty", got.Error)
+	}
+
+	// A within-limit Mutate still succeeds.
+	if _, mErr := s.Mutate(ctx, "e1", func(e *Execution) error {
+		e.Error = "small"
+
+		return nil
+	}); mErr != nil {
+		t.Fatalf("within-limit Mutate: %v", mErr)
+	}
+}
+
 func TestPayloadGuardDisabled(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)

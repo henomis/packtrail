@@ -56,6 +56,7 @@ type config struct {
 	defaultTimeout  time.Duration
 	maxDeliver      int
 	maxPayloadBytes int
+	maxDocBytes     int
 	drainTimeout    time.Duration
 }
 
@@ -246,3 +247,12 @@ func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drain
 // size for the rest of the execution document. Pass a negative value to disable
 // the guard; zero keeps the default.
 func WithMaxPayloadBytes(n int) Option { return func(c *config) { c.maxPayloadBytes = n } }
+
+// WithMaxDocumentBytes caps the serialized size of an execution's control
+// document (default 768 KiB, store.DefaultMaxDocumentBytes). The document is
+// small control metadata, but a very wide fanout (one BranchState per branch) or
+// a large transient outbox can grow it toward NATS's 1 MiB ceiling; a write that
+// would exceed the limit is rejected with a typed error (and, on the fanout path,
+// fails the node with a clear reason) instead of an opaque NATS publish error.
+// Pass a negative value to disable the guard; zero keeps the default.
+func WithMaxDocumentBytes(n int) Option { return func(c *config) { c.maxDocBytes = n } }

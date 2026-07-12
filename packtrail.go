@@ -446,6 +446,10 @@ func openStore(ctx context.Context, js jetstream.JetStream, n names.Names, c con
 		st.SetMaxPayloadBytes(c.maxPayloadBytes)
 	}
 
+	if c.maxDocBytes != 0 {
+		st.SetMaxDocumentBytes(c.maxDocBytes)
+	}
+
 	if c.archiveRetention > 0 {
 		if err = st.EnableArchive(ctx, c.archiveRetention); err != nil {
 			return nil, err

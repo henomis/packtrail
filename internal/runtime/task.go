@@ -161,7 +161,17 @@ func (e *Engine) settleTask(
 		return e.failNode(ctx, exec.ID, node.ID, "task "+node.ID+": "+res.Error)
 	}
 
-	return e.settleTaskRetry(ctx, node, exec, res, callErr)
+	// Transient: a transport error (callErr != nil), an explicit retry request,
+	// or a re-pending settle. These are re-driven per the node's retry policy.
+	if callErr != nil || res.Status == invoker.StatusRetry || res.Status == invoker.StatusPending {
+		return e.settleTaskRetry(ctx, node, exec, res, callErr)
+	}
+
+	// callErr == nil but the status is none of the known values (e.g. an empty or
+	// misspelled status from a buggy worker). Retrying re-hits the same bug and
+	// burns the whole retry budget, so fail fast with an actionable reason.
+	return e.failNode(ctx, exec.ID, node.ID,
+		fmt.Sprintf("task %s: unknown result status %q", node.ID, res.Status))
 }
 
 // settleTaskSuccess records the output in the data plane and advances. Data

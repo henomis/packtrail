@@ -24,6 +24,41 @@ import (
 // no inbound transition at all is already caught by start-node detection, so
 // the interesting case is an island: nodes referencing each other but detached
 // from the start node.
+// TestValidateRejectsMultipleDefaults: two default rules silently last-win at
+// runtime, so validation must reject the ambiguity at load time.
+func TestValidateRejectsMultipleDefaults(t *testing.T) {
+	_, err := Parse([]byte(`
+name: two-defaults
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: c, type: task, subject: "z"}
+  - {id: d, type: choice, rules: [{default: true, to: b}, {default: true, to: c}]}
+edges:
+  - {from: a, to: d}
+`))
+	if err == nil || !strings.Contains(err.Error(), "only one default") {
+		t.Fatalf("err = %v, want multiple-default rejection", err)
+	}
+}
+
+// TestValidateRejectsDefaultWithWhen: a default rule that also carries a when
+// silently ignores the when at runtime, so it is rejected as ambiguous.
+func TestValidateRejectsDefaultWithWhen(t *testing.T) {
+	_, err := Parse([]byte(`
+name: default-with-when
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: d, type: choice, rules: [{when: 'input.x == 1', default: true, to: b}]}
+edges:
+  - {from: a, to: d}
+`))
+	if err == nil || !strings.Contains(err.Error(), "must not also carry a when") {
+		t.Fatalf("err = %v, want default-with-when rejection", err)
+	}
+}
+
 func TestValidateRejectsUnreachableNode(t *testing.T) {
 	_, err := Parse([]byte(`
 name: island

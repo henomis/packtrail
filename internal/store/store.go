@@ -38,6 +38,12 @@ const (
 	defaultDLQReadCap  = 100
 	casBackoffBase     = 250 * time.Microsecond
 	casBackoffCap      = 5 * time.Millisecond
+	// workDedupWindow is set explicitly (rather than relying on NATS's implicit
+	// ~2m default) so the outbox's per-item msg-id dedup — which makes a
+	// re-flushed work item idempotent within the window — is self-documenting and
+	// robust against a server-default change. Beyond it a duplicate is still
+	// state-safe against the guarded transitions.
+	workDedupWindow = 2 * time.Minute
 )
 
 // DefaultMaxPayloadBytes caps a single data-plane entry (a start input, one
@@ -45,6 +51,15 @@ const (
 // 1 MiB max message size. Override with SetMaxPayloadBytes; a non-positive
 // limit disables the guard.
 const DefaultMaxPayloadBytes = 512 << 10 // 512 KiB
+
+// DefaultMaxDocumentBytes caps the serialized execution control document by
+// default. Unlike a data-plane payload, the document is small control metadata,
+// but a very wide fanout (a BranchState per branch) or a large transient outbox
+// can grow it toward NATS's 1 MiB ceiling — where it would otherwise fail as an
+// opaque NATS publish error. The guard rejects it first with the typed
+// ErrDocumentTooLarge. It sits below 1 MiB with headroom for KV/message
+// overhead. Override with SetMaxDocumentBytes; a non-positive limit disables it.
+const DefaultMaxDocumentBytes = 768 << 10 // 768 KiB
 
 // ErrConflict is returned when a CAS write loses to a concurrent writer and the
 // caller's revision is stale.
@@ -64,6 +79,12 @@ var ErrAlreadyExists = errors.New("store: already exists")
 // callers can still record a failure against it.
 var ErrPayloadTooLarge = errors.New("store: payload exceeds max size")
 
+// ErrDocumentTooLarge is returned when a control-document write would exceed the
+// configured max size. Like ErrPayloadTooLarge it is rejected before it reaches
+// NATS, so the last within-limit document stays persisted and a caller can still
+// record a (small) failure against it.
+var ErrDocumentTooLarge = errors.New("store: control document exceeds max size")
+
 // Store provides access to all Packtrail KV buckets and streams.
 type Store struct {
 	js              jetstream.JetStream
@@ -75,6 +96,7 @@ type Store struct {
 	idxFlow         jetstream.KeyValue
 	payloads        jetstream.KeyValue // the data plane: start inputs, node outputs, signal payloads
 	maxPayloadBytes int                // per-entry payload-size guard; <= 0 disables it
+	maxDocBytes     int                // control-document size guard; <= 0 disables it
 
 	casConflicts atomic.Uint64 // cumulative CAS-conflict retries across all Mutate calls
 	deadLetters  atomic.Uint64 // cumulative dead-letters emitted by this instance
@@ -85,7 +107,7 @@ type Store struct {
 // Open ensures every bucket and stream exists, under the given namespace, and
 // returns a ready Store.
 func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, error) {
-	s := &Store{js: js, names: n, maxPayloadBytes: DefaultMaxPayloadBytes}
+	s := &Store{js: js, names: n, maxPayloadBytes: DefaultMaxPayloadBytes, maxDocBytes: DefaultMaxDocumentBytes}
 
 	var err error
 
@@ -129,10 +151,11 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 	}
 
 	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      n.StreamWork,
-		Subjects:  []string{n.SubjWorkPrefix + ">"},
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.WorkQueuePolicy,
+		Name:       n.StreamWork,
+		Subjects:   []string{n.SubjWorkPrefix + ">"},
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.WorkQueuePolicy,
+		Duplicates: workDedupWindow,
 	}); err != nil {
 		return nil, fmt.Errorf("work stream: %w", err)
 	}
@@ -278,6 +301,13 @@ func (s *Store) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter,
 // is used (it is not safe to change concurrently with writes).
 func (s *Store) SetMaxPayloadBytes(n int) { s.maxPayloadBytes = n }
 
+// SetMaxDocumentBytes sets the maximum serialized size, in bytes, of an
+// execution control document. A write that exceeds it is rejected with
+// ErrDocumentTooLarge before it reaches NATS (see update). A non-positive limit
+// disables the guard. Call before the store is used (it is not safe to change
+// concurrently with writes).
+func (s *Store) SetMaxDocumentBytes(n int) { s.maxDocBytes = n }
+
 // Create persists a new execution and returns its initial revision. The id is
 // deduped against the cold archive as well as the hot bucket: a retried
 // StartWithID whose original execution was already swept into the archive must
@@ -384,6 +414,13 @@ func (s *Store) update(ctx context.Context, e *Execution) (uint64, error) {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return 0, err
+	}
+
+	// Reject an over-limit document before it hits NATS: the last within-limit
+	// state stays persisted, so a caller can still record a (small) failure.
+	if s.maxDocBytes > 0 && len(data) > s.maxDocBytes {
+		return 0, fmt.Errorf("%w: execution %s is %d bytes, limit %d",
+			ErrDocumentTooLarge, e.ID, len(data), s.maxDocBytes)
 	}
 
 	rev, err := s.exec.Update(ctx, e.ID, data, e.Revision)

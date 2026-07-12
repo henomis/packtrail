@@ -82,6 +82,11 @@ func (f Func) Invoke(ctx context.Context, req Request) (Result, error) { return 
 // Registry dispatches an invocation to a registered Invoker by kind
 // (Request.Invoker). It is itself an Invoker, so the engine holds exactly one
 // Invoker regardless of how many kinds are configured.
+//
+// The kind map is not synchronized: all Register calls must complete during
+// setup (before Server.Run starts concurrent Invoke dispatch). Registering a
+// kind while invocations are in flight is a data race — the Registry is
+// build-once, read-only-thereafter.
 type Registry struct {
 	m map[string]Invoker
 }

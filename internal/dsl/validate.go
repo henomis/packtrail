@@ -204,6 +204,13 @@ func (f *Flow) rejectUnreachable() error {
 // reachableFrom returns every node id reachable from id via a single runtime
 // transition: the linear edge, choice rule targets, a signal's on_timeout
 // route, or a fanout's branches (invoked inline by their fanout).
+//
+// Known limitation: this follows the linear edge (f.next) of every node,
+// including a node that is itself a fanout branch. At runtime a branch is
+// invoked inline and never advances its own outgoing edge, so a node reachable
+// ONLY via a branch's edge is dead yet still passes the unreachable check. This
+// is a conservative false-negative (it accepts dead config; it never rejects a
+// live flow), left as-is to avoid changing which flows validate.
 func (f *Flow) reachableFrom(id string) []string {
 	var succ []string
 
@@ -485,26 +492,8 @@ func (f *Flow) validateNode(n *Node) error {
 			return fmt.Errorf("flow %q: fanin node %q: quorum:N must satisfy 0 < N <= len(wait_for)", f.Name, n.ID)
 		}
 	case NodeChoice:
-		if len(n.Rules) == 0 {
-			return fmt.Errorf("flow %q: choice node %q: at least one rule is required", f.Name, n.ID)
-		}
-
-		sawDefault := false
-
-		for _, r := range n.Rules {
-			if r.Default {
-				sawDefault = true
-			} else if strings.TrimSpace(r.When) == "" {
-				return fmt.Errorf("flow %q: choice node %q: non-default rule needs a when expression", f.Name, n.ID)
-			}
-
-			if err := ref(r.To, "rule.to"); err != nil {
-				return err
-			}
-		}
-
-		if !sawDefault {
-			return fmt.Errorf("flow %q: choice node %q: a default rule is required", f.Name, n.ID)
+		if err := f.validateChoiceRules(n, ref); err != nil {
+			return err
 		}
 	case NodeSignal:
 		if strings.TrimSpace(n.SignalName) == "" {
@@ -533,6 +522,47 @@ func (f *Flow) validateNode(n *Node) error {
 		}
 	default:
 		return fmt.Errorf("flow %q: node %q: unknown type %q", f.Name, n.ID, n.Type)
+	}
+
+	return nil
+}
+
+// validateChoiceRules checks a choice node's rule set: at least one rule, every
+// non-default rule has a when, exactly one default, no default that also carries
+// a when (its when would be silently ignored), and every target references a
+// known node. ref is validateNode's target-checking closure.
+func (f *Flow) validateChoiceRules(n *Node, ref func(id, field string) error) error {
+	if len(n.Rules) == 0 {
+		return fmt.Errorf("flow %q: choice node %q: at least one rule is required", f.Name, n.ID)
+	}
+
+	defaults := 0
+
+	for _, r := range n.Rules {
+		switch {
+		case r.Default && strings.TrimSpace(r.When) != "":
+			// A default rule with a when is ambiguous — the when is silently
+			// ignored at runtime. Reject it rather than surprise the author.
+			return fmt.Errorf("flow %q: choice node %q: a default rule must not also carry a when expression", f.Name, n.ID)
+		case r.Default:
+			defaults++
+		case strings.TrimSpace(r.When) == "":
+			return fmt.Errorf("flow %q: choice node %q: non-default rule needs a when expression", f.Name, n.ID)
+		}
+
+		if err := ref(r.To, "rule.to"); err != nil {
+			return err
+		}
+	}
+
+	if defaults == 0 {
+		return fmt.Errorf("flow %q: choice node %q: a default rule is required", f.Name, n.ID)
+	}
+
+	if defaults > 1 {
+		// More than one default silently last-wins at runtime; reject the
+		// ambiguity at load time.
+		return fmt.Errorf("flow %q: choice node %q: only one default rule is allowed", f.Name, n.ID)
 	}
 
 	return nil

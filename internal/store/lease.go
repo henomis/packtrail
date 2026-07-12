@@ -126,6 +126,13 @@ func (s *Store) LeaseHeld(ctx context.Context, execID string) (bool, error) {
 
 // ReleaseLease drops ownership of execID if held by owner. Releasing a lease not
 // owned by owner is a no-op.
+//
+// The delete is guarded on the revision read above, so if our own heartbeat
+// renewed the lease between the Get and the Delete the delete no-ops and the
+// lease lingers until its Expires (≤ LeaseTTL). That is self-healing — the lease
+// still frees on expiry — it only briefly delays a legitimate takeover; it never
+// deletes a lease a different owner has taken over (the owner check and the
+// revision guard both protect that).
 func (s *Store) ReleaseLease(ctx context.Context, execID, owner string) error {
 	entry, err := s.leases.Get(ctx, execID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {

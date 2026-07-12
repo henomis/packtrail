@@ -51,7 +51,25 @@ func New(js jetstream.JetStream, n names.Names) *Scheduler {
 }
 
 // EnsureStream creates (idempotently) the schedule-enabled stream that carries
-// scheduled and fired messages.
+// both schedule definitions (sched.once.*, sched.cron.*) and fired deliveries
+// (sched.fire.*).
+//
+// Retention is deliberately LimitsPolicy with no MaxAge/MaxMsgs, despite fired
+// messages accumulating (one per fired timer — they are NOT rolled up per key,
+// and Acking does not remove them under LimitsPolicy). A stream-wide age/size
+// limit is NOT safe here: this same stream must retain a cron definition
+// indefinitely and a long-delay one-shot (e.g. a multi-day signal timeout) until
+// it fires, so pruning by age would silently delete a pending timer. The server
+// requires a schedule's target (fire) subject to live in this same
+// schedule-enabled stream, so the fired messages cannot be split onto a separate
+// WorkQueue/Interest stream that would drop them on ack.
+//
+// The scheduler self-purges a one-shot definition once it fires, so the unbounded
+// growth is limited to already-consumed sched.fire.* messages. Reclaiming those
+// safely needs a dedicated maintenance pass that purges the fire.> subject only
+// below the fired consumer's ack floor (never a blanket age limit); that is left
+// as a follow-up. AllowRollup stays enabled so a cron definition can be replaced
+// by name.
 func (s *Scheduler) EnsureStream(ctx context.Context) error {
 	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              s.stream,
@@ -59,7 +77,11 @@ func (s *Scheduler) EnsureStream(ctx context.Context) error {
 		Storage:           jetstream.FileStorage,
 		Retention:         jetstream.LimitsPolicy,
 		AllowMsgSchedules: true,
-		AllowRollup:       true, // fired schedules roll up on their target subject
+		AllowRollup:       true,
+		// Explicit (rather than the implicit ~2m default) so AtID's Nats-Msg-Id
+		// dedup — which drops a re-published identical timer within the window —
+		// is self-documenting and stable across server-default changes.
+		Duplicates: scheduleDedupWindow,
 	})
 	if err != nil {
 		return fmt.Errorf("schedule stream: %w", err)
@@ -118,6 +140,9 @@ func (s *Scheduler) Cron(ctx context.Context, name, key, expr string, payload []
 const (
 	firedAckWait  = 30 * time.Second
 	firedNakDelay = 2 * time.Second
+	// scheduleDedupWindow is the explicit JetStream dedup window for the schedule
+	// stream, matching NATS's implicit ~2m default (see AtID).
+	scheduleDedupWindow = 2 * time.Minute
 )
 
 // ConsumeFired sets up a durable consumer that invokes handler for every fired

@@ -57,7 +57,28 @@ func (e *Engine) stepFanout(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 
 	branches := pendingBranchIDs(node, updated)
 
-	if e.dispatchBranches(ctx, flow, updated, branches) {
+	anyPending, err := e.dispatchBranches(ctx, flow, updated, branches)
+	if err != nil {
+		// A branch could not be settled or persisted, so it is still
+		// BranchPending. We must NOT advance to the fanin: nothing would ever
+		// re-run the branch (the fanin's advance routes to evalFanin, never back
+		// to stepFanout), so an all/quorum join would strand forever.
+		if errors.Is(err, store.ErrPayloadTooLarge) || errors.Is(err, store.ErrDocumentTooLarge) {
+			// Permanent: an over-limit branch output or control document can never
+			// persist. Fail the node, mirroring the task path's failNode on an
+			// over-limit output. failNode reads the last within-limit document, so
+			// it can still record the (small) failure.
+			return e.failNode(ctx, exec.ID, node.ID,
+				fmt.Sprintf("fanout branch could not be persisted: %v", err))
+		}
+
+		// Transient (assemble context / NATS fault): return the error so the
+		// work item Naks and the redelivered advance re-dispatches only the
+		// branches still pending (settled ones are no longer in pendingBranchIDs).
+		return err
+	}
+
+	if anyPending {
 		// Async branches outstanding: park at the fanin (waiting); their
 		// completions drive the join.
 		return e.parkAtFanin(ctx, node, exec.ID, fanin)
@@ -144,7 +165,11 @@ func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin 
 }
 
 // dispatchBranches invokes every branch in parallel and persists each settled
-// result as it completes, returning whether any branch went async (pending).
+// result as it completes. It returns whether any branch went async (pending)
+// and a non-nil dispatchErr if a branch could not be dispatched or persisted
+// and is therefore still BranchPending — the caller must not advance past an
+// unsettled branch (see stepFanout). A permanent ErrPayloadTooLarge takes
+// precedence over a transient error.
 //
 // Branch invocations run concurrently, but their CAS writes to the single
 // execution document are serialized through a per-fanout mutex: with only one
@@ -156,20 +181,31 @@ func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin 
 // recomputed on takeover) while bounding contention to a single writer.
 func (e *Engine) dispatchBranches(
 	ctx context.Context, flow *dsl.Flow, exec *store.Execution, branches []string,
-) (anyPending bool) {
+) (anyPending bool, dispatchErr error) {
 	// One assembly serves every branch: they all see the same upstream context.
 	contextDoc, err := e.assembleContext(ctx, exec)
 	if err != nil {
 		e.log.Error("assemble branch context", "exec", exec.ID, "err", err)
 
-		return false // nothing dispatched; the redelivered advance retries
+		// Nothing dispatched: every branch is still pending. Surface the error so
+		// stepFanout Naks instead of advancing to the fanin with pending branches.
+		return false, fmt.Errorf("assemble branch context: %w", err)
 	}
 
 	var (
 		wg      sync.WaitGroup
 		writeMu sync.Mutex
 		pending atomic.Bool
+		errMu   sync.Mutex
+		errs    []error
 	)
+
+	recordErr := func(err error) {
+		errMu.Lock()
+		defer errMu.Unlock()
+
+		errs = append(errs, err)
+	}
 
 	for _, b := range branches {
 		wg.Add(1)
@@ -192,20 +228,47 @@ func (e *Engine) dispatchBranches(
 				if putErr := e.store.PutPayload(ctx, store.OutputKey(exec.ID, branchID), o.payload); putErr != nil {
 					e.log.Error("persist branch output", "exec", exec.ID, "branch", branchID, "err", putErr)
 
-					return // branch stays pending; the redelivered advance re-runs it
+					// The branch stays BranchPending. Surface the error so
+					// stepFanout does not advance past this unsettled branch:
+					// an over-limit output fails the node, a transient fault Naks.
+					recordErr(fmt.Errorf("persist branch %q output: %w", branchID, putErr))
+
+					return
 				}
 			}
 
 			writeMu.Lock()
 			defer writeMu.Unlock()
 
-			e.persistBranch(ctx, exec.ID, branchID, startAttempt, o.state, len(o.payload) > 0)
+			if pbErr := e.persistBranch(ctx, exec.ID, branchID, startAttempt, o.state, len(o.payload) > 0); pbErr != nil {
+				// The settle CAS failed (e.g. an over-limit control document, or
+				// exhausted conflict retries), so the branch is still
+				// BranchPending. Surface it so stepFanout does not advance past it.
+				recordErr(fmt.Errorf("persist branch %q: %w", branchID, pbErr))
+			}
 		}(b)
 	}
 
 	wg.Wait()
 
-	return pending.Load()
+	return pending.Load(), firstDispatchErr(errs)
+}
+
+// firstDispatchErr picks the error stepFanout should act on. A permanent
+// document/payload-too-large error is preferred over a transient one so the node
+// is failed deterministically rather than Nak-looping on the over-limit branch.
+func firstDispatchErr(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+
+	for _, err := range errs {
+		if errors.Is(err, store.ErrPayloadTooLarge) || errors.Is(err, store.ErrDocumentTooLarge) {
+			return err
+		}
+	}
+
+	return errs[0]
 }
 
 // persistBranch writes a single branch's settled state via CAS. Callers serialize
@@ -213,11 +276,13 @@ func (e *Engine) dispatchBranches(
 // do not contend. The write is guarded: it applies only while the execution is
 // still active and the branch is still pending at the dispatched attempt, so a
 // stale dispatcher (duplicate delivery, lost lease) cannot overwrite a branch that
-// was settled or re-dispatched elsewhere.
+// was settled or re-dispatched elsewhere. A stale-write skip is not an error
+// (nil); a real store failure is returned so the caller does not advance past a
+// branch left BranchPending.
 func (e *Engine) persistBranch(
 	ctx context.Context, execID, branchID string, startAttempt int,
 	state store.BranchState, hasOutput bool,
-) {
+) error {
 	_, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() {
 			return errSkip
@@ -238,7 +303,11 @@ func (e *Engine) persistBranch(
 	})
 	if err != nil && !errors.Is(err, errSkip) {
 		e.log.Error("persist branch", "exec", execID, "branch", branchID, "err", err)
+
+		return err
 	}
+
+	return nil
 }
 
 // branchOutcome is the in-memory result of dispatching one branch. A pending

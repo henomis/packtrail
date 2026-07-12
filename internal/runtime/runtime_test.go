@@ -234,6 +234,36 @@ func TestTaskPermanentError(t *testing.T) {
 	}
 }
 
+// A task worker that returns an unrecognized status (e.g. empty or misspelled)
+// fails the execution fast with an actionable reason, rather than being treated
+// as a transient failure and burning the whole retry budget.
+func TestUnknownTaskStatusFailsFast(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{RetryBaseDelay: 50 * time.Millisecond})
+
+	var calls atomic.Int32
+
+	h.serve(t, "tasks.a.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		calls.Add(1)
+		return protocol.TaskResponse{Status: "bogus"}, nil
+	})
+	h.serve(t, "tasks.b.*", passthrough)
+
+	id, err := h.engine.Start(context.Background(), "linear", json.RawMessage(`{"start":true}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed, 3*time.Second)
+	if !strings.Contains(ex.Error, "unknown result status") {
+		t.Fatalf("failure reason = %q, want it to mention the unknown status", ex.Error)
+	}
+
+	// Fail-fast: it was invoked once, not retried through the whole budget.
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("task invoked %d times, want 1 (fail fast, no retry loop)", got)
+	}
+}
+
 // A task whose output exceeds the per-entry limit fails the execution fast
 // with an actionable reason, rather than producing an opaque KV error or
 // looping. Nothing oversized is persisted to the data plane.

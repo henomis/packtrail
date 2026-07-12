@@ -17,6 +17,7 @@ package asyncqueue_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,6 +202,69 @@ func TestWorkerRecoversInvokerPanic(t *testing.T) {
 
 	if calls[0].res.Status != invoker.StatusError {
 		t.Fatalf("completion status = %q, want StatusError (panic recovered)", calls[0].res.Status)
+	}
+}
+
+// panickingCompleter panics on every CompleteActivity, simulating a bug in the
+// settle path (which runs on the worker's job goroutine, outside invoke's own
+// recover).
+type panickingCompleter struct{}
+
+func (panickingCompleter) CompleteActivity(context.Context, string, string, int, invoker.Result) error {
+	panic("boom in settle path")
+}
+
+// TestWorkerRecoversSettlePanic verifies a panic in the settle path
+// (CompleteActivity) — not the Invoker — is recovered by the job goroutine's
+// top-level guard, dead-lettered via the sink, and Term'd, rather than crashing
+// the whole hosting process. If the guard were absent this test would panic the
+// test binary instead of reaching the sink.
+func TestWorkerRecoversSettlePanic(t *testing.T) {
+	srv := natstest.Start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const prefix, kind = "t", "echo"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	exec := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+
+	type record struct {
+		key, reason string
+	}
+
+	sunk := make(chan record, 1)
+	sink := asyncqueue.WithDeadLetterSink(func(_ context.Context, key, reason string, _ uint64) {
+		select {
+		case sunk <- record{key, reason}:
+		default:
+		}
+	})
+
+	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, panickingCompleter{}, sink)
+	go func() { _ = w.Run(ctx) }()
+
+	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
+	if _, err := d.Invoke(ctx, invoker.Request{ExecutionID: "e1", NodeID: "n1", Target: "a"}); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	select {
+	case got := <-sunk:
+		if got.key != "e1/n1" {
+			t.Fatalf("sink key = %q, want %q", got.key, "e1/n1")
+		}
+
+		if !strings.Contains(got.reason, "panic") {
+			t.Fatalf("sink reason = %q, want it to mention the panic", got.reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dead-letter sink not invoked (settle panic likely crashed the worker)")
 	}
 }
 

@@ -65,7 +65,7 @@ func newBlockHarness(t *testing.T, flowYAML string, cfg Config) *blockHarness {
 	}
 
 	sch := scheduler.New(srv.JS, names.New(""))
-	if err := sch.EnsureStream(ctx); err != nil {
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
@@ -228,7 +228,7 @@ func newIdleEngine(t *testing.T, flowYAML string) (*store.Store, *Engine) {
 	}
 
 	sch := scheduler.New(srv.JS, names.New(""))
-	if err := sch.EnsureStream(ctx); err != nil {
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 

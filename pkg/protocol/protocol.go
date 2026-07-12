@@ -101,7 +101,9 @@ func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats
 //
 //	protocol.ServeNamespaced(ctx, nc, "packtrail", "tasks.triage.*", handler)
 //	// subscribes to "packtrail.tasks.triage.*"
-func ServeNamespaced(ctx context.Context, nc *nats.Conn, namespace, subject string, h Handler) (*nats.Subscription, error) {
+func ServeNamespaced(
+	ctx context.Context, nc *nats.Conn, namespace, subject string, h Handler,
+) (*nats.Subscription, error) {
 	return Serve(ctx, nc, namespace+"."+subject, h)
 }
 

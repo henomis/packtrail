@@ -125,56 +125,66 @@ func (s *Signals) Consume(
 	}
 
 	return cons.Consume(func(msg jetstream.Msg) {
-		execID, name, ok := s.parseSubject(msg.Subject())
-		if !ok {
-			// Unparseable subjects can never be applied; Term, but leave a
-			// durable trace instead of dropping the signal invisibly.
-			slog.Warn("dead-lettering signal with unparseable subject", "subject", msg.Subject())
-
-			if onDeadLetter != nil {
-				var deliveries uint64
-				if meta, metaErr := msg.Metadata(); metaErr == nil {
-					deliveries = meta.NumDelivered
-				}
-
-				onDeadLetter(msg.Subject(), "", "unparseable signal subject", deliveries)
-			}
-
-			_ = msg.Term()
-
-			return
-		}
-
-		meta, metaErr := msg.Metadata()
-		if metaErr != nil {
-			_ = msg.NakWithDelay(time.Second)
-			return
-		}
-
-		d := Delivery{ExecID: execID, Name: name, Seq: meta.Sequence.Stream, Payload: msg.Data()}
-
-		handlerErr := handler(ctx, d)
-		if handlerErr == nil {
-			_ = msg.Ack()
-			return
-		}
-
-		//nolint:gosec // maxDeliver is a small positive config value
-		exhausted := maxDeliver > 0 && meta.NumDelivered >= uint64(maxDeliver)
-		if isTerminal(handlerErr) || exhausted {
-			slog.Warn("dead-lettering signal", "exec", execID, "name", name, "err", handlerErr)
-
-			if onDeadLetter != nil {
-				onDeadLetter(execID, name, handlerErr.Error(), meta.NumDelivered)
-			}
-
-			_ = msg.Term()
-
-			return
-		}
-
-		_ = msg.NakWithDelay(signalNakDelay)
+		s.handleDelivery(ctx, msg, maxDeliver, onDeadLetter, handler)
 	})
+}
+
+// handleDelivery parses, dispatches, and acks/naks/terms a single signal
+// delivery on behalf of Consume.
+func (s *Signals) handleDelivery(
+	ctx context.Context, msg jetstream.Msg, maxDeliver int,
+	onDeadLetter func(execID, name, reason string, deliveries uint64),
+	handler func(context.Context, Delivery) error,
+) {
+	execID, name, ok := s.parseSubject(msg.Subject())
+	if !ok {
+		// Unparseable subjects can never be applied; Term, but leave a
+		// durable trace instead of dropping the signal invisibly.
+		slog.Warn("dead-lettering signal with unparseable subject", "subject", msg.Subject())
+
+		if onDeadLetter != nil {
+			var deliveries uint64
+			if meta, metaErr := msg.Metadata(); metaErr == nil {
+				deliveries = meta.NumDelivered
+			}
+
+			onDeadLetter(msg.Subject(), "", "unparseable signal subject", deliveries)
+		}
+
+		_ = msg.Term()
+
+		return
+	}
+
+	meta, metaErr := msg.Metadata()
+	if metaErr != nil {
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
+
+	d := Delivery{ExecID: execID, Name: name, Seq: meta.Sequence.Stream, Payload: msg.Data()}
+
+	handlerErr := handler(ctx, d)
+	if handlerErr == nil {
+		_ = msg.Ack()
+		return
+	}
+
+	//nolint:gosec // maxDeliver is a small positive config value
+	exhausted := maxDeliver > 0 && meta.NumDelivered >= uint64(maxDeliver)
+	if isTerminal(handlerErr) || exhausted {
+		slog.Warn("dead-lettering signal", "exec", execID, "name", name, "err", handlerErr)
+
+		if onDeadLetter != nil {
+			onDeadLetter(execID, name, handlerErr.Error(), meta.NumDelivered)
+		}
+
+		_ = msg.Term()
+
+		return
+	}
+
+	_ = msg.NakWithDelay(signalNakDelay)
 }
 
 // isTerminal reports whether err (or one it wraps) declares itself non-retryable

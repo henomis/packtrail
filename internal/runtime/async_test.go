@@ -74,7 +74,7 @@ func newAsyncHarnessCfg(t *testing.T, flowYAML string, cfg Config) *asyncHarness
 	}
 
 	sch := scheduler.New(srv.JS, names.New(""))
-	if err := sch.EnsureStream(ctx); err != nil {
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 

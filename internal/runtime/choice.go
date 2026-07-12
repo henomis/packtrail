@@ -45,9 +45,9 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 			return fmt.Errorf("choice %q: expression not compiled: %q", node.ID, r.When)
 		}
 
-		match, err := prog.Match(contextDoc)
-		if err != nil {
-			e.log.Warn("choice rule eval", "node", node.ID, "when", r.When, "err", err)
+		match, matchErr := prog.Match(contextDoc)
+		if matchErr != nil {
+			e.log.Warn("choice rule eval", "node", node.ID, "when", r.When, "err", matchErr)
 			continue
 		}
 

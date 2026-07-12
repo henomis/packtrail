@@ -386,7 +386,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 
 	exec.AppendWork(item)
 
-	if _, err := e.store.Create(ctx, exec); err != nil {
+	if _, err = e.store.Create(ctx, exec); err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
 			// Idempotent: this id already started. Re-flush anything the
 			// original commit left unpublished before returning it.
@@ -402,9 +402,10 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 
 	e.emitEvent(ctx, exec)
 
-	if err := e.flushOutbox(ctx, exec); err != nil {
+	if err = e.flushOutbox(ctx, exec); err != nil {
 		return "", fmt.Errorf(
-			"execution %s created and its first work item committed, but publishing is failing (retry StartWithID with the same id, or the stall watchdog re-publishes it): %w",
+			"execution %s created and its first work item committed, but publishing is failing "+
+				"(retry StartWithID with the same id, or the stall watchdog re-publishes it): %w",
 			id, err)
 	}
 
@@ -1113,7 +1114,7 @@ func (e *Engine) process(ctx context.Context, wi workItem) error {
 	// execution heals its outbox immediately, without waiting for the watchdog.
 	// Re-publishing this very item is possible and harmless (msg-id dedup, then
 	// the guarded transitions).
-	if err := e.flushOutbox(ctx, exec); err != nil {
+	if err = e.flushOutbox(ctx, exec); err != nil {
 		return err // transient: Nak and retry
 	}
 
@@ -1166,7 +1167,9 @@ func (e *Engine) stepNode(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 // still at fromNode. A stale caller — a duplicate delivery, or an instance that
 // lost its lease mid-invocation and settles late — must not rewind CurrentNode
 // or resurrect a terminal (notably cancelled) execution; its advance is a no-op.
-func (e *Engine) advanceTo(ctx context.Context, execID, fromNode, nextNode string, mutate func(*store.Execution)) error {
+func (e *Engine) advanceTo(
+	ctx context.Context, execID, fromNode, nextNode string, mutate func(*store.Execution),
+) error {
 	var item json.RawMessage
 
 	if nextNode != "" {
@@ -1251,7 +1254,7 @@ func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, atte
 	// (e.g. a redelivered completion whose original settle lost its fanin
 	// eval): the outbox on the document is the source of truth for follow-on
 	// work, so a duplicate delivery heals it here instead of being dropped.
-	if err := e.flushOutbox(ctx, exec); err != nil {
+	if err = e.flushOutbox(ctx, exec); err != nil {
 		return err
 	}
 
@@ -1336,6 +1339,12 @@ func activityResult(a store.ActivityResult) (invoker.Result, error) {
 // completeBranch settles a pending fanout branch and, when it reaches a terminal
 // state, triggers a fanin re-evaluation. A retry with attempts remaining
 // re-dispatches the branch (a new attempt) instead.
+const (
+	branchSettleSkip       = ""
+	branchSettleSettled    = "settled"
+	branchSettleRedispatch = "redispatch"
+)
+
 func (e *Engine) completeBranch(
 	ctx context.Context, flow *dsl.Flow, exec *store.Execution,
 	branchID string, attempt int, res invoker.Result,
@@ -1344,12 +1353,6 @@ func (e *Engine) completeBranch(
 	if node == nil || node.Type != dsl.NodeTask {
 		return nil
 	}
-
-	const (
-		actionSkip       = ""
-		actionSettled    = "settled"
-		actionRedispatch = "redispatch"
-	)
 
 	evalItem, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindFaninEval})
 	if marshalErr != nil {
@@ -1366,60 +1369,15 @@ func (e *Engine) completeBranch(
 		}
 	}
 
-	action := actionSkip
+	var action string
 
 	claimed, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-		action = actionSkip // fresh per attempt: Mutate may retry fn
+		// action is reassigned fresh on every call: Mutate may retry fn.
+		var mutErr error
 
-		// Decide on the fresh document: a Cancel (or completion) that landed
-		// after the caller's snapshot must not have a branch settled onto it.
-		if !ex.Active() {
-			return errSkip
-		}
+		action, mutErr = settleBranchAttempt(ex, node, branchID, attempt, res, evalItem)
 
-		bs, ok := ex.Branches[branchID]
-		if !ok || bs.Status != store.BranchPending || bs.Attempt != attempt {
-			return errSkip
-		}
-
-		switch res.Status {
-		case invoker.StatusOK:
-			ex.Branches[branchID] = store.BranchState{
-				NodeID: branchID, Status: store.BranchCompleted, Attempt: attempt,
-			}
-
-			if len(res.Payload) > 0 {
-				ex.AddOutput(branchID)
-			}
-
-			action = actionSettled
-		case invoker.StatusError:
-			ex.Branches[branchID] = store.BranchState{
-				NodeID: branchID, Status: store.BranchFailed,
-				Error: res.Error, Attempt: attempt,
-			}
-			action = actionSettled
-		case invoker.StatusRetry, invoker.StatusPending: // transient/retry
-			if attempt+1 >= maxAttempts(node) {
-				ex.Branches[branchID] = store.BranchState{
-					NodeID: branchID, Status: store.BranchFailed,
-					Error: retryReason(res, nil), Attempt: attempt,
-				}
-				action = actionSettled
-			} else {
-				bs.Attempt = attempt + 1
-				ex.Branches[branchID] = bs // stays pending at the new attempt
-				action = actionRedispatch
-			}
-		}
-
-		if action == actionSettled {
-			// The join re-evaluation is committed with the settle (transactional
-			// outbox): a crash between this write and the flush can never lose it.
-			ex.AppendWork(evalItem)
-		}
-
-		return nil
+		return mutErr
 	})
 	if err != nil {
 		if errors.Is(err, errSkip) {
@@ -1429,21 +1387,97 @@ func (e *Engine) completeBranch(
 		return err
 	}
 
-	if action == actionRedispatch {
-		contextDoc, asmErr := e.assembleContext(ctx, claimed)
-		if asmErr != nil {
-			return asmErr
-		}
-
-		res2, callErr := e.invoke(ctx, node, exec.ID, contextDoc, attempt+1)
-		if callErr == nil && res2.Status == invoker.StatusPending {
-			return nil // re-dispatched; await the next CompleteActivity
-		}
-		// A synchronous branch invoker settled immediately.
-		return e.completeBranch(ctx, flow, claimed, branchID, attempt+1, settleResult(res2, callErr))
+	if action == branchSettleRedispatch {
+		return e.redispatchBranch(ctx, flow, node, claimed, branchID, attempt)
 	}
 
 	return e.flushOutbox(ctx, claimed)
+}
+
+// settleBranchAttempt is completeBranch's Mutate callback: on the fresh
+// document, it decides whether the dispatched attempt still applies and, if
+// so, records the branch's next state (settled or bumped for redispatch),
+// committing the fanin re-evaluation in the same write when it settles.
+func settleBranchAttempt(
+	ex *store.Execution, node *dsl.Node, branchID string, attempt int, res invoker.Result, evalItem json.RawMessage,
+) (action string, err error) {
+	// Decide on the fresh document: a Cancel (or completion) that landed
+	// after the caller's snapshot must not have a branch settled onto it.
+	if !ex.Active() {
+		return branchSettleSkip, errSkip
+	}
+
+	bs, ok := ex.Branches[branchID]
+	if !ok || bs.Status != store.BranchPending || bs.Attempt != attempt {
+		return branchSettleSkip, errSkip
+	}
+
+	next, action := nextBranchState(node, branchID, bs, attempt, res)
+	ex.Branches[branchID] = next
+
+	if action != branchSettleSettled {
+		// Redispatch, or an unrecognized res.Status: leave the branch as computed
+		// (pending, possibly at a bumped attempt) without appending the fanin eval.
+		return action, nil
+	}
+
+	if next.Status == store.BranchCompleted && len(res.Payload) > 0 {
+		ex.AddOutput(branchID)
+	}
+
+	// The join re-evaluation is committed with the settle (transactional
+	// outbox): a crash between this write and the flush can never lose it.
+	ex.AppendWork(evalItem)
+
+	return branchSettleSettled, nil
+}
+
+// nextBranchState computes a pending branch's next state given its dispatch
+// result: completed or failed (branchSettleSettled), bumped to the next
+// pending attempt (branchSettleRedispatch) when a transient failure still has
+// attempts remaining, or left untouched (branchSettleSkip) for a res.Status
+// this engine version does not recognize — never guess at an unknown status.
+func nextBranchState(
+	node *dsl.Node, branchID string, bs store.BranchState, attempt int, res invoker.Result,
+) (next store.BranchState, action string) {
+	switch res.Status {
+	case invoker.StatusOK:
+		return store.BranchState{NodeID: branchID, Status: store.BranchCompleted, Attempt: attempt}, branchSettleSettled
+	case invoker.StatusError:
+		return store.BranchState{
+			NodeID: branchID, Status: store.BranchFailed, Error: res.Error, Attempt: attempt,
+		}, branchSettleSettled
+	case invoker.StatusRetry, invoker.StatusPending: // transient/retry
+		if attempt+1 >= maxAttempts(node) {
+			return store.BranchState{
+				NodeID: branchID, Status: store.BranchFailed, Error: retryReason(res, nil), Attempt: attempt,
+			}, branchSettleSettled
+		}
+
+		bs.Attempt = attempt + 1
+
+		return bs, branchSettleRedispatch // stays pending at the new attempt
+	}
+
+	return bs, branchSettleSkip
+}
+
+// redispatchBranch re-invokes a branch task for its next attempt after a
+// transient failure freed it back to pending.
+func (e *Engine) redispatchBranch(
+	ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution, branchID string, attempt int,
+) error {
+	contextDoc, err := e.assembleContext(ctx, exec)
+	if err != nil {
+		return err
+	}
+
+	res2, callErr := e.invoke(ctx, node, exec.ID, contextDoc, attempt+1)
+	if callErr == nil && res2.Status == invoker.StatusPending {
+		return nil // re-dispatched; await the next CompleteActivity
+	}
+	// A synchronous branch invoker settled immediately.
+	return e.completeBranch(ctx, flow, exec, branchID, attempt+1, settleResult(res2, callErr))
 }
 
 // settleResult normalises a raw invoke outcome (result + transport error) into a

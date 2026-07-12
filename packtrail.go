@@ -267,7 +267,9 @@ func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 			}
 
 			if kind := n.InvokerKind(); !known[kind] {
-				return fmt.Errorf("flow %q: task node %q uses invoker kind %q, but no such invoker is registered (register it with WithInvoker or WithAsyncInvoker)",
+				return fmt.Errorf(
+					"flow %q: task node %q uses invoker kind %q, but no such invoker is registered "+
+						"(register it with WithInvoker or WithAsyncInvoker)",
 					f.Name, n.ID, kind)
 			}
 		}
@@ -700,9 +702,9 @@ func (s *Server) redriveStalled(ctx context.Context) (int, error) {
 
 			seen[id] = struct{}{}
 
-			ok, err := s.engine.RedriveStalled(ctx, id, s.cfg.stallRedrive)
-			if err != nil {
-				return redriven, err
+			ok, redriveErr := s.engine.RedriveStalled(ctx, id, s.cfg.stallRedrive)
+			if redriveErr != nil {
+				return redriven, redriveErr
 			}
 
 			if ok {
@@ -787,42 +789,61 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer cc.Stop()
 
-	// The active-set and full reconciles run on independent durable schedules.
-	// Both schedules survive restarts and fire on a single instance, so the deep
-	// backstop runs on its own cadence regardless of process churn or HA. The
-	// active pass also runs the stall watchdog (unless disabled): first the
-	// index is re-asserted from the source of truth, then stranded executions
-	// are re-driven.
+	if err = s.scheduleReconciles(ctx); err != nil {
+		return err
+	}
+
+	wg := s.startAsyncWorkers(ctx)
+
+	defer wg.Wait()
+	defer s.Close()
+
+	return s.engine.Run(ctx)
+}
+
+// scheduleReconciles wires the active-set and full reconcile passes and, if
+// configured, their durable cron schedules. The two run on independent
+// durable schedules; both survive restarts and fire on a single instance, so
+// the deep backstop runs on its own cadence regardless of process churn or
+// HA. The active pass also runs the stall watchdog (unless disabled): first
+// the index is re-asserted from the source of truth, then stranded executions
+// are re-driven.
+func (s *Server) scheduleReconciles(ctx context.Context) error {
 	s.engine.OnReconcileActive(func(ctx context.Context) error {
-		if err := s.indexer.ReconcileActive(ctx); err != nil {
-			return err
+		if reconcileErr := s.indexer.ReconcileActive(ctx); reconcileErr != nil {
+			return reconcileErr
 		}
 
 		if s.cfg.stallRedrive < 0 {
 			return nil // watchdog explicitly disabled
 		}
 
-		_, err := s.redriveStalled(ctx)
+		_, redriveErr := s.redriveStalled(ctx)
 
-		return err
+		return redriveErr
 	})
 	s.engine.OnReconcileFull(s.reconcileFull)
 
 	if s.cfg.reconcileActiveCron != "" {
-		if err = s.engine.ScheduleReconcileActive(ctx, s.cfg.reconcileActiveCron); err != nil {
+		if err := s.engine.ScheduleReconcileActive(ctx, s.cfg.reconcileActiveCron); err != nil {
 			return err
 		}
 	}
 
 	if s.cfg.reconcileFullCron != "" {
-		if err = s.engine.ScheduleReconcileFull(ctx, s.cfg.reconcileFullCron); err != nil {
+		if err := s.engine.ScheduleReconcileFull(ctx, s.cfg.reconcileFullCron); err != nil {
 			return err
 		}
 	}
 
-	// Host an in-process worker for each async invoker kind. Each consumes its
-	// kind's work-queue and settles results via this Server. They stop when ctx
-	// is cancelled (i.e. when engine.Run returns below).
+	return nil
+}
+
+// startAsyncWorkers hosts an in-process worker for each async invoker kind.
+// Each consumes its kind's work-queue and settles results via this Server.
+// They stop when ctx is cancelled (i.e. when engine.Run returns); the caller
+// must wait on the returned WaitGroup for them to drain.
+func (s *Server) startAsyncWorkers(ctx context.Context) *sync.WaitGroup {
 	var wg sync.WaitGroup
 
 	js := s.store.JS()
@@ -862,10 +883,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}(w, ai.kind)
 	}
 
-	defer wg.Wait()
-	defer s.Close()
-
-	return s.engine.Run(ctx)
+	return &wg
 }
 
 // Close drains any registered task workers. It does not close the NATS

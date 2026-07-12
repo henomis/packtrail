@@ -26,13 +26,13 @@ import (
 	"github.com/henomis/packtrail/invoker/asyncqueue"
 )
 
-// terminalErr is a non-retryable completion error. The worker detects it
+// terminalError is a non-retryable completion error. The worker detects it
 // structurally (interface{ Terminal() bool }) — mirroring the runtime engine's
 // "unknown flow" completion error — and dead-letters the job instead of looping.
-type terminalErr struct{}
+type terminalError struct{}
 
-func (terminalErr) Error() string  { return "terminal" }
-func (terminalErr) Terminal() bool { return true }
+func (terminalError) Error() string  { return "terminal" }
+func (terminalError) Terminal() bool { return true }
 
 // countingCompleter returns err for every CompleteActivity and counts the calls,
 // so a test can tell a single dead-letter (Term) from a Nak redelivery loop.
@@ -89,7 +89,7 @@ func TestWorkerDeadLettersTerminalCompletion(t *testing.T) {
 	exec := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
 		return invoker.Result{Status: invoker.StatusOK}, nil
 	})
-	completer := &countingCompleter{err: terminalErr{}}
+	completer := &countingCompleter{err: terminalError{}}
 
 	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, completer)
 	go func() { _ = w.Run(ctx) }()
@@ -125,7 +125,7 @@ func TestWorkerDeadLetterSink(t *testing.T) {
 	exec := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
 		return invoker.Result{Status: invoker.StatusOK}, nil
 	})
-	completer := &countingCompleter{err: terminalErr{}}
+	completer := &countingCompleter{err: terminalError{}}
 
 	type record struct {
 		key, reason string

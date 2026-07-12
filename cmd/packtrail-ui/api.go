@@ -203,9 +203,16 @@ func (a *api) getResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	data, err := json.Marshal(res)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
 
-	if _, err := w.Write(res); err != nil {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if _, err = w.Write(data); err != nil {
 		slog.Error("write results", "err", err)
 	}
 }

@@ -45,21 +45,7 @@ func (e *Engine) stepFanout(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 	// guard keeps a stale delivery from dispatching branches — and firing their
 	// side effects — for an execution that was cancelled or has moved on.
 	updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-		if !ex.Active() || ex.CurrentNode != node.ID {
-			return errSkip
-		}
-
-		if ex.Branches == nil {
-			ex.Branches = map[string]store.BranchState{}
-		}
-
-		for _, b := range node.Branches {
-			if _, ok := ex.Branches[b]; !ok {
-				ex.Branches[b] = store.BranchState{NodeID: b, Status: store.BranchPending}
-			}
-		}
-
-		return nil
+		return ensurePendingBranches(ex, node)
 	})
 	if err != nil {
 		if errors.Is(err, errSkip) {
@@ -69,59 +55,92 @@ func (e *Engine) stepFanout(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 		return err
 	}
 
-	branches := make([]string, 0, len(node.Branches))
-
-	for _, b := range node.Branches {
-		if updated.Branches[b].Status == store.BranchPending {
-			branches = append(branches, b)
-		}
-	}
+	branches := pendingBranchIDs(node, updated)
 
 	if e.dispatchBranches(ctx, flow, updated, branches) {
 		// Async branches outstanding: park at the fanin (waiting); their
-		// completions will enqueue fanin_eval. Set CurrentNode so evalFanin
-		// recognises the node. One eval is committed with the park itself
-		// (transactional outbox): a fast async branch can complete *before* the
-		// park lands — its CompleteActivity enqueued a fanin_eval that evalFanin
-		// dropped as stale — and if that was the last outstanding branch nothing
-		// else would ever re-evaluate the join. With branches still pending the
-		// eval harmlessly no-ops; duplicates are state-safe (advanceTo is
-		// guarded). This is the fanout counterpart to stepTask's
-		// early-completion stash.
-		evalItem, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindFaninEval})
-		if marshalErr != nil {
-			return marshalErr
-		}
-
-		parked, parkErr := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-			// Park only if still active at the fanout: a Cancel that landed while
-			// branches were dispatching must not be overwritten back to waiting.
-			if !ex.Active() || ex.CurrentNode != node.ID {
-				return errSkip
-			}
-
-			ex.Status = store.StatusWaiting
-			ex.CurrentNode = fanin
-			ex.Attempt = 0
-			ex.AppendWork(evalItem)
-
-			return nil
-		})
-		if parkErr != nil {
-			if errors.Is(parkErr, errSkip) {
-				return nil
-			}
-
-			return parkErr
-		}
-
-		e.emitEvent(ctx, parked)
-
-		return e.flushOutbox(ctx, parked)
+		// completions drive the join.
+		return e.parkAtFanin(ctx, node, exec.ID, fanin)
 	}
 
 	// All branches settled synchronously; move to the fanin to apply the join.
 	return e.advanceTo(ctx, exec.ID, node.ID, fanin, nil)
+}
+
+// ensurePendingBranches is stepFanout's Mutate callback: it seeds a pending
+// entry for every branch not yet tracked (idempotent on resume).
+func ensurePendingBranches(ex *store.Execution, node *dsl.Node) error {
+	if !ex.Active() || ex.CurrentNode != node.ID {
+		return errSkip
+	}
+
+	if ex.Branches == nil {
+		ex.Branches = map[string]store.BranchState{}
+	}
+
+	for _, b := range node.Branches {
+		if _, ok := ex.Branches[b]; !ok {
+			ex.Branches[b] = store.BranchState{NodeID: b, Status: store.BranchPending}
+		}
+	}
+
+	return nil
+}
+
+// pendingBranchIDs returns the branches of node still awaiting dispatch.
+func pendingBranchIDs(node *dsl.Node, exec *store.Execution) []string {
+	branches := make([]string, 0, len(node.Branches))
+
+	for _, b := range node.Branches {
+		if exec.Branches[b].Status == store.BranchPending {
+			branches = append(branches, b)
+		}
+	}
+
+	return branches
+}
+
+// parkAtFanin parks the execution at the fanin node (waiting); their
+// completions will enqueue fanin_eval. Set CurrentNode so evalFanin
+// recognises the node. One eval is committed with the park itself
+// (transactional outbox): a fast async branch can complete *before* the
+// park lands — its CompleteActivity enqueued a fanin_eval that evalFanin
+// dropped as stale — and if that was the last outstanding branch nothing
+// else would ever re-evaluate the join. With branches still pending the
+// eval harmlessly no-ops; duplicates are state-safe (advanceTo is
+// guarded). This is the fanout counterpart to stepTask's
+// early-completion stash.
+func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin string) error {
+	evalItem, err := json.Marshal(workItem{ExecID: execID, Kind: kindFaninEval})
+	if err != nil {
+		return err
+	}
+
+	parked, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		// Park only if still active at the fanout: a Cancel that landed while
+		// branches were dispatching must not be overwritten back to waiting.
+		if !ex.Active() || ex.CurrentNode != node.ID {
+			return errSkip
+		}
+
+		ex.Status = store.StatusWaiting
+		ex.CurrentNode = fanin
+		ex.Attempt = 0
+		ex.AppendWork(evalItem)
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil
+		}
+
+		return err
+	}
+
+	e.emitEvent(ctx, parked)
+
+	return e.flushOutbox(ctx, parked)
 }
 
 // dispatchBranches invokes every branch in parallel and persists each settled

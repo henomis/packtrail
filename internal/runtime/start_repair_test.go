@@ -156,8 +156,8 @@ func TestSignalReparkIdempotent(t *testing.T) {
 
 	// The duplicate's re-scheduled timeout must no-op, not re-dispatch anything.
 	select {
-	case r := <-h.inv.reqs:
-		t.Fatalf("stale duplicate timeout dispatched: %+v", r)
+	case stale := <-h.inv.reqs:
+		t.Fatalf("stale duplicate timeout dispatched: %+v", stale)
 	case <-time.After(1200 * time.Millisecond):
 	}
 }

@@ -111,19 +111,19 @@ func TestApplySignalDuplicateRedrivesRunning(t *testing.T) {
 
 	exec.AppendWork(advItem)
 
-	if _, err := st.Create(ctx, exec); err != nil {
+	if _, err = st.Create(ctx, exec); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	// The redelivered (duplicate) signal.
-	if err := eng.applySignal(ctx, signal.Delivery{ExecID: "sig-redrive-1", Name: "go", Seq: 7}); err != nil {
+	if err = eng.applySignal(ctx, signal.Delivery{ExecID: "sig-redrive-1", Name: "go", Seq: 7}); err != nil {
 		t.Fatalf("apply signal: %v", err)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		ex, err := st.Get(ctx, "sig-redrive-1")
-		if err == nil && ex.Status == store.StatusCompleted {
+		ex, getErr := st.Get(ctx, "sig-redrive-1")
+		if getErr == nil && ex.Status == store.StatusCompleted {
 			return
 		}
 
@@ -207,7 +207,7 @@ func TestGuardedAdvanceFlushFailureLeavesDurableOutbox(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if ex, getErr := st.Get(ctx, "sig-flushfail-1"); getErr == nil && ex.Status == store.StatusCompleted {
+		if cur, getErr := st.Get(ctx, "sig-flushfail-1"); getErr == nil && cur.Status == store.StatusCompleted {
 			return
 		}
 

@@ -94,13 +94,13 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 	}
 }
 
-// terminalErr is a non-retryable handler error. ConsumeFired detects it
+// terminalError is a non-retryable handler error. ConsumeFired detects it
 // structurally (interface{ Terminal() bool }) — mirroring the runtime engine's
 // terminalError for a cron start of a removed flow — and Terms it.
-type terminalErr struct{}
+type terminalError struct{}
 
-func (terminalErr) Error() string  { return "terminal" }
-func (terminalErr) Terminal() bool { return true }
+func (terminalError) Error() string  { return "terminal" }
+func (terminalError) Terminal() bool { return true }
 
 // TestConsumeFiredTerminalDeadLetters verifies a terminal handler error is Term'd
 // on the first delivery (not redelivered): the handler is invoked exactly once.
@@ -118,7 +118,7 @@ func TestConsumeFiredTerminalDeadLetters(t *testing.T) {
 	cc, err := sched.ConsumeFired(ctx, "test-fired-terminal", 10, nil, func(string, []byte) error {
 		calls.Add(1)
 
-		return terminalErr{}
+		return terminalError{}
 	})
 	if err != nil {
 		t.Fatalf("consume fired: %v", err)

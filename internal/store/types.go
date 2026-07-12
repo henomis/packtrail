@@ -78,8 +78,8 @@ type Execution struct {
 	WaitSignal  string                 `json:"wait_signal,omitempty"` // signal_name currently awaited
 	Activity    *ActivityResult        `json:"activity,omitempty"`    //nolint:lll // async completion that arrived before the task parked
 	Error       string                 `json:"error,omitempty"`
-	RetryAt     time.Time              `json:"retry_at,omitzero"` // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
-	Outbox      []OutboxItem           `json:"outbox,omitempty"`  // follow-on messages committed with the last transition, pending publish
+	RetryAt     time.Time              `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
+	Outbox      []OutboxItem           `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
 	OutboxSeq   uint64                 `json:"outbox_seq,omitempty"`
 	Revision    uint64                 `json:"-"` // current KV revision, for CAS (not persisted in value)
 	UpdatedAt   time.Time              `json:"updated_at"`

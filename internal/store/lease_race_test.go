@@ -66,16 +66,16 @@ func TestAcquireLeaseExpiredRenewalLosesTakeover(t *testing.T) {
 	}
 
 	// Inject B's takeover into A's read→write window.
-	real := s.leases
-	s.leases = &raceKV{KeyValue: real, beforeUpdate: func() {
-		s.leases = real // B (and A's retry re-read) must see the real bucket
+	origKV := s.leases
+	s.leases = &raceKV{KeyValue: origKV, beforeUpdate: func() {
+		s.leases = origKV // B (and A's retry re-read) must see the real bucket
 
 		held, acquireErr := s.AcquireLease(ctx, execID, "B", time.Minute)
 		if acquireErr != nil || !held {
 			t.Fatalf("B takeover: held=%v err=%v", held, acquireErr)
 		}
 
-		s.leases = &raceKV{KeyValue: real} // restore wrapper for A's in-flight Update
+		s.leases = &raceKV{KeyValue: origKV} // restore wrapper for A's in-flight Update
 	}}
 
 	held, err := s.AcquireLease(ctx, execID, "A", time.Minute)
@@ -88,7 +88,7 @@ func TestAcquireLeaseExpiredRenewalLosesTakeover(t *testing.T) {
 	}
 
 	// The lease must belong to B.
-	entry, err := real.Get(ctx, execID)
+	entry, err := origKV.Get(ctx, execID)
 	if err != nil {
 		t.Fatalf("get lease: %v", err)
 	}
@@ -123,14 +123,14 @@ func TestAcquireLeaseLiveRenewalConflictStillHeld(t *testing.T) {
 	}
 
 	// Our own heartbeat renews in the read→write window, bumping the revision.
-	real := s.leases
-	s.leases = &raceKV{KeyValue: real, beforeUpdate: func() {
+	origKV := s.leases
+	s.leases = &raceKV{KeyValue: origKV, beforeUpdate: func() {
 		renewed, marshalErr := json.Marshal(Lease{Owner: "A", Expires: time.Now().Add(2 * time.Minute).UTC()})
 		if marshalErr != nil {
 			t.Fatalf("marshal: %v", marshalErr)
 		}
 
-		if _, putErr := real.Put(ctx, execID, renewed); putErr != nil {
+		if _, putErr := origKV.Put(ctx, execID, renewed); putErr != nil {
 			t.Fatalf("concurrent renewal: %v", putErr)
 		}
 	}}

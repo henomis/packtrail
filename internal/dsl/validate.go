@@ -44,7 +44,8 @@ func (f *Flow) Validate() error {
 	}
 
 	if !namePattern.MatchString(f.Name) {
-		return fmt.Errorf("flow %q: name must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV key segment)", f.Name)
+		return fmt.Errorf(
+			"flow %q: name must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV key segment)", f.Name)
 	}
 
 	if len(f.Nodes) == 0 {
@@ -60,7 +61,9 @@ func (f *Flow) Validate() error {
 		}
 
 		if !namePattern.MatchString(n.ID) {
-			return fmt.Errorf("flow %q: node id %q must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV key segment)", f.Name, n.ID)
+			return fmt.Errorf(
+				"flow %q: node id %q must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV key segment)",
+				f.Name, n.ID)
 		}
 
 		if _, dup := f.byID[n.ID]; dup {
@@ -169,28 +172,7 @@ func (f *Flow) rejectUnreachable() error {
 		id := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		var succ []string
-
-		if to := f.next[id]; to != "" {
-			succ = append(succ, to)
-		}
-
-		if n := f.byID[id]; n != nil {
-			switch n.Type {
-			case NodeFanout:
-				succ = append(succ, n.Branches...)
-			case NodeChoice:
-				for _, r := range n.Rules {
-					succ = append(succ, r.To)
-				}
-			case NodeSignal:
-				if n.OnTimeout != "" {
-					succ = append(succ, n.OnTimeout)
-				}
-			}
-		}
-
-		for _, next := range succ {
+		for _, next := range f.reachableFrom(id) {
 			if !seen[next] {
 				seen[next] = true
 
@@ -210,11 +192,44 @@ func (f *Flow) rejectUnreachable() error {
 	if len(unreachable) > 0 {
 		sort.Strings(unreachable)
 
-		return fmt.Errorf("flow %q: unreachable node(s) %v: not connected to the start node by any edge, choice rule, fanout branch or on_timeout",
+		return fmt.Errorf(
+			"flow %q: unreachable node(s) %v: not connected to the start node by any edge, "+
+				"choice rule, fanout branch or on_timeout",
 			f.Name, unreachable)
 	}
 
 	return nil
+}
+
+// reachableFrom returns every node id reachable from id via a single runtime
+// transition: the linear edge, choice rule targets, a signal's on_timeout
+// route, or a fanout's branches (invoked inline by their fanout).
+func (f *Flow) reachableFrom(id string) []string {
+	var succ []string
+
+	if to := f.next[id]; to != "" {
+		succ = append(succ, to)
+	}
+
+	n := f.byID[id]
+	if n == nil {
+		return succ
+	}
+
+	switch n.Type {
+	case NodeFanout:
+		succ = append(succ, n.Branches...)
+	case NodeChoice:
+		for _, r := range n.Rules {
+			succ = append(succ, r.To)
+		}
+	case NodeSignal:
+		if n.OnTimeout != "" {
+			succ = append(succ, n.OnTimeout)
+		}
+	}
+
+	return succ
 }
 
 // validateFanAdjacency ties each fanout to the fanin that joins it, rejecting
@@ -238,7 +253,8 @@ func (f *Flow) validateFanAdjacency() error {
 
 		for _, b := range n.Branches {
 			if bn := f.byID[b]; bn.Type != NodeTask {
-				return fmt.Errorf("flow %q: fanout %q: branch %q is a %s node; branches must be task nodes (any other type never settles)",
+				return fmt.Errorf(
+					"flow %q: fanout %q: branch %q is a %s node; branches must be task nodes (any other type never settles)",
 					f.Name, n.ID, b, bn.Type)
 			}
 
@@ -251,13 +267,15 @@ func (f *Flow) validateFanAdjacency() error {
 		}
 
 		if jn := f.byID[fanin]; jn.Type != NodeFanin {
-			return fmt.Errorf("flow %q: fanout %q leads to %q, a %s node; a fanout's successor must be a fanin",
+			return fmt.Errorf(
+				"flow %q: fanout %q leads to %q, a %s node; a fanout's successor must be a fanin",
 				f.Name, n.ID, fanin, jn.Type)
 		}
 
 		for _, w := range f.byID[fanin].WaitFor {
 			if !branches[w] {
-				return fmt.Errorf("flow %q: fanin %q waits for %q, which is not a branch of its fanout %q (the join could never settle it)",
+				return fmt.Errorf(
+					"flow %q: fanin %q waits for %q, which is not a branch of its fanout %q (the join could never settle it)",
 					f.Name, fanin, w, n.ID)
 			}
 		}
@@ -304,7 +322,8 @@ func (f *Flow) validateFanMembership() error {
 
 		for _, w := range n.WaitFor {
 			if _, ok := branchOwner[w]; !ok {
-				return fmt.Errorf("flow %q: fanin %q waits for node %q, which is not a branch of any fanout (it would never settle)",
+				return fmt.Errorf(
+					"flow %q: fanin %q waits for node %q, which is not a branch of any fanout (it would never settle)",
 					f.Name, n.ID, w)
 			}
 		}
@@ -321,58 +340,75 @@ func (f *Flow) validateFanMembership() error {
 // targets, and a signal node's on_timeout route. Branch nodes do not advance
 // the execution (they are invoked inline by the fanout) and are not followed.
 func (f *Flow) rejectFanCycles() error {
-	succ := func(id string) []string {
-		var out []string
-
-		if to := f.next[id]; to != "" {
-			out = append(out, to)
-		}
-
-		if n := f.byID[id]; n != nil {
-			switch n.Type {
-			case NodeChoice:
-				for _, r := range n.Rules {
-					out = append(out, r.To)
-				}
-			case NodeSignal:
-				if n.OnTimeout != "" {
-					out = append(out, n.OnTimeout)
-				}
-			}
-		}
-
-		return out
-	}
-
 	for i := range f.Nodes {
 		start := &f.Nodes[i]
 		if start.Type != NodeFanout && start.Type != NodeFanin {
 			continue
 		}
 
-		// DFS from start's successors; reaching start again means it is on a cycle.
-		stack := succ(start.ID)
-		seen := map[string]bool{}
-
-		for len(stack) > 0 {
-			id := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-
-			if id == start.ID {
-				return fmt.Errorf("flow %q: %s node %q lies on a cycle; fanout/fanin state is per-execution and a revisit would reuse it",
-					f.Name, start.Type, start.ID)
-			}
-
-			if seen[id] {
-				continue
-			}
-
-			seen[id] = true
-			stack = append(stack, succ(id)...)
+		if f.advanceCycleFrom(start.ID) {
+			return fmt.Errorf(
+				"flow %q: %s node %q lies on a cycle; fanout/fanin state is per-execution and a revisit would reuse it",
+				f.Name, start.Type, start.ID)
 		}
 	}
 
 	return nil
+}
+
+// advanceCycleFrom reports whether a DFS along runtime-advance edges, starting
+// from startID's successors, ever revisits startID.
+func (f *Flow) advanceCycleFrom(startID string) bool {
+	stack := f.advanceSucc(startID)
+	seen := map[string]bool{}
+
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if id == startID {
+			return true
+		}
+
+		if seen[id] {
+			continue
+		}
+
+		seen[id] = true
+		stack = append(stack, f.advanceSucc(id)...)
+	}
+
+	return false
+}
+
+// advanceSucc returns id's runtime-advance successors: the linear edge, choice
+// rule targets, and a signal node's on_timeout route. Branch nodes do not
+// advance the execution (they are invoked inline by the fanout) and are not
+// followed.
+func (f *Flow) advanceSucc(id string) []string {
+	var out []string
+
+	if to := f.next[id]; to != "" {
+		out = append(out, to)
+	}
+
+	n := f.byID[id]
+	if n == nil {
+		return out
+	}
+
+	switch n.Type {
+	case NodeChoice:
+		for _, r := range n.Rules {
+			out = append(out, r.To)
+		}
+	case NodeSignal:
+		if n.OnTimeout != "" {
+			out = append(out, n.OnTimeout)
+		}
+	}
+
+	return out
 }
 
 // validateTaskNode checks a task node's required transport and retry bounds.
@@ -397,7 +433,8 @@ func (f *Flow) validateTaskNode(n *Node) error {
 		}
 
 		if resolved := ResolvePlaceholders(target, "x"); strings.ContainsAny(resolved, " \t*>") {
-			return fmt.Errorf("flow %q: task node %q: subject %q contains whitespace or wildcard characters (it becomes a NATS request subject)",
+			return fmt.Errorf(
+				"flow %q: task node %q: subject %q contains whitespace or wildcard characters (it becomes a NATS request subject)",
 				f.Name, n.ID, target)
 		}
 	}
@@ -475,7 +512,8 @@ func (f *Flow) validateNode(n *Node) error {
 		}
 
 		if !namePattern.MatchString(n.SignalName) {
-			return fmt.Errorf("flow %q: signal node %q: signal_name %q must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token)",
+			return fmt.Errorf(
+				"flow %q: signal node %q: signal_name %q must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token)",
 				f.Name, n.ID, n.SignalName)
 		}
 
@@ -488,7 +526,8 @@ func (f *Flow) validateNode(n *Node) error {
 			// schedule is only installed for a positive timeout, so the route
 			// is dead configuration — almost certainly a forgotten timeout.
 			if n.Timeout.D() <= 0 {
-				return fmt.Errorf("flow %q: signal node %q: on_timeout %q requires a positive timeout (without one the route never fires)",
+				return fmt.Errorf(
+					"flow %q: signal node %q: on_timeout %q requires a positive timeout (without one the route never fires)",
 					f.Name, n.ID, n.OnTimeout)
 			}
 		}

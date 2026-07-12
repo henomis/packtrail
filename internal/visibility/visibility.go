@@ -227,7 +227,9 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 // CAS, and whether the record exists. A corrupt value is treated as
 // not-yet-indexed content but keeps its KV revision, so the rewrite still goes
 // through the CAS.
-func (ix *Indexer) lastIndexed(ctx context.Context, execID string) (prev store.Event, kvRev uint64, exists bool, err error) {
+func (ix *Indexer) lastIndexed(
+	ctx context.Context, execID string,
+) (prev store.Event, kvRev uint64, exists bool, err error) {
 	entry, getErr := ix.idxFlow.Get(ctx, metaKey(execID))
 	if getErr != nil {
 		if errors.Is(getErr, jetstream.ErrKeyNotFound) {

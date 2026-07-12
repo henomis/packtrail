@@ -102,7 +102,7 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 	if callErr == nil && res.Status == invoker.StatusPending {
 		var early *store.ActivityResult
 
-		updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+		updated, mutErr := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
 			// Park only if the execution is still active at this node/attempt: a
 			// Cancel (or a competing instance's transition) that landed while the
 			// dispatch was in flight must not be overwritten back to waiting. The
@@ -123,12 +123,12 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 
 			return nil
 		})
-		if err != nil {
-			if errors.Is(err, errSkip) {
+		if mutErr != nil {
+			if errors.Is(mutErr, errSkip) {
 				return nil // cancelled or moved on while dispatching: drop
 			}
 
-			return err
+			return mutErr
 		}
 
 		e.emitEvent(ctx, updated)
@@ -152,30 +152,8 @@ func (e *Engine) settleTask(
 	ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 	exec *store.Execution, res invoker.Result, callErr error,
 ) error {
-	// Success: record the output in the data plane and advance. Data before
-	// control — the output is readable before the advance commits, so the flow
-	// can never move past a node whose result is missing; a re-run of the same
-	// attempt overwrites the entry idempotently. Outputs are namespaced per
-	// node (results.<node> in the assembled context), so any JSON shape is
-	// legal — nothing merges into a shared root anymore.
 	if callErr == nil && res.Status == invoker.StatusOK {
-		if len(res.Payload) > 0 {
-			if putErr := e.store.PutPayload(ctx, store.OutputKey(exec.ID, node.ID), res.Payload); putErr != nil {
-				if errors.Is(putErr, store.ErrPayloadTooLarge) {
-					return e.failNode(ctx, exec.ID, node.ID, putErr.Error())
-				}
-
-				return putErr
-			}
-		}
-
-		next := flow.Successor(node.ID)
-
-		return e.advanceTo(ctx, exec.ID, node.ID, next, func(ex *store.Execution) {
-			if len(res.Payload) > 0 {
-				ex.AddOutput(node.ID)
-			}
-		})
+		return e.settleTaskSuccess(ctx, flow, node, exec, res)
 	}
 
 	// Permanent error from the task: fail immediately, no retry.
@@ -183,8 +161,43 @@ func (e *Engine) settleTask(
 		return e.failNode(ctx, exec.ID, node.ID, "task "+node.ID+": "+res.Error)
 	}
 
-	// Transient failure (transport error, timeout, or explicit retry). Retry if
-	// attempts remain, scheduling the next attempt via the Message Scheduler.
+	return e.settleTaskRetry(ctx, node, exec, res, callErr)
+}
+
+// settleTaskSuccess records the output in the data plane and advances. Data
+// before control — the output is readable before the advance commits, so the
+// flow can never move past a node whose result is missing; a re-run of the
+// same attempt overwrites the entry idempotently. Outputs are namespaced per
+// node (results.<node> in the assembled context), so any JSON shape is legal —
+// nothing merges into a shared root anymore.
+func (e *Engine) settleTaskSuccess(
+	ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution, res invoker.Result,
+) error {
+	if len(res.Payload) > 0 {
+		if putErr := e.store.PutPayload(ctx, store.OutputKey(exec.ID, node.ID), res.Payload); putErr != nil {
+			if errors.Is(putErr, store.ErrPayloadTooLarge) {
+				return e.failNode(ctx, exec.ID, node.ID, putErr.Error())
+			}
+
+			return putErr
+		}
+	}
+
+	next := flow.Successor(node.ID)
+
+	return e.advanceTo(ctx, exec.ID, node.ID, next, func(ex *store.Execution) {
+		if len(res.Payload) > 0 {
+			ex.AddOutput(node.ID)
+		}
+	})
+}
+
+// settleTaskRetry handles a transient failure (transport error, timeout, or
+// explicit retry): retries if attempts remain, scheduling the next attempt via
+// the Message Scheduler, or fails the node once retries are exhausted.
+func (e *Engine) settleTaskRetry(
+	ctx context.Context, node *dsl.Node, exec *store.Execution, res invoker.Result, callErr error,
+) error {
 	reason := retryReason(res, callErr)
 	if exec.Attempt+1 >= maxAttempts(node) {
 		return e.failNode(ctx, exec.ID, node.ID, "task "+node.ID+" exhausted retries: "+reason)

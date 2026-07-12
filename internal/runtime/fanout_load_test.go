@@ -73,7 +73,7 @@ func memHarness(t *testing.T, flowYAML string, inv invoker.Invoker) (*store.Stor
 	}
 
 	sch := scheduler.New(srv.JS, n)
-	if err := sch.EnsureStream(ctx); err != nil {
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 

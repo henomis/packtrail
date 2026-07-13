@@ -125,6 +125,19 @@ nodes:
 	}
 }
 
+func TestValidateRejectsMalformedSubjectTokens(t *testing.T) {
+	for _, subject := range []string{"tasks..notify", ".tasks.notify", "tasks.notify.", "tasks.\nnotify"} {
+		_, err := Parse([]byte(`
+name: bad-subject-shape
+nodes:
+  - {id: a, type: task, subject: "` + subject + `"}
+`))
+		if err == nil || !strings.Contains(err.Error(), "NATS request subject") {
+			t.Errorf("subject %q: err = %v, want malformed-subject rejection", subject, err)
+		}
+	}
+}
+
 // TestValidateAllowsPlaceholderSubject: the {execution_id} placeholder is part
 // of the nats-task contract and must stay legal.
 func TestValidateAllowsPlaceholderSubject(t *testing.T) {
@@ -146,5 +159,88 @@ nodes:
   - {id: a, type: task, invoker: http, target: "https://example.com/hook?x=1 y"}
 `)); err != nil {
 		t.Fatalf("custom target rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsUnknownJoinPolicy(t *testing.T) {
+	for _, jp := range []string{"majority", "quorm:2", "Any", "banana"} {
+		_, err := Parse([]byte(`
+name: bad-join
+nodes:
+  - {id: fo, type: fanout, branches: [b1, b2]}
+  - {id: b1, type: task, subject: "x"}
+  - {id: b2, type: task, subject: "y"}
+  - {id: j, type: fanin, wait_for: [b1, b2], join_policy: "` + jp + `"}
+edges:
+  - {from: fo, to: j}
+`))
+		if err == nil || !strings.Contains(err.Error(), "unknown join_policy") {
+			t.Fatalf("join_policy %q: err = %v, want unknown-join_policy rejection", jp, err)
+		}
+	}
+}
+
+func TestValidateRejectsSelfEdge(t *testing.T) {
+	_, err := Parse([]byte(`
+name: self-loop
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+edges:
+  - {from: a, to: b}
+  - {from: b, to: b}
+`))
+	if err == nil || !strings.Contains(err.Error(), "self-edge") {
+		t.Fatalf("err = %v, want self-edge rejection", err)
+	}
+}
+
+func TestValidateRejectsUnknownBackoff(t *testing.T) {
+	_, err := Parse([]byte(`
+name: bad-backoff
+nodes:
+  - {id: a, type: task, subject: "x", retry: {max_attempts: 3, backoff: expontential}}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unknown retry.backoff") {
+		t.Fatalf("err = %v, want unknown-backoff rejection", err)
+	}
+}
+
+func TestValidateAcceptsKnownBackoffs(t *testing.T) {
+	for _, b := range []string{"fixed", "linear", "exponential"} {
+		if _, err := Parse([]byte(`
+name: ok-backoff
+nodes:
+  - {id: a, type: task, subject: "x", retry: {max_attempts: 3, backoff: ` + b + `}}
+`)); err != nil {
+			t.Fatalf("backoff %q rejected: %v", b, err)
+		}
+	}
+}
+
+func TestValidateRejectsNodeReachableOnlyViaBranchEdge(t *testing.T) {
+	_, err := Parse([]byte(`
+name: dead-via-branch-edge
+nodes:
+  - id: fo
+    type: fanout
+    branches: [b1]
+  - id: b1
+    type: task
+    subject: "x"
+  - id: j
+    type: fanin
+    wait_for: [b1]
+  - id: ghost
+    type: task
+    subject: "g"
+edges:
+  - from: fo
+    to: j
+  - from: b1
+    to: ghost
+`))
+	if err == nil || !strings.Contains(err.Error(), "unreachable node(s) [ghost]") {
+		t.Fatalf("err = %v, want unreachable ghost rejection", err)
 	}
 }

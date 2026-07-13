@@ -93,6 +93,11 @@ func (f *Flow) Validate() error {
 			return fmt.Errorf("flow %q: edge to unknown node %q", f.Name, e.To)
 		}
 
+		// A self-edge is an unconditional advance loop with no exit.
+		if e.From == e.To {
+			return fmt.Errorf("flow %q: node %q has a self-edge (would advance-loop forever)", f.Name, e.From)
+		}
+
 		if _, dup := f.next[e.From]; dup {
 			return fmt.Errorf("flow %q: node %q has more than one outgoing edge", f.Name, e.From)
 		}
@@ -202,19 +207,13 @@ func (f *Flow) rejectUnreachable() error {
 }
 
 // reachableFrom returns every node id reachable from id via a single runtime
-// transition: the linear edge, choice rule targets, a signal's on_timeout
-// route, or a fanout's branches (invoked inline by their fanout).
-//
-// Known limitation: this follows the linear edge (f.next) of every node,
-// including a node that is itself a fanout branch. At runtime a branch is
-// invoked inline and never advances its own outgoing edge, so a node reachable
-// ONLY via a branch's edge is dead yet still passes the unreachable check. This
-// is a conservative false-negative (it accepts dead config; it never rejects a
-// live flow), left as-is to avoid changing which flows validate.
+// transition: the linear edge (except out of fanout branch tasks, which are
+// invoked inline and never advance), choice rule targets, a signal's on_timeout
+// route, or a fanout's branches.
 func (f *Flow) reachableFrom(id string) []string {
 	var succ []string
 
-	if to := f.next[id]; to != "" {
+	if to := f.next[id]; to != "" && !f.isFanoutBranch(id) {
 		succ = append(succ, to)
 	}
 
@@ -237,6 +236,23 @@ func (f *Flow) reachableFrom(id string) []string {
 	}
 
 	return succ
+}
+
+func (f *Flow) isFanoutBranch(id string) bool {
+	for i := range f.Nodes {
+		n := &f.Nodes[i]
+		if n.Type != NodeFanout {
+			continue
+		}
+
+		for _, b := range n.Branches {
+			if b == id {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // validateFanAdjacency ties each fanout to the fanin that joins it, rejecting
@@ -429,6 +445,15 @@ func (f *Flow) validateTaskNode(n *Node) error {
 			f.Name, n.ID, MaxRetryAttempts)
 	}
 
+	if n.Retry != nil {
+		switch strings.TrimSpace(n.Retry.Backoff) {
+		case "", "fixed", "linear", "exponential":
+		default:
+			return fmt.Errorf("flow %q: task node %q: unknown retry.backoff %q (want exponential, linear, or fixed)",
+				f.Name, n.ID, n.Retry.Backoff)
+		}
+	}
+
 	// For the built-in nats-task kind the target becomes a NATS request
 	// subject; whitespace or wildcard characters can never publish. Custom
 	// invoker kinds interpret Target freely (it may be a URL), so only the
@@ -439,7 +464,9 @@ func (f *Flow) validateTaskNode(n *Node) error {
 			target = n.Subject
 		}
 
-		if resolved := ResolvePlaceholders(target, "x"); strings.ContainsAny(resolved, " \t*>") {
+		resolved := ResolvePlaceholders(target, "x")
+		if strings.ContainsAny(resolved, " \t\n\r*>") || strings.Contains(resolved, "..") ||
+			strings.HasPrefix(resolved, ".") || strings.HasSuffix(resolved, ".") {
 			return fmt.Errorf(
 				"flow %q: task node %q: subject %q contains whitespace or wildcard characters (it becomes a NATS request subject)",
 				f.Name, n.ID, target)
@@ -485,6 +512,11 @@ func (f *Flow) validateNode(n *Node) error {
 			if err := ref(w, "wait_for"); err != nil {
 				return err
 			}
+		}
+
+		if jp := strings.TrimSpace(n.JoinPolicy); jp != "" && jp != JoinAll && jp != JoinAny && !strings.HasPrefix(jp, JoinQuorum+":") {
+			return fmt.Errorf("flow %q: fanin node %q: unknown join_policy %q (want all, any, or quorum:N)",
+				f.Name, n.ID, n.JoinPolicy)
 		}
 
 		kind, quorum := n.JoinKind()

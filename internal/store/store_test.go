@@ -271,6 +271,27 @@ func TestDocumentSizeGuard(t *testing.T) {
 	}
 }
 
+func TestDocumentSizeGuardOnCreate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxDocumentBytes(128)
+
+	_, err := s.Create(ctx, &Execution{
+		ID:          "e-create-big",
+		FlowName:    "f",
+		Status:      StatusRunning,
+		CurrentNode: "a",
+		Error:       strings.Repeat("x", 512),
+	})
+	if !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("oversized Create: err = %v, want ErrDocumentTooLarge", err)
+	}
+
+	if _, getErr := s.Get(ctx, "e-create-big"); !errors.Is(getErr, ErrNotFound) {
+		t.Fatalf("oversized Create persisted an entry: get err = %v, want ErrNotFound", getErr)
+	}
+}
+
 func TestPayloadGuardDisabled(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)

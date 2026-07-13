@@ -31,7 +31,6 @@ import (
 
 const (
 	execBucketHistory  = 64
-	leasesBucketTTL    = 5 * time.Minute
 	eventsMaxAge       = 24 * time.Hour
 	deadLetterMaxAge   = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
 	deadLetterReadWait = 500 * time.Millisecond
@@ -120,9 +119,10 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 
 	if s.leases, err = js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket: n.BucketLeases,
-		// Bucket-wide TTL is a backstop; correctness relies on the expiry
-		// timestamp stored in each lease value (see lease.go).
-		TTL:            leasesBucketTTL,
+		// No bucket-wide TTL: lease validity is governed by the Expires field
+		// in each value (see lease.go). A fixed bucket TTL shorter than a
+		// configured LeaseTTL would evict live leases early.
+		TTL:            0,
 		LimitMarkerTTL: time.Minute,
 	}); err != nil {
 		return nil, fmt.Errorf("leases bucket: %w", err)
@@ -328,6 +328,11 @@ func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return 0, err
+	}
+
+	if s.maxDocBytes > 0 && len(data) > s.maxDocBytes {
+		return 0, fmt.Errorf("%w: execution %s is %d bytes, limit %d",
+			ErrDocumentTooLarge, e.ID, len(data), s.maxDocBytes)
 	}
 
 	rev, err := s.exec.Create(ctx, e.ID, data)

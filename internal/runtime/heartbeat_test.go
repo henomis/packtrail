@@ -37,6 +37,10 @@ type hbMsg struct{ jetstream.Msg }
 
 func (hbMsg) InProgress() error { return nil }
 
+type hbPanicMsg struct{ jetstream.Msg }
+
+func (hbPanicMsg) InProgress() error { panic("boom in heartbeat InProgress") }
+
 // TestHeartbeatAbortsOnPersistentRenewalErrors: when lease renewal keeps
 // erroring (NATS unreachable) for a full TTL, the lease may have expired and
 // been taken over while this instance runs blind. The heartbeat must assume
@@ -88,5 +92,52 @@ func TestHeartbeatAbortsOnPersistentRenewalErrors(t *testing.T) {
 		// aborted as required
 	case <-time.After(3 * time.Second):
 		t.Fatal("heartbeat kept running through persistent renewal errors (double-fire window unbounded)")
+	}
+}
+
+// TestHeartbeatRecoversInProgressPanic: a panic from msg.InProgress must not
+// crash the engine process; heartbeat recovers and aborts processing via onLost.
+func TestHeartbeatRecoversInProgressPanic(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	st, err := store.Open(ctx, srv.JS, names.New(""))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	sch := scheduler.New(srv.JS, names.New(""))
+	if err = sch.EnsureStream(ctx); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+
+	flow, err := dsl.Parse([]byte(signalRedriveFlow))
+	if err != nil {
+		t.Fatalf("flow: %v", err)
+	}
+
+	inv := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+
+	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow},
+		Config{LeaseTTL: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+
+	procCtx, onLost := context.WithCancel(ctx)
+	t.Cleanup(onLost)
+
+	hbCtx, stopHB := context.WithCancel(ctx)
+	t.Cleanup(stopHB)
+
+	go eng.heartbeat(hbCtx, onLost, hbPanicMsg{}, "hb-exec")
+
+	select {
+	case <-procCtx.Done():
+		// recovered and aborted as required
+	case <-time.After(3 * time.Second):
+		t.Fatal("heartbeat did not recover from InProgress panic")
 	}
 }

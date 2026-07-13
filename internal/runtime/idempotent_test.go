@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/henomis/packtrail/internal/store"
+	"github.com/henomis/packtrail/invoker"
 	"github.com/henomis/packtrail/pkg/protocol"
 )
 
@@ -99,6 +100,29 @@ func TestStartWithIDValidatesID(t *testing.T) {
 	// A well-formed id is accepted.
 	if _, err := h.engine.StartWithID(ctx, "good-id_1", "linear", nil); err != nil {
 		t.Fatalf("StartWithID(good-id_1): %v", err)
+	}
+}
+
+func TestExecIDValidationAcrossEntryPoints(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	ctx := context.Background()
+
+	for _, bad := range []string{"", "has space", "dotted.id", "wild*card", "tooupstream>"} {
+		if _, err := h.engine.Results(ctx, bad); err == nil {
+			t.Errorf("Results(%q) = nil error, want rejection", bad)
+		}
+
+		if err := h.engine.CompleteActivity(ctx, bad, "a", 0, invoker.Result{Status: invoker.StatusOK}); err == nil {
+			t.Errorf("CompleteActivity(%q) = nil error, want rejection", bad)
+		}
+
+		if err := h.engine.Resume(ctx, bad); err == nil {
+			t.Errorf("Resume(%q) = nil error, want rejection", bad)
+		}
+
+		if err := h.engine.Cancel(ctx, bad, "x"); err == nil {
+			t.Errorf("Cancel(%q) = nil error, want rejection", bad)
+		}
 	}
 }
 

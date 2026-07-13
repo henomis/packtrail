@@ -161,7 +161,7 @@ func New(
 		cfg.OwnerID = "engine-" + nuid.Next()
 	}
 
-	if cfg.LeaseTTL == 0 {
+	if cfg.LeaseTTL <= 0 {
 		cfg.LeaseTTL = defaultLeaseTTL
 	}
 
@@ -177,7 +177,7 @@ func New(
 		cfg.RetryMaxDelay = defaultRetryMaxDelay
 	}
 
-	if cfg.MaxConcurrency == 0 {
+	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = defaultConcurrency
 	}
 
@@ -697,6 +697,10 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 // document invokers and choice rules see. ErrNotFound if the execution does
 // not exist.
 func (e *Engine) Results(ctx context.Context, execID string) (json.RawMessage, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	ex, err := e.store.Get(ctx, execID)
 	if err != nil {
 		return nil, err
@@ -1065,7 +1069,22 @@ func (e *Engine) heartbeat(ctx context.Context, onLost context.CancelFunc, msg j
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = msg.InProgress()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						e.log.Error("heartbeat panic",
+							"exec", execID,
+							"panic", r, "stack", string(debug.Stack()))
+						onLost()
+					}
+				}()
+
+				_ = msg.InProgress()
+			}()
+
+			if ctx.Err() != nil {
+				return
+			}
 
 			held, err := e.store.AcquireLease(ctx, execID, e.cfg.OwnerID, e.cfg.LeaseTTL)
 			if err != nil {
@@ -1240,10 +1259,11 @@ func (e *Engine) advanceTo(
 		if errors.Is(err, errSkip) {
 			return nil // guard failed: nothing advanced, nothing to enqueue
 		}
-		// An over-limit payload can never be persisted: retrying produces the same
-		// oversized write. Fail the execution with the actionable reason instead.
-		// failNode keeps the prior (within-limit) payload, so its write succeeds.
-		if errors.Is(err, store.ErrPayloadTooLarge) {
+		// An over-limit payload or control document can never be persisted:
+		// retrying produces the same oversized write. Fail the execution with the
+		// actionable reason instead. failNode keeps the prior (within-limit)
+		// document, so its write succeeds.
+		if errors.Is(err, store.ErrPayloadTooLarge) || errors.Is(err, store.ErrDocumentTooLarge) {
 			return e.failNode(ctx, execID, fromNode, err.Error())
 		}
 
@@ -1263,6 +1283,10 @@ func (e *Engine) advanceTo(
 // is a no-op. It settles either the execution's current task node or a pending
 // fanout branch.
 func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, attempt int, res invoker.Result) error {
+	if !validExecID(execID) {
+		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	exec, err := e.store.Get(ctx, execID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1523,6 +1547,10 @@ func settleResult(res invoker.Result, callErr error) invoker.Result {
 // work, so the engine need not be the same instance — any running engine picks
 // it up (and if none is running yet, it runs when one starts).
 func (e *Engine) Resume(ctx context.Context, execID string) error {
+	if !validExecID(execID) {
+		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	ex, err := e.store.Get(ctx, execID)
 	if err != nil {
 		return err // includes store.ErrNotFound
@@ -1578,6 +1606,10 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 // harmlessly. Unlike Resume, a cancelled execution is terminal and cannot be
 // revived.
 func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
+	if !validExecID(execID) {
+		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() {
 			return errSkip // already terminal: no-op

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -184,7 +185,7 @@ func (s *Signals) handleDelivery(
 
 	d := Delivery{ExecID: execID, Name: name, Seq: meta.Sequence.Stream, Payload: msg.Data()}
 
-	handlerErr := handler(ctx, d)
+	handlerErr := callHandler(ctx, d, handler)
 	if handlerErr == nil {
 		_ = msg.Ack()
 		return
@@ -206,6 +207,32 @@ func (s *Signals) handleDelivery(
 
 	_ = msg.NakWithDelay(signalNakDelay)
 }
+
+func callHandler(
+	ctx context.Context,
+	d Delivery,
+	handler func(context.Context, Delivery) error,
+) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("signal handler panic",
+				"exec", d.ExecID, "name", d.Name,
+				"panic", r, "stack", string(debug.Stack()))
+
+			err = signalPanicError{value: r}
+		}
+	}()
+
+	return handler(ctx, d)
+}
+
+type signalPanicError struct {
+	value any
+}
+
+func (e signalPanicError) Error() string { return fmt.Sprintf("signal handler panic: %v", e.value) }
+
+func (e signalPanicError) Terminal() bool { return true }
 
 // isTerminal reports whether err (or one it wraps) declares itself non-retryable
 // via interface{ Terminal() bool }. Structural so this package need not import

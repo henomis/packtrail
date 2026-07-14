@@ -22,6 +22,7 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -88,10 +89,21 @@ func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats
 		resp, err := h(callCtx, req)
 		if err != nil {
 			resp = TaskResponse{Status: StatusRetry, Error: err.Error()}
+		} else if !validStatus(resp.Status) {
+			resp = TaskResponse{
+				Status: StatusError,
+				Error: fmt.Sprintf(
+					"handler returned invalid task status %q; want %q, %q, or %q",
+					resp.Status, StatusOK, StatusError, StatusRetry),
+			}
 		}
 
 		reply(msg, resp)
 	})
+}
+
+func validStatus(status string) bool {
+	return status == StatusOK || status == StatusError || status == StatusRetry
 }
 
 // ServeNamespaced is like Serve but prepends namespace to subject, matching the

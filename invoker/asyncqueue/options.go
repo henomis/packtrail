@@ -29,6 +29,8 @@ const (
 	defaultAckWait         = 30 * time.Second
 	defaultMaxDeliver      = 10
 	defaultDrainTimeout    = 30 * time.Second
+	defaultMaxQueuedJobs   = 10_000
+	defaultMaxQueuedBytes  = 1 << 30
 	// defaultDedupWindow must exceed the maximum expected lag between a
 	// Dispatcher publishing a job and a Worker consuming it, so a redelivered
 	// dispatch of the same attempt is collapsed.
@@ -44,6 +46,8 @@ type config struct {
 	dedupWindow     time.Duration
 	maxDeliver      int
 	drainTimeout    time.Duration
+	maxQueuedJobs   int64
+	maxQueuedBytes  int64
 	deadLetterSink  DeadLetterSink
 }
 
@@ -55,6 +59,8 @@ func newConfig(opts []Option) config {
 		dedupWindow:     defaultDedupWindow,
 		maxDeliver:      defaultMaxDeliver,
 		drainTimeout:    defaultDrainTimeout,
+		maxQueuedJobs:   defaultMaxQueuedJobs,
+		maxQueuedBytes:  defaultMaxQueuedBytes,
 	}
 
 	for _, o := range opts {
@@ -107,6 +113,30 @@ func WithDedupWindow(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
 			c.dedupWindow = d
+		}
+	}
+}
+
+// WithMaxQueuedJobs caps the number of jobs retained in the durable work queue
+// (default 10,000). When full, new distinct jobs are rejected at publish time so
+// the engine can retry dispatch instead of silently growing infrastructure
+// storage without bound. Non-positive values keep the bounded default.
+func WithMaxQueuedJobs(n int64) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.maxQueuedJobs = n
+		}
+	}
+}
+
+// WithMaxQueuedBytes caps the total bytes retained in the durable work queue
+// (default 1GiB). When full, new distinct jobs are rejected at publish time so
+// the engine can retry dispatch instead of silently growing infrastructure
+// storage without bound. Non-positive values keep the bounded default.
+func WithMaxQueuedBytes(n int64) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.maxQueuedBytes = n
 		}
 	}
 }

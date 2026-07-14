@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/invoker"
 	"github.com/henomis/packtrail/invoker/asyncqueue"
@@ -93,6 +95,71 @@ func TestDispatcherPublishesPending(t *testing.T) {
 
 	if info.State.Msgs != 1 {
 		t.Errorf("queued msgs: got %d, want 1", info.State.Msgs)
+	}
+}
+
+func TestEnsureStreamBoundsQueueByDefault(t *testing.T) {
+	srv := natstest.Start(t)
+	ctx := context.Background()
+
+	const prefix, kind = "t", "echo"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	stream, err := srv.JS.Stream(ctx, asyncqueue.StreamName(prefix, kind))
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.Config.MaxMsgs <= 0 {
+		t.Fatalf("MaxMsgs = %d, want a bounded positive default", info.Config.MaxMsgs)
+	}
+
+	if info.Config.MaxBytes <= 0 {
+		t.Fatalf("MaxBytes = %d, want a bounded positive default", info.Config.MaxBytes)
+	}
+
+	if info.Config.Discard != jetstream.DiscardNew {
+		t.Fatalf("Discard = %v, want DiscardNew", info.Config.Discard)
+	}
+}
+
+func TestDispatcherShedsWhenQueueFull(t *testing.T) {
+	srv := natstest.Start(t)
+	ctx := context.Background()
+
+	const prefix, kind = "t", "echo"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind, asyncqueue.WithMaxQueuedJobs(1)); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
+	if _, err := d.Invoke(ctx, invoker.Request{ExecutionID: "e1", NodeID: "n1", Target: "agentA"}); err != nil {
+		t.Fatalf("first invoke: %v", err)
+	}
+
+	if _, err := d.Invoke(ctx, invoker.Request{ExecutionID: "e2", NodeID: "n2", Target: "agentA"}); err == nil {
+		t.Fatal("second invoke succeeded, want publish error while queue is full")
+	}
+
+	stream, err := srv.JS.Stream(ctx, asyncqueue.StreamName(prefix, kind))
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.State.Msgs != 1 {
+		t.Fatalf("queued msgs = %d, want 1 after shedding the second job", info.State.Msgs)
 	}
 }
 
@@ -183,6 +250,53 @@ func TestWorkerRunsExecAndCompletes(t *testing.T) {
 
 	if c.res.Status != invoker.StatusOK || string(c.res.Payload) != `"hello"` {
 		t.Errorf("completion result: got (%q,%s), want (ok,\"hello\")", c.res.Status, c.res.Payload)
+	}
+}
+
+func TestWorkerDoesNotPrefetchBeyondConcurrency(t *testing.T) {
+	srv := natstest.Start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const prefix, kind = "t", "echo"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	exec := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+
+	const concurrency = 3
+
+	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, newFakeCompleter(), asyncqueue.WithConcurrency(concurrency))
+
+	go func() { _ = w.Run(ctx) }()
+
+	consumer := prefix + "-async-" + kind + "-worker"
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		cons, err := srv.JS.Consumer(ctx, asyncqueue.StreamName(prefix, kind), consumer)
+		if err == nil {
+			info, infoErr := cons.Info(ctx)
+			if infoErr != nil {
+				t.Fatalf("consumer info: %v", infoErr)
+			}
+
+			if info.Config.MaxAckPending != concurrency {
+				t.Fatalf("MaxAckPending = %d, want %d", info.Config.MaxAckPending, concurrency)
+			}
+
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("consumer %q was not created: %v", consumer, err)
+		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

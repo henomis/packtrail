@@ -89,6 +89,33 @@ func (h *harness) serve(t *testing.T, subject string, fn protocol.Handler) {
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 }
 
+func (h *harness) serveRawResponse(
+	t *testing.T,
+	subject string,
+	resp protocol.TaskResponse,
+	onCall func(),
+) {
+	t.Helper()
+
+	sub, err := h.nc.QueueSubscribe(h.prefix+"."+subject, "packtrail-workers", func(msg *nats.Msg) {
+		if onCall != nil {
+			onCall()
+		}
+
+		data, _ := json.Marshal(resp)
+		_ = msg.Respond(data)
+	})
+	if err != nil {
+		t.Fatalf("serve raw %s: %v", subject, err)
+	}
+
+	if err = h.nc.Flush(); err != nil {
+		t.Fatalf("flush raw %s: %v", subject, err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
 // waitStatus polls until the execution reaches status, or fails.
 func (h *harness) waitStatus(t *testing.T, id, status string, within time.Duration) *store.Execution {
 	t.Helper()
@@ -242,9 +269,8 @@ func TestUnknownTaskStatusFailsFast(t *testing.T) {
 
 	var calls atomic.Int32
 
-	h.serve(t, "tasks.a.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	h.serveRawResponse(t, "tasks.a.*", protocol.TaskResponse{Status: "bogus"}, func() {
 		calls.Add(1)
-		return protocol.TaskResponse{Status: "bogus"}, nil
 	})
 	h.serve(t, "tasks.b.*", passthrough)
 

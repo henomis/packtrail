@@ -17,7 +17,11 @@ package natstask_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/invoker"
@@ -106,11 +110,16 @@ func TestInvokeMapsError(t *testing.T) {
 func TestInvokeRejectsPending(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.rogue.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
-		return protocol.TaskResponse{Status: "pending"}, nil
+	sub, err := srv.NC.Subscribe("packtrail.tasks.rogue.*", func(msg *nats.Msg) {
+		data, _ := json.Marshal(protocol.TaskResponse{Status: "pending"})
+		_ = msg.Respond(data)
 	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err = srv.NC.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
@@ -128,6 +137,41 @@ func TestInvokeRejectsPending(t *testing.T) {
 
 	if res.Error == "" {
 		t.Fatal("expected an actionable error message for the pending reply")
+	}
+
+	if !strings.Contains(res.Error, "pending") {
+		t.Fatalf("error = %q, want it to mention pending", res.Error)
+	}
+}
+
+func TestInvokeUsesRequestDeadlineWithoutCallerDeadline(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := srv.NC.Subscribe("packtrail.tasks.silent.*", func(_ *nats.Msg) {})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err = srv.NC.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	inv := natstask.New(srv.NC, "packtrail")
+	start := time.Now()
+
+	_, err = inv.Invoke(context.Background(), invoker.Request{
+		Target:      "tasks.silent.x",
+		ExecutionID: "exec-deadline",
+		Deadline:    time.Now().Add(100 * time.Millisecond),
+	})
+	if err == nil {
+		t.Fatal("invoke succeeded, want request-deadline error from silent responder")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("invoke took %v, want it bounded by request deadline", elapsed)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +109,28 @@ func TestServeHandlerErrorIsRetry(t *testing.T) {
 
 	if resp.Error != "transient boom" {
 		t.Fatalf("error = %q, want transient boom", resp.Error)
+	}
+}
+
+func TestServeRejectsInvalidStatus(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.invalid.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: "pending"}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	resp := request(t, srv, "tasks.invalid.x", protocol.TaskRequest{ExecutionID: "exec-invalid"})
+	if resp.Status != protocol.StatusError {
+		t.Fatalf("status = %q, want error", resp.Status)
+	}
+
+	if !strings.Contains(resp.Error, "invalid task status") {
+		t.Fatalf("error = %q, want invalid-status explanation", resp.Error)
 	}
 }
 

@@ -89,6 +89,9 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, prefix, kind stri
 		Subjects:   []string{Subject(prefix, kind)},
 		Retention:  jetstream.WorkQueuePolicy,
 		Duplicates: c.dedupWindow,
+		MaxMsgs:    c.maxQueuedJobs,
+		MaxBytes:   c.maxQueuedBytes,
+		Discard:    jetstream.DiscardNew,
 	})
 	if err != nil {
 		return fmt.Errorf("asyncqueue: ensure stream %q: %w", kind, err)

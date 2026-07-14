@@ -66,7 +66,18 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 		return invoker.Result{}, err
 	}
 
-	msg, err := i.nc.RequestWithContext(ctx, i.prefix+"."+req.Target, data)
+	callCtx := ctx
+
+	if !req.Deadline.IsZero() {
+		if ctxDeadline, ok := ctx.Deadline(); !ok || req.Deadline.Before(ctxDeadline) {
+			var cancel context.CancelFunc
+
+			callCtx, cancel = context.WithDeadline(ctx, req.Deadline)
+			defer cancel()
+		}
+	}
+
+	msg, err := i.nc.RequestWithContext(callCtx, i.prefix+"."+req.Target, data)
 	if err != nil {
 		return invoker.Result{}, err
 	}

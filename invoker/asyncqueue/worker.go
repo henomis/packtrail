@@ -30,9 +30,8 @@ import (
 )
 
 const (
-	maxAckPendingFactor = 2
-	nakDelay            = 2 * time.Second
-	heartbeatDivisor    = 3
+	nakDelay         = 2 * time.Second
+	heartbeatDivisor = 3
 )
 
 // Worker consumes jobs for one async invoker kind and runs the embedder's
@@ -79,7 +78,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		Durable:       durable(w.prefix, w.kind),
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       w.cfg.ackWait,
-		MaxAckPending: w.cfg.concurrency * maxAckPendingFactor,
+		MaxAckPending: w.cfg.concurrency,
 		FilterSubject: Subject(w.prefix, w.kind),
 	})
 	if err != nil {

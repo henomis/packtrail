@@ -216,7 +216,9 @@ func (e *Engine) settleTaskRetry(
 	// exec.Attempt is the pre-increment value; the attempt being scheduled is +1.
 	delay := backoff(node, exec.Attempt+1, e.cfg.RetryBaseDelay, e.cfg.RetryMaxDelay)
 
-	item, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindAdvance})
+	retryAt := time.Now().Add(delay).UTC()
+
+	item, marshalErr := advanceWorkItem(exec.ID, node.ID, exec.Attempt+1, retryAt)
 	if marshalErr != nil {
 		return marshalErr
 	}
@@ -236,7 +238,7 @@ func (e *Engine) settleTaskRetry(
 		// backoff, not a lost work item. The retry's scheduled delivery is
 		// committed in this same write (transactional outbox), so a crash can
 		// never bump the attempt yet lose its timer.
-		ex.RetryAt = time.Now().Add(delay).UTC()
+		ex.RetryAt = retryAt
 		ex.AppendSched(item, ex.RetryAt)
 
 		return nil

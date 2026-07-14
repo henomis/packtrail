@@ -76,7 +76,7 @@ func (e *Engine) stepSignal(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 // node has a positive timeout).
 func signalWorkItems(execID string, node *dsl.Node, next string) (advanceItem, timeoutItem json.RawMessage, err error) {
 	if next != "" {
-		advanceItem, err = json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+		advanceItem, err = advanceWorkItem(execID, next, 0, time.Time{})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -269,7 +269,7 @@ func (e *Engine) guardedAdvance(ctx context.Context, execID, signalNodeID, name,
 	var item json.RawMessage
 
 	if nextNode != "" {
-		data, err := json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+		data, err := advanceWorkItem(execID, nextNode, 0, time.Time{})
 		if err != nil {
 			return err
 		}

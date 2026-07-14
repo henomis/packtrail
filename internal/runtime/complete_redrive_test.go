@@ -210,3 +210,45 @@ func TestCompleteBranchSkipsCancelledExecution(t *testing.T) {
 		t.Fatalf("branch b2 = %q, want still pending (terminal document must not be mutated)", ex.Branches["b2"].Status)
 	}
 }
+
+// TestBranchRetryOutboxRedrivesPendingAttempt covers the async branch retry crash
+// window: the branch attempt bump and scheduled redispatch are committed together,
+// then the process dies before flushing the schedule. A watchdog/outbox reflush
+// must redispatch the pending branch attempt instead of leaving it parked forever.
+func TestBranchRetryOutboxRedrivesPendingAttempt(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanRetryFlow)
+	ctx := context.Background()
+
+	retryAt := time.Now().Add(-time.Second).UTC()
+
+	item, err := branchRetryWorkItem("branch-retry-crash-1", "x", 1, retryAt)
+	if err != nil {
+		t.Fatalf("marshal retry item: %v", err)
+	}
+
+	exec := &store.Execution{
+		ID: "branch-retry-crash-1", FlowName: "async-fan-retry",
+		Status: store.StatusWaiting, CurrentNode: "join",
+		Branches: map[string]store.BranchState{
+			"x": {NodeID: "x", Status: store.BranchPending, Attempt: 1},
+			"y": {NodeID: "y", Status: store.BranchPending, Attempt: 0},
+		},
+	}
+	exec.AppendSched(item, retryAt)
+
+	if _, err = h.store.Create(ctx, exec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	redriven, err := h.engine.RedriveStalled(ctx, exec.ID, time.Millisecond)
+	if err != nil || !redriven {
+		t.Fatalf("redrive: redriven=%v err=%v, want true/nil", redriven, err)
+	}
+
+	req := h.nextReq(t)
+	if req.NodeID != "x" || req.Attempt != 1 {
+		t.Fatalf("redispatch = %+v, want branch x attempt 1", req)
+	}
+}

@@ -133,7 +133,7 @@ func pendingBranchIDs(node *dsl.Node, exec *store.Execution) []string {
 // guarded). This is the fanout counterpart to stepTask's
 // early-completion stash.
 func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin string) error {
-	evalItem, err := json.Marshal(workItem{ExecID: execID, Kind: kindFaninEval})
+	evalItem, err := faninEvalWorkItem(execID, fanin)
 	if err != nil {
 		return err
 	}

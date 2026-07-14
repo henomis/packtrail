@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -43,6 +45,22 @@ type Cache struct {
 	kv       jetstream.KeyValue
 	delegate Invoker
 	prefix   string
+}
+
+const (
+	cacheEntryResult = "result"
+	cacheEntryClaim  = "claim"
+	cachePollDelay   = 25 * time.Millisecond
+	cacheClaimTTL    = 5 * time.Minute
+	cacheClaimGrace  = 5 * time.Second
+)
+
+var errCacheClaimExpired = errors.New("invoker cache: claim expired")
+
+type cacheEntry struct {
+	State      string    `json:"state"`
+	Result     Result    `json:"result,omitempty"`
+	ClaimUntil time.Time `json:"claim_until,omitzero"`
 }
 
 // NewCache wraps delegate so its results are deduplicated through kv.
@@ -70,18 +88,179 @@ func (c *Cache) key(req Request) string {
 // returning it.
 func (c *Cache) Invoke(ctx context.Context, req Request) (Result, error) {
 	key := c.key(req)
-	if entry, err := c.kv.Get(ctx, key); err == nil {
-		var r Result
-		if json.Unmarshal(entry.Value(), &r) == nil {
-			return r, nil
-		}
-	} else if !errors.Is(err, jetstream.ErrKeyNotFound) {
+
+	claimRev, res, hit, err := c.getOrClaim(ctx, key, req)
+	if err != nil {
 		return Result{}, err
 	}
 
+	if hit {
+		return res, nil
+	}
+
+	return c.invokeAndStore(ctx, key, claimRev, req)
+}
+
+func (c *Cache) getOrClaim(
+	ctx context.Context, key string, req Request,
+) (claimRev uint64, res Result, hit bool, err error) {
+	entry, err := c.kv.Get(ctx, key)
+	if err != nil {
+		if !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return 0, Result{}, false, err
+		}
+
+		return c.claimMissing(ctx, key, req)
+	}
+
+	return c.resolveEntry(ctx, key, req, entry)
+}
+
+func (c *Cache) claimMissing(ctx context.Context, key string, req Request) (uint64, Result, bool, error) {
+	rev, err := c.createClaim(ctx, key, req)
+	if err == nil {
+		return rev, Result{}, false, nil
+	}
+
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return c.getOrClaim(ctx, key, req)
+	}
+
+	return 0, Result{}, false, err
+}
+
+func (c *Cache) resolveEntry(
+	ctx context.Context, key string, req Request, entry jetstream.KeyValueEntry,
+) (uint64, Result, bool, error) {
+	decoded, err := decodeCacheEntry(entry.Value())
+	if err != nil {
+		return 0, Result{}, false, fmt.Errorf("%w: key %s", err, key)
+	}
+
+	switch decoded.State {
+	case cacheEntryResult:
+		return 0, decoded.Result, true, nil
+	case cacheEntryClaim:
+		return c.resolveClaim(ctx, key, req, entry.Revision(), decoded.ClaimUntil)
+	default:
+		return 0, Result{}, false, fmt.Errorf("invoker cache: unknown entry state %q for key %s", decoded.State, key)
+	}
+}
+
+func (c *Cache) resolveClaim(
+	ctx context.Context, key string, req Request, revision uint64, until time.Time,
+) (uint64, Result, bool, error) {
+	if time.Now().After(until) {
+		return c.claimExpired(ctx, key, req, revision)
+	}
+
+	waited, err := c.waitForClaim(ctx, key, until)
+	if err == nil {
+		return 0, waited, true, nil
+	}
+
+	if errors.Is(err, errCacheClaimExpired) {
+		return c.getOrClaim(ctx, key, req)
+	}
+
+	return 0, Result{}, false, err
+}
+
+func (c *Cache) claimExpired(
+	ctx context.Context, key string, req Request, revision uint64,
+) (uint64, Result, bool, error) {
+	rev, err := c.stealExpiredClaim(ctx, key, revision, req)
+	if err == nil {
+		return rev, Result{}, false, nil
+	}
+
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return c.getOrClaim(ctx, key, req)
+	}
+
+	return 0, Result{}, false, err
+}
+
+func (c *Cache) createClaim(ctx context.Context, key string, req Request) (uint64, error) {
+	data, err := json.Marshal(cacheEntry{State: cacheEntryClaim, ClaimUntil: claimUntil(ctx, req)})
+	if err != nil {
+		return 0, err
+	}
+
+	return c.kv.Create(ctx, key, data)
+}
+
+func (c *Cache) stealExpiredClaim(ctx context.Context, key string, revision uint64, req Request) (uint64, error) {
+	data, err := json.Marshal(cacheEntry{State: cacheEntryClaim, ClaimUntil: claimUntil(ctx, req)})
+	if err != nil {
+		return 0, err
+	}
+
+	return c.kv.Update(ctx, key, data, revision)
+}
+
+func claimUntil(ctx context.Context, req Request) time.Time {
+	deadline := req.Deadline
+	if deadline.IsZero() {
+		if ctxDeadline, ok := ctx.Deadline(); ok {
+			deadline = ctxDeadline
+		}
+	}
+
+	if deadline.IsZero() {
+		return time.Now().Add(cacheClaimTTL).UTC()
+	}
+
+	return deadline.Add(cacheClaimGrace).UTC()
+}
+
+func (c *Cache) waitForClaim(ctx context.Context, key string, claimUntil time.Time) (Result, error) {
+	for {
+		delay := cachePollDelay
+		if remaining := time.Until(claimUntil); remaining <= 0 {
+			return Result{}, errCacheClaimExpired
+		} else if remaining < delay {
+			delay = remaining
+		}
+
+		select {
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		entry, err := c.kv.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
+				return Result{}, errCacheClaimExpired
+			}
+
+			return Result{}, err
+		}
+
+		decoded, err := decodeCacheEntry(entry.Value())
+		if err != nil {
+			return Result{}, fmt.Errorf("%w: key %s", err, key)
+		}
+
+		switch decoded.State {
+		case cacheEntryResult:
+			return decoded.Result, nil
+		case cacheEntryClaim:
+			claimUntil = decoded.ClaimUntil
+		default:
+			return Result{}, fmt.Errorf("invoker cache: unknown entry state %q for key %s", decoded.State, key)
+		}
+	}
+}
+
+func (c *Cache) invokeAndStore(ctx context.Context, key string, claimRev uint64, req Request) (Result, error) {
 	res, err := c.delegate.Invoke(ctx, req)
 	if err != nil {
-		// Transient transport failure: do not cache, so a redelivery re-invokes.
+		// Transient transport failure: do not publish a result, so a redelivery can
+		// steal the expired claim and re-invoke.
+		c.expireClaim(ctx, key, claimRev)
+
 		return res, err
 	}
 
@@ -93,15 +272,50 @@ func (c *Cache) Invoke(ctx context.Context, req Request) (Result, error) {
 	// CompleteActivity is never called, the execution parks indefinitely —
 	// async workers should carry their own timeout/failure mechanism.
 	//
-	// A failed Put is logged, not surfaced: the result is still returned, only
+	// A failed Update is logged, not surfaced: the result is still returned, only
 	// the dedup guarantee for a later redelivery of this attempt is lost. A
-	// persistently failing cache silently reopens the double-fire window, so it
-	// must at least be visible.
-	if data, mErr := json.Marshal(res); mErr == nil {
-		if _, putErr := c.kv.Put(ctx, key, data); putErr != nil {
-			slog.Debug("invoker cache: store result", "key", key, "err", putErr)
-		}
+	// persistently failing cache visibly reopens the double-fire window.
+	data, mErr := json.Marshal(cacheEntry{State: cacheEntryResult, Result: res})
+	if mErr != nil {
+		return Result{}, mErr
+	}
+
+	if _, putErr := c.kv.Update(ctx, key, data, claimRev); putErr != nil {
+		slog.Debug("invoker cache: store result", "key", key, "err", putErr)
 	}
 
 	return res, nil
+}
+
+func (c *Cache) expireClaim(ctx context.Context, key string, claimRev uint64) {
+	data, err := json.Marshal(cacheEntry{State: cacheEntryClaim, ClaimUntil: time.Now().UTC()})
+	if err != nil {
+		return
+	}
+
+	if _, err = c.kv.Update(ctx, key, data, claimRev); err != nil {
+		slog.Debug("invoker cache: expire claim", "key", key, "err", err)
+	}
+}
+
+func decodeCacheEntry(data []byte) (cacheEntry, error) {
+	var entry cacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return cacheEntry{}, fmt.Errorf("invoker cache: decode entry: %w", err)
+	}
+
+	if entry.State != "" {
+		return entry, nil
+	}
+
+	var legacy Result
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return cacheEntry{}, fmt.Errorf("invoker cache: decode legacy result: %w", err)
+	}
+
+	if legacy.Status == "" {
+		return cacheEntry{}, errors.New("invoker cache: entry is neither a result nor a claim")
+	}
+
+	return cacheEntry{State: cacheEntryResult, Result: legacy}, nil
 }

@@ -49,16 +49,19 @@ import (
 // workItem is the JSON body of a message on packtrail.work.<execID>. The subject
 // also carries the execID; the body adds the kind of work to perform.
 type workItem struct {
-	ExecID string `json:"exec_id"`
-	Kind   string `json:"kind"`
-	Node   string `json:"node,omitempty"`   // node that scheduled this item (timeout staleness guard)
-	Signal string `json:"signal,omitempty"` // signal name (wait timeout)
+	ExecID    string    `json:"exec_id"`
+	Kind      string    `json:"kind"`
+	Node      string    `json:"node,omitempty"`      // node/branch this item is allowed to drive
+	Attempt   int       `json:"attempt,omitempty"`   // expected task/branch attempt
+	NotBefore time.Time `json:"not_before,omitzero"` // retry deadline guard
+	Signal    string    `json:"signal,omitempty"`    // signal name (wait timeout)
 }
 
 // Work kinds.
 const (
 	kindAdvance     = "advance"      // run the step for exec.CurrentNode
 	kindFaninEval   = "fanin_eval"   // re-evaluate a fanin join
+	kindBranchRetry = "branch_retry" // re-dispatch one async fanout branch attempt
 	kindWaitTimeout = "wait_timeout" // a signal node's timeout fired
 )
 
@@ -402,6 +405,30 @@ var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validExecID(id string) bool { return execIDPattern.MatchString(id) }
 
+func advanceWorkItem(execID, node string, attempt int, notBefore time.Time) (json.RawMessage, error) {
+	return json.Marshal(workItem{
+		ExecID:    execID,
+		Kind:      kindAdvance,
+		Node:      node,
+		Attempt:   attempt,
+		NotBefore: notBefore.UTC(),
+	})
+}
+
+func faninEvalWorkItem(execID, fanin string) (json.RawMessage, error) {
+	return json.Marshal(workItem{ExecID: execID, Kind: kindFaninEval, Node: fanin})
+}
+
+func branchRetryWorkItem(execID, branchID string, attempt int, notBefore time.Time) (json.RawMessage, error) {
+	return json.Marshal(workItem{
+		ExecID:    execID,
+		Kind:      kindBranchRetry,
+		Node:      branchID,
+		Attempt:   attempt,
+		NotBefore: notBefore.UTC(),
+	})
+}
+
 // requireObjectPayload rejects a start input that is not a JSON object. The
 // input is addressed field-wise from choice expressions (`input.tier`) and
 // documented as an object throughout; node outputs, by contrast, are free-form
@@ -468,7 +495,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 	// The first work item is committed in the same write that creates the
 	// execution (transactional outbox): the document and its driving message
 	// can never disagree, whatever crashes.
-	item, err := json.Marshal(workItem{ExecID: id, Kind: kindAdvance})
+	item, err := advanceWorkItem(id, exec.CurrentNode, exec.Attempt, time.Time{})
 	if err != nil {
 		return "", err
 	}
@@ -654,7 +681,9 @@ func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan ti
 
 	switch {
 	case ex.Status == store.StatusRunning:
-		return true, e.enqueue(ctx, execID, workItem{Kind: kindAdvance})
+		return true, e.enqueue(ctx, execID, workItem{
+			Kind: kindAdvance, Node: ex.CurrentNode, Attempt: ex.Attempt, NotBefore: ex.RetryAt,
+		})
 	case ex.Status == store.StatusWaiting && ex.WaitSignal == "":
 		flow, ok := e.flows[ex.FlowName]
 		if !ok {
@@ -665,7 +694,7 @@ func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan ti
 			return false, nil // async task wait: CompleteActivity owns it
 		}
 
-		return true, e.enqueue(ctx, execID, workItem{Kind: kindFaninEval})
+		return true, e.enqueue(ctx, execID, workItem{Kind: kindFaninEval, Node: ex.CurrentNode})
 	default:
 		return false, nil // signal wait: the wait timeout owns it
 	}
@@ -1334,20 +1363,191 @@ func (e *Engine) process(ctx context.Context, wi workItem) error {
 		return terminal("unknown flow %q", exec.FlowName)
 	}
 
+	switch wi.Kind {
+	case kindAdvance:
+		return e.processAdvance(ctx, flow, exec, wi)
+	case kindFaninEval:
+		return e.processFaninEval(ctx, flow, exec, wi)
+	case kindBranchRetry:
+		return e.processBranchRetry(ctx, flow, exec, wi)
+	case kindWaitTimeout:
+		return e.onWaitTimeout(ctx, flow, exec, wi)
+	default:
+		return terminal("unknown work kind %q", wi.Kind)
+	}
+}
+
+func (e *Engine) processAdvance(ctx context.Context, flow *dsl.Flow, exec *store.Execution, wi workItem) error {
+	if exec.Status != store.StatusRunning {
+		return nil
+	}
+
+	if !advanceApplies(exec, wi) {
+		return nil
+	}
+
+	if due := advanceNotBefore(exec, wi); !due.IsZero() && time.Now().Before(due) {
+		return e.deferWorkUntil(ctx, exec, wi, due)
+	}
+
 	node := flow.Node(exec.CurrentNode)
 	if node == nil {
 		return terminal("unknown node %q in flow %q", exec.CurrentNode, exec.FlowName)
 	}
 
+	return e.stepNode(ctx, flow, node, exec)
+}
+
+func advanceApplies(exec *store.Execution, wi workItem) bool {
+	if wi.Node == "" {
+		return true // legacy item: still fenced by StatusRunning and RetryAt
+	}
+
+	return exec.CurrentNode == wi.Node && exec.Attempt == wi.Attempt
+}
+
+func advanceNotBefore(exec *store.Execution, wi workItem) time.Time {
+	due := wi.NotBefore
+	if exec.RetryAt.After(due) {
+		due = exec.RetryAt
+	}
+
+	return due
+}
+
+func (e *Engine) processFaninEval(ctx context.Context, flow *dsl.Flow, exec *store.Execution, wi workItem) error {
+	if exec.Status != store.StatusWaiting {
+		return nil
+	}
+
+	if wi.Node != "" && exec.CurrentNode != wi.Node {
+		return nil
+	}
+
+	node := flow.Node(exec.CurrentNode)
+	if node == nil {
+		return terminal("unknown node %q in flow %q", exec.CurrentNode, exec.FlowName)
+	}
+
+	if node.Type != dsl.NodeFanin {
+		return nil
+	}
+
+	return e.evalFanin(ctx, flow, exec)
+}
+
+func (e *Engine) processBranchRetry(ctx context.Context, flow *dsl.Flow, exec *store.Execution, wi workItem) error {
+	if wi.Node == "" {
+		return terminal("branch retry work item missing branch node")
+	}
+
+	if !branchWorkApplies(flow, exec, wi.Node) {
+		return nil
+	}
+
+	bs, ok := exec.Branches[wi.Node]
+	if !ok || bs.Status != store.BranchPending || bs.Attempt != wi.Attempt {
+		return nil
+	}
+
+	if !wi.NotBefore.IsZero() && time.Now().Before(wi.NotBefore) {
+		return e.deferWorkUntil(ctx, exec, wi, wi.NotBefore)
+	}
+
+	node := flow.Node(wi.Node)
+	if node == nil || node.Type != dsl.NodeTask {
+		return terminal("branch retry node %q is not a task in flow %q", wi.Node, exec.FlowName)
+	}
+
+	contextDoc, err := e.assembleContext(ctx, exec)
+	if err != nil {
+		return err
+	}
+
+	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, wi.Attempt)
+	if callErr == nil && res.Status == invoker.StatusPending {
+		return nil
+	}
+
+	return e.completeBranch(ctx, flow, exec, wi.Node, wi.Attempt, settleResult(res, callErr))
+}
+
+func branchWorkApplies(flow *dsl.Flow, exec *store.Execution, branchID string) bool {
+	node := flow.Node(exec.CurrentNode)
+	if node == nil {
+		return false
+	}
+
+	switch node.Type {
+	case dsl.NodeFanout:
+		return containsNode(node.Branches, branchID)
+	case dsl.NodeFanin:
+		return faninOwnsBranch(flow, node.ID, branchID)
+	default:
+		return false
+	}
+}
+
+func containsNode(nodes []string, node string) bool {
+	for _, n := range nodes {
+		if n == node {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (e *Engine) deferWorkUntil(ctx context.Context, exec *store.Execution, wi workItem, due time.Time) error {
+	wi.ExecID = exec.ID
+	wi.NotBefore = due.UTC()
+
+	if wi.Kind == kindAdvance && wi.Node == "" {
+		wi.Node = exec.CurrentNode
+		wi.Attempt = exec.Attempt
+	}
+
+	if wi.Kind == kindFaninEval && wi.Node == "" {
+		wi.Node = exec.CurrentNode
+	}
+
+	item, err := json.Marshal(wi)
+	if err != nil {
+		return err
+	}
+
+	updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+		if !deferredWorkApplies(ex, wi) {
+			return errSkip
+		}
+
+		ex.AppendSched(item, due)
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil
+		}
+
+		return err
+	}
+
+	return e.flushOutbox(ctx, updated)
+}
+
+func deferredWorkApplies(ex *store.Execution, wi workItem) bool {
 	switch wi.Kind {
 	case kindAdvance:
-		return e.stepNode(ctx, flow, node, exec)
+		return ex.Status == store.StatusRunning && advanceApplies(ex, wi)
+	case kindBranchRetry:
+		bs, ok := ex.Branches[wi.Node]
+
+		return ok && bs.Status == store.BranchPending && bs.Attempt == wi.Attempt
 	case kindFaninEval:
-		return e.evalFanin(ctx, flow, exec)
-	case kindWaitTimeout:
-		return e.onWaitTimeout(ctx, flow, exec, wi)
+		return ex.Status == store.StatusWaiting && (wi.Node == "" || ex.CurrentNode == wi.Node)
 	default:
-		return terminal("unknown work kind %q", wi.Kind)
+		return false
 	}
 }
 
@@ -1384,7 +1584,7 @@ func (e *Engine) advanceTo(
 	var item json.RawMessage
 
 	if nextNode != "" {
-		data, err := json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+		data, err := advanceWorkItem(execID, nextNode, 0, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -1634,7 +1834,20 @@ func (e *Engine) completeBranch(
 		return nil
 	}
 
-	evalItem, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindFaninEval})
+	faninID := faninForBranch(flow, exec, branchID)
+	if faninID == "" {
+		return nil
+	}
+
+	evalItem, marshalErr := faninEvalWorkItem(exec.ID, faninID)
+	if marshalErr != nil {
+		return marshalErr
+	}
+
+	nextAttempt := attempt + 1
+	retryAt := time.Now().Add(backoff(node, nextAttempt, e.cfg.RetryBaseDelay, e.cfg.RetryMaxDelay)).UTC()
+
+	retryItem, marshalErr := branchRetryWorkItem(exec.ID, branchID, nextAttempt, retryAt)
 	if marshalErr != nil {
 		return marshalErr
 	}
@@ -1649,13 +1862,10 @@ func (e *Engine) completeBranch(
 		}
 	}
 
-	var action string
-
 	claimed, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-		// action is reassigned fresh on every call: Mutate may retry fn.
 		var mutErr error
 
-		action, mutErr = settleBranchAttempt(ex, node, branchID, attempt, res, evalItem)
+		_, mutErr = settleBranchAttempt(ex, node, branchID, attempt, res, evalItem, retryItem, retryAt)
 
 		return mutErr
 	})
@@ -1667,19 +1877,50 @@ func (e *Engine) completeBranch(
 		return err
 	}
 
-	if action == branchSettleRedispatch {
-		return e.redispatchBranch(ctx, flow, node, claimed, branchID, attempt)
+	return e.flushOutbox(ctx, claimed)
+}
+
+func faninForBranch(flow *dsl.Flow, exec *store.Execution, branchID string) string {
+	node := flow.Node(exec.CurrentNode)
+	if node == nil {
+		return ""
 	}
 
-	return e.flushOutbox(ctx, claimed)
+	switch node.Type {
+	case dsl.NodeFanout:
+		if !containsNode(node.Branches, branchID) {
+			return ""
+		}
+
+		return flow.Successor(node.ID)
+	case dsl.NodeFanin:
+		if faninOwnsBranch(flow, node.ID, branchID) {
+			return node.ID
+		}
+	}
+
+	return ""
+}
+
+func faninOwnsBranch(flow *dsl.Flow, faninID, branchID string) bool {
+	for i := range flow.Nodes {
+		node := &flow.Nodes[i]
+		if node.Type == dsl.NodeFanout && flow.Successor(node.ID) == faninID {
+			return containsNode(node.Branches, branchID)
+		}
+	}
+
+	return false
 }
 
 // settleBranchAttempt is completeBranch's Mutate callback: on the fresh
 // document, it decides whether the dispatched attempt still applies and, if
 // so, records the branch's next state (settled or bumped for redispatch),
-// committing the fanin re-evaluation in the same write when it settles.
+// committing the fanin re-evaluation when it settles or the scheduled
+// redispatch when it retries in the same write.
 func settleBranchAttempt(
-	ex *store.Execution, node *dsl.Node, branchID string, attempt int, res invoker.Result, evalItem json.RawMessage,
+	ex *store.Execution, node *dsl.Node, branchID string, attempt int, res invoker.Result,
+	evalItem, retryItem json.RawMessage, retryAt time.Time,
 ) (action string, err error) {
 	// Decide on the fresh document: a Cancel (or completion) that landed
 	// after the caller's snapshot must not have a branch settled onto it.
@@ -1695,9 +1936,15 @@ func settleBranchAttempt(
 	next, action := nextBranchState(node, branchID, bs, attempt, res)
 	ex.Branches[branchID] = next
 
+	if action == branchSettleRedispatch {
+		ex.AppendSched(retryItem, retryAt)
+
+		return action, nil
+	}
+
 	if action != branchSettleSettled {
-		// Redispatch, or an unrecognized res.Status: leave the branch as computed
-		// (pending, possibly at a bumped attempt) without appending the fanin eval.
+		// Unrecognized res.Status: leave the branch as computed without appending
+		// the fanin eval.
 		return action, nil
 	}
 
@@ -1742,24 +1989,6 @@ func nextBranchState(
 	return bs, branchSettleSkip
 }
 
-// redispatchBranch re-invokes a branch task for its next attempt after a
-// transient failure freed it back to pending.
-func (e *Engine) redispatchBranch(
-	ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution, branchID string, attempt int,
-) error {
-	contextDoc, err := e.assembleContext(ctx, exec)
-	if err != nil {
-		return err
-	}
-
-	res2, callErr := e.invoke(ctx, node, exec.ID, contextDoc, attempt+1)
-	if callErr == nil && res2.Status == invoker.StatusPending {
-		return nil // re-dispatched; await the next CompleteActivity
-	}
-	// A synchronous branch invoker settled immediately.
-	return e.completeBranch(ctx, flow, exec, branchID, attempt+1, settleResult(res2, callErr))
-}
-
 // settleResult normalises a raw invoke outcome (result + transport error) into a
 // Result whose Status drives branch settling.
 func settleResult(res invoker.Result, callErr error) invoker.Result {
@@ -1794,7 +2023,7 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 		return fmt.Errorf("execution %s has no current node to resume", execID)
 	}
 
-	item, err := json.Marshal(workItem{ExecID: execID, Kind: kindAdvance})
+	item, err := advanceWorkItem(execID, ex.CurrentNode, 0, time.Time{})
 	if err != nil {
 		return err
 	}

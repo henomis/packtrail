@@ -262,6 +262,32 @@ func TestCompleteActivityIdempotent(t *testing.T) {
 	}
 }
 
+// TestStaleAdvanceDoesNotInvokeDuringAsyncWait covers redelivered advance work
+// after an async task has parked. The scoped work item still matches the node and
+// attempt, but StatusWaiting fences it so it cannot dispatch a duplicate activity.
+func TestStaleAdvanceDoesNotInvokeDuringAsyncWait(t *testing.T) {
+	h := newAsyncHarness(t, asyncLinearFlow)
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-linear", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	_ = h.nextReq(t)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	if err = h.engine.enqueue(ctx, id, workItem{Kind: kindAdvance, Node: "a", Attempt: 0}); err != nil {
+		t.Fatalf("enqueue stale advance: %v", err)
+	}
+
+	select {
+	case dup := <-h.inv.reqs:
+		t.Fatalf("stale advance dispatched duplicate activity: %+v", dup)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 const asyncFanFlow = `
 version: "1.0"
 name: async-fan
@@ -380,6 +406,54 @@ func TestAsyncBranchRetryDoesNotBlock(t *testing.T) {
 	}
 }
 
+const asyncFanSubsetRetryFlow = `
+version: "1.0"
+name: async-fan-subset-retry
+nodes:
+  - {id: fo, type: fanout, branches: [x, y, z]}
+  - {id: x, type: task, subject: "x"}
+  - {id: y, type: task, subject: "y"}
+  - {id: z, type: task, subject: "z", retry: {max_attempts: 3}}
+  - {id: join, type: fanin, wait_for: [x, y], join_policy: "all"}
+  - {id: done, type: task, subject: "d"}
+edges:
+  - {from: fo, to: join}
+  - {from: join, to: done}
+`
+
+func TestAsyncBranchRetryForNonWaitedBranch(t *testing.T) {
+	h := newAsyncHarnessCfg(t, asyncFanSubsetRetryFlow, Config{RetryBaseDelay: 20 * time.Millisecond})
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan-subset-retry", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	got := map[string]bool{}
+
+	for range 3 {
+		req := h.nextReq(t)
+		got[req.NodeID] = true
+	}
+
+	if !got["x"] || !got["y"] || !got["z"] {
+		t.Fatalf("branch dispatches = %v, want x/y/z", got)
+	}
+
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	if err = h.engine.CompleteActivity(ctx, id, "z", 0,
+		invoker.Result{Status: invoker.StatusRetry, Error: "transient"}); err != nil {
+		t.Fatalf("retry z: %v", err)
+	}
+
+	retry := h.nextReq(t)
+	if retry.NodeID != "z" || retry.Attempt != 1 {
+		t.Fatalf("redispatch = %+v, want branch z attempt 1", retry)
+	}
+}
+
 const asyncRetryFlow = `
 version: "1.0"
 name: async-retry
@@ -389,7 +463,7 @@ edges: []
 `
 
 // TestAsyncTaskRetry verifies a retry completion re-dispatches with the next
-// attempt, then a success finishes the flow.
+// attempt only after its backoff deadline, then a success finishes the flow.
 func TestAsyncTaskRetry(t *testing.T) {
 	h := newAsyncHarness(t, asyncRetryFlow)
 	ctx := context.Background()
@@ -402,9 +476,15 @@ func TestAsyncTaskRetry(t *testing.T) {
 
 	h.waitStatus(t, id, store.StatusWaiting)
 
-	// Ask for a retry; engine re-dispatches at attempt 1.
+	// Ask for a retry; engine schedules attempt 1 behind the retry deadline.
 	if err := h.engine.CompleteActivity(ctx, id, "a", 0, invoker.Result{Status: invoker.StatusRetry, Error: "transient"}); err != nil {
 		t.Fatalf("retry: %v", err)
+	}
+
+	select {
+	case early := <-h.inv.reqs:
+		t.Fatalf("retry dispatched before its backoff deadline: %+v", early)
+	case <-time.After(150 * time.Millisecond):
 	}
 
 	r1 := h.nextReq(t)

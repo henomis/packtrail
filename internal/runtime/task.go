@@ -174,30 +174,33 @@ func (e *Engine) settleTask(
 		fmt.Sprintf("task %s: unknown result status %q", node.ID, res.Status))
 }
 
-// settleTaskSuccess records the output in the data plane and advances. Data
-// before control — the output is readable before the advance commits, so the
-// flow can never move past a node whose result is missing; a re-run of the
-// same attempt overwrites the entry idempotently. Outputs are namespaced per
-// node (results.<node> in the assembled context), so any JSON shape is legal —
-// nothing merges into a shared root anymore.
+// settleTaskSuccess records a versioned output candidate in the data plane and
+// advances. The guarded control-plane CAS commits the selected candidate version;
+// a stale/lost-lease attempt can leave an orphan payload, but it cannot overwrite
+// the output version that Results reads.
 func (e *Engine) settleTaskSuccess(
 	ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution, res invoker.Result,
 ) error {
+	outputVersion := ""
+
 	if len(res.Payload) > 0 {
-		if putErr := e.store.PutPayload(ctx, store.OutputKey(exec.ID, node.ID), res.Payload); putErr != nil {
+		version, putErr := e.writeOutputCandidate(ctx, exec.ID, node.ID, res.Payload)
+		if putErr != nil {
 			if errors.Is(putErr, store.ErrPayloadTooLarge) {
 				return e.failNode(ctx, exec.ID, node.ID, putErr.Error())
 			}
 
 			return putErr
 		}
+
+		outputVersion = version
 	}
 
 	next := flow.Successor(node.ID)
 
-	return e.advanceTo(ctx, exec.ID, node.ID, next, func(ex *store.Execution) {
-		if len(res.Payload) > 0 {
-			ex.AddOutput(node.ID)
+	return e.advanceToAttempt(ctx, exec.ID, node.ID, exec.Attempt, next, func(ex *store.Execution) {
+		if outputVersion != "" {
+			ex.SetOutput(node.ID, outputVersion)
 		}
 	})
 }

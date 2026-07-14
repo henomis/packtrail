@@ -86,6 +86,7 @@ const (
 	nakDelayLong         = 5 * time.Second
 	heartbeatDivisor     = 3
 	maxAckPendingMult    = 2
+	outputCreateRetries  = 3
 )
 
 // terminalError marks a process error as non-retryable: the work item can never
@@ -770,34 +771,14 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 		return nil, err
 	}
 
-	results := make(map[string]json.RawMessage, len(ex.Outputs))
-
-	for _, node := range ex.Outputs {
-		out, getErr := e.store.GetPayload(ctx, store.OutputKey(ex.ID, node))
-		if getErr != nil {
-			if errors.Is(getErr, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, getErr
-		}
-
-		results[node] = out
+	results, err := e.loadOutputPayloads(ctx, ex)
+	if err != nil {
+		return nil, err
 	}
 
-	signals := make(map[string]json.RawMessage, len(ex.LastSeq))
-
-	for name, seq := range ex.LastSeq {
-		p, getErr := e.store.GetPayload(ctx, store.SignalKey(ex.ID, name, seq))
-		if getErr != nil {
-			if errors.Is(getErr, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, getErr
-		}
-
-		signals[name] = p
+	signals, err := e.loadSignalPayloads(ctx, ex)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(in) == 0 {
@@ -824,6 +805,83 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 		Branches map[string]json.RawMessage `json:"branches"`
 		LastNode string                     `json:"last_node"`
 	}{Input: in, Results: results, Signals: signals, Branches: branches, LastNode: lastNode})
+}
+
+func (e *Engine) loadOutputPayloads(
+	ctx context.Context,
+	ex *store.Execution,
+) (map[string]json.RawMessage, error) {
+	results := make(map[string]json.RawMessage, len(ex.Outputs))
+
+	for _, node := range ex.Outputs {
+		out, err := e.store.GetPayload(ctx, outputPayloadKey(ex, node))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+
+			return nil, err
+		}
+
+		results[node] = out
+	}
+
+	return results, nil
+}
+
+func outputPayloadKey(ex *store.Execution, node string) string {
+	if version := ex.OutputVersion(node); version != "" {
+		return store.OutputVersionKey(ex.ID, node, version)
+	}
+
+	return store.OutputKey(ex.ID, node)
+}
+
+func (e *Engine) loadSignalPayloads(
+	ctx context.Context,
+	ex *store.Execution,
+) (map[string]json.RawMessage, error) {
+	signals := make(map[string]json.RawMessage, len(ex.LastSeq))
+
+	for name, seq := range ex.LastSeq {
+		p, err := e.store.GetPayload(ctx, store.SignalKey(ex.ID, name, seq))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+
+			return nil, err
+		}
+
+		signals[name] = p
+	}
+
+	return signals, nil
+}
+
+func (e *Engine) writeOutputCandidate(
+	ctx context.Context,
+	execID, node string,
+	payload json.RawMessage,
+) (string, error) {
+	if len(payload) == 0 {
+		return "", nil
+	}
+
+	for range outputCreateRetries {
+		version := nuid.Next()
+
+		existing, err := e.store.CreatePayload(ctx, store.OutputVersionKey(execID, node, version), payload)
+		if err != nil {
+			return "", err
+		}
+
+		if existing == nil {
+			return version, nil
+		}
+	}
+
+	return "", fmt.Errorf("output version collision for execution %s node %s", execID, node)
 }
 
 // Results assembles the execution's data-plane view — the same context
@@ -1581,6 +1639,12 @@ func (e *Engine) stepNode(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 func (e *Engine) advanceTo(
 	ctx context.Context, execID, fromNode, nextNode string, mutate func(*store.Execution),
 ) error {
+	return e.advanceToAttempt(ctx, execID, fromNode, -1, nextNode, mutate)
+}
+
+func (e *Engine) advanceToAttempt(
+	ctx context.Context, execID, fromNode string, expectedAttempt int, nextNode string, mutate func(*store.Execution),
+) error {
 	var item json.RawMessage
 
 	if nextNode != "" {
@@ -1595,6 +1659,10 @@ func (e *Engine) advanceTo(
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() || ex.CurrentNode != fromNode {
 			return errSkip // cancelled, completed, or already moved on: stale advance
+		}
+
+		if expectedAttempt >= 0 && ex.Attempt != expectedAttempt {
+			return errSkip
 		}
 
 		if mutate != nil {
@@ -1852,24 +1920,26 @@ func (e *Engine) completeBranch(
 		return marshalErr
 	}
 
-	// Data before control: a completed branch's output is readable before the
-	// settle commits, so the flow can never join on a result that is missing.
-	// A stale completion that loses the guarded settle below leaves a harmless
-	// overwritable entry.
+	outputVersion := ""
+
 	if res.Status == invoker.StatusOK && len(res.Payload) > 0 {
-		if err := e.store.PutPayload(ctx, store.OutputKey(exec.ID, branchID), res.Payload); err != nil {
+		version, err := e.writeOutputCandidate(ctx, exec.ID, branchID, res.Payload)
+		if err != nil {
 			if !errors.Is(err, store.ErrPayloadTooLarge) {
 				return err
 			}
 
 			res = invoker.Result{Status: invoker.StatusError, Error: err.Error()}
+		} else {
+			outputVersion = version
 		}
 	}
 
 	claimed, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
 		var mutErr error
 
-		_, mutErr = settleBranchAttempt(ex, node, branchID, attempt, res, evalItem, retryItem, retryAt)
+		_, mutErr = settleBranchAttempt(
+			ex, node, branchID, attempt, res, outputVersion, evalItem, retryItem, retryAt)
 
 		return mutErr
 	})
@@ -1924,7 +1994,7 @@ func faninOwnsBranch(flow *dsl.Flow, faninID, branchID string) bool {
 // redispatch when it retries in the same write.
 func settleBranchAttempt(
 	ex *store.Execution, node *dsl.Node, branchID string, attempt int, res invoker.Result,
-	evalItem, retryItem json.RawMessage, retryAt time.Time,
+	outputVersion string, evalItem, retryItem json.RawMessage, retryAt time.Time,
 ) (action string, err error) {
 	// Decide on the fresh document: a Cancel (or completion) that landed
 	// after the caller's snapshot must not have a branch settled onto it.
@@ -1952,8 +2022,8 @@ func settleBranchAttempt(
 		return action, nil
 	}
 
-	if next.Status == store.BranchCompleted && len(res.Payload) > 0 {
-		ex.AddOutput(branchID)
+	if next.Status == store.BranchCompleted && outputVersion != "" {
+		ex.SetOutput(branchID, outputVersion)
 	}
 
 	// The join re-evaluation is committed with the settle (transactional

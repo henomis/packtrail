@@ -24,13 +24,12 @@ import (
 	"github.com/henomis/packtrail/invoker"
 )
 
-// TestOutputOverwrittenOnRerun covers the data-before-control crash ordering: a
+// TestOrphanOutputIgnoredOnRerun covers the data-before-control crash ordering: a
 // task's output landed in the data plane but the process died before the
-// control-plane advance committed. The re-run (here via the stall watchdog)
-// invokes the node again and its put overwrites the orphaned entry
-// idempotently — the flow completes with the re-run's output and no duplicate
-// Outputs entry.
-func TestOutputOverwrittenOnRerun(t *testing.T) {
+// control-plane advance committed. The re-run (here via the stall watchdog) now
+// commits a new output version, so the orphaned legacy entry is ignored and the
+// flow completes with the re-run's output and no duplicate Outputs entry.
+func TestOrphanOutputIgnoredOnRerun(t *testing.T) {
 	ctx := context.Background()
 
 	inv := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {

@@ -238,11 +238,11 @@ func (e *Engine) dispatchBranches(
 				return
 			}
 
-			// Data before control: the output entry is written outside the
-			// mutex (data-plane puts are CAS-free and parallel-safe), then the
-			// settle is serialized like every branch write.
+			outputVersion := ""
+
 			if len(o.payload) > 0 {
-				if putErr := e.store.PutPayload(ctx, store.OutputKey(exec.ID, branchID), o.payload); putErr != nil {
+				version, putErr := e.writeOutputCandidate(ctx, exec.ID, branchID, o.payload)
+				if putErr != nil {
 					e.log.Error("persist branch output", "exec", exec.ID, "branch", branchID, "err", putErr)
 
 					// The branch stays BranchPending. Surface the error so
@@ -252,12 +252,14 @@ func (e *Engine) dispatchBranches(
 
 					return
 				}
+
+				outputVersion = version
 			}
 
 			writeMu.Lock()
 			defer writeMu.Unlock()
 
-			if pbErr := e.persistBranch(ctx, exec.ID, branchID, startAttempt, o.state, len(o.payload) > 0); pbErr != nil {
+			if pbErr := e.persistBranch(ctx, exec.ID, branchID, startAttempt, o.state, outputVersion); pbErr != nil {
 				// The settle CAS failed (e.g. an over-limit control document, or
 				// exhausted conflict retries), so the branch is still
 				// BranchPending. Surface it so stepFanout does not advance past it.
@@ -298,7 +300,7 @@ func firstDispatchErr(errs []error) error {
 // branch left BranchPending.
 func (e *Engine) persistBranch(
 	ctx context.Context, execID, branchID string, startAttempt int,
-	state store.BranchState, hasOutput bool,
+	state store.BranchState, outputVersion string,
 ) error {
 	_, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() {
@@ -312,8 +314,8 @@ func (e *Engine) persistBranch(
 
 		ex.Branches[branchID] = state
 
-		if hasOutput {
-			ex.AddOutput(branchID)
+		if outputVersion != "" {
+			ex.SetOutput(branchID, outputVersion)
 		}
 
 		return nil

@@ -66,28 +66,63 @@ type OutboxItem struct {
 // entry (see payloads.go); the document carries only which entries exist, so
 // its size grows with nodes visited, never with payload bytes.
 type Execution struct {
-	ID          string                 `json:"id"`
-	FlowName    string                 `json:"flow_name"`
-	CurrentNode string                 `json:"current_node"`
-	Status      string                 `json:"status"`
-	Attempt     int                    `json:"attempt"`               // attempts spent on CurrentNode (task retries)
-	Outputs     []string               `json:"outputs,omitempty"`     // node ids with a stored output, in settle order
-	Branches    map[string]BranchState `json:"branches,omitempty"`    // active fanout/fanin branches
-	LastSeq     map[string]uint64      `json:"last_seq,omitempty"`    // last applied JetStream seq, per signal_name
-	Signals     map[string]bool        `json:"signals,omitempty"`     // received-but-unconsumed markers, per signal_name
-	WaitSignal  string                 `json:"wait_signal,omitempty"` // signal_name currently awaited
-	Activity    *ActivityResult        `json:"activity,omitempty"`    //nolint:lll // async completion that arrived before the task parked
-	Error       string                 `json:"error,omitempty"`
-	RetryAt     time.Time              `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
-	Outbox      []OutboxItem           `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
-	OutboxSeq   uint64                 `json:"outbox_seq,omitempty"`
-	Revision    uint64                 `json:"-"` // current KV revision, for CAS (not persisted in value)
-	UpdatedAt   time.Time              `json:"updated_at"`
+	ID          string `json:"id"`
+	FlowName    string `json:"flow_name"`
+	CurrentNode string `json:"current_node"`
+	Status      string `json:"status"`
+	// attempts spent on CurrentNode (task retries)
+	Attempt int `json:"attempt"`
+	// node ids with a stored output, in settle order
+	Outputs        []string               `json:"outputs,omitempty"`
+	OutputVersions map[string]string      `json:"output_versions,omitempty"` // committed versioned output keys, per node
+	Branches       map[string]BranchState `json:"branches,omitempty"`        // active fanout/fanin branches
+	LastSeq        map[string]uint64      `json:"last_seq,omitempty"`        // last applied JetStream seq, per signal_name
+	// received-but-unconsumed markers, per signal_name
+	Signals    map[string]bool `json:"signals,omitempty"`
+	WaitSignal string          `json:"wait_signal,omitempty"` // signal_name currently awaited
+	Activity   *ActivityResult `json:"activity,omitempty"`    //nolint:lll // async completion that arrived before the task parked
+	Error      string          `json:"error,omitempty"`
+	RetryAt    time.Time       `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
+	Outbox     []OutboxItem    `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
+	OutboxSeq  uint64          `json:"outbox_seq,omitempty"`
+	Revision   uint64          `json:"-"` // current KV revision, for CAS (not persisted in value)
+	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
-// AddOutput records that node's output exists in the data plane. Call inside
-// the Mutate callback that commits the settle; idempotent per node.
+// AddOutput records that node's legacy output exists in the data plane. Call
+// inside the Mutate callback that commits the settle; idempotent per node.
 func (e *Execution) AddOutput(node string) {
+	e.appendOutput(node)
+}
+
+// SetOutput records that node's versioned output exists in the data plane. The
+// version is committed with the guarded control-plane CAS so stale attempts can
+// leave orphan payload candidates without changing which output Results reads.
+func (e *Execution) SetOutput(node, version string) {
+	e.appendOutput(node)
+
+	if version == "" {
+		return
+	}
+
+	if e.OutputVersions == nil {
+		e.OutputVersions = make(map[string]string, 1)
+	}
+
+	e.OutputVersions[node] = version
+}
+
+// OutputVersion returns the committed version for node, or "" for legacy output
+// entries written before output versioning was introduced.
+func (e *Execution) OutputVersion(node string) string {
+	if e.OutputVersions == nil {
+		return ""
+	}
+
+	return e.OutputVersions[node]
+}
+
+func (e *Execution) appendOutput(node string) {
 	for _, n := range e.Outputs {
 		if n == node {
 			return
@@ -149,7 +184,8 @@ type ActivityResult struct {
 }
 
 // BranchState is the persisted control state of a single fanout branch; a
-// completed branch's result lives in the data plane under OutputKey.
+// completed branch's result lives in the data plane and is selected by
+// Execution.OutputVersions when versioned.
 type BranchState struct {
 	NodeID  string `json:"node_id"`
 	Status  string `json:"status"`

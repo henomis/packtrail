@@ -28,9 +28,9 @@ import (
 // The data plane: every payload an execution produces or consumes lives as its
 // own entry in the payloads bucket, keyed under the execution id. The control
 // plane (the execution document) carries only which entries exist; its guarded
-// CAS transitions decide which write is current, so data-plane writes are
-// plain idempotent puts — a re-run of the same attempt overwrites the same key
-// with the same logical content.
+// CAS transitions decide which write is current. Output writers therefore write
+// versioned candidate keys first, then commit the selected version in the
+// execution document; legacy OutputKey remains readable for old executions.
 //
 // The "in"/"out"/"sig" sub-tokens keep the key spaces disjoint even though
 // node ids and signal names share one alphabet (a node may legally be named
@@ -41,6 +41,13 @@ func InputKey(execID string) string { return execID + ".in" }
 
 // OutputKey is the data-plane key of a task or branch node's output.
 func OutputKey(execID, node string) string { return execID + ".out." + node }
+
+// OutputVersionKey is the data-plane key of a candidate task or branch output.
+// The execution document commits exactly one version per output node; uncommitted
+// versions are harmless orphans swept with the execution's other payloads.
+func OutputVersionKey(execID, node, version string) string {
+	return execID + ".outv." + node + "." + version
+}
 
 // SignalKey is the data-plane key of a received signal's payload. It is
 // versioned by the signal's stream sequence: the control plane commits

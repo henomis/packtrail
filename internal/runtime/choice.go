@@ -64,7 +64,7 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 		}
 
 		if match {
-			return e.advanceTo(ctx, exec.ID, node.ID, r.To, nil)
+			return e.advanceToGenerationAttempt(ctx, exec.ID, node.ID, exec.NodeGeneration, exec.Attempt, r.To, nil)
 		}
 	}
 
@@ -75,5 +75,5 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 		return terminal("choice %q: no rule matched and no default", node.ID)
 	}
 
-	return e.advanceTo(ctx, exec.ID, node.ID, defaultTo, nil)
+	return e.advanceToGenerationAttempt(ctx, exec.ID, node.ID, exec.NodeGeneration, exec.Attempt, defaultTo, nil)
 }

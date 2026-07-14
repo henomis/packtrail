@@ -151,6 +151,60 @@ func TestSignalTimeoutNoFallbackFails(t *testing.T) {
 	}
 }
 
+func TestSignalTimeoutFailRejectsStaleGeneration(t *testing.T) {
+	h := newHarness(t, signalTimeoutFlow, Config{})
+	ctx := context.Background()
+
+	exec := &store.Execution{
+		ID:             "sig-timeout-stale-generation",
+		FlowName:       "sigfail",
+		Status:         store.StatusWaiting,
+		CurrentNode:    "wait",
+		NodeGeneration: 2,
+		WaitSignal:     "approval",
+	}
+	if _, err := h.store.Create(ctx, exec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	staleSnapshot := *exec
+	staleSnapshot.NodeGeneration = 1
+
+	flow := h.engine.flows["sigfail"]
+	if err := h.engine.onWaitTimeout(ctx, flow, &staleSnapshot, workItem{
+		Kind: kindWaitTimeout, Node: "wait", Generation: 1, Signal: "approval",
+	}); err != nil {
+		t.Fatalf("stale timeout: %v", err)
+	}
+
+	afterStale, err := h.store.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+
+	if afterStale.Status != store.StatusWaiting ||
+		afterStale.CurrentNode != "wait" ||
+		afterStale.NodeGeneration != 2 ||
+		afterStale.WaitSignal != "approval" {
+		t.Fatalf("after stale timeout = %+v, want unchanged signal wait", afterStale)
+	}
+
+	if err = h.engine.onWaitTimeout(ctx, flow, afterStale, workItem{
+		Kind: kindWaitTimeout, Node: "wait", Generation: 2, Signal: "approval",
+	}); err != nil {
+		t.Fatalf("fresh timeout: %v", err)
+	}
+
+	afterFresh, err := h.store.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+
+	if afterFresh.Status != store.StatusFailed || afterFresh.Error == "" {
+		t.Fatalf("after fresh timeout = %+v, want failed with error", afterFresh)
+	}
+}
+
 // drainBranchDispatches reads the two initial fanout branch dispatches.
 func drainBranchDispatches(t *testing.T, h *asyncHarness) {
 	t.Helper()

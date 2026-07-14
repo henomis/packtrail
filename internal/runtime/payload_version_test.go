@@ -134,7 +134,7 @@ func TestStaleAsyncBranchCompletionCannotOverwriteCommittedOutput(t *testing.T) 
 		},
 	}
 
-	if err := eng.completeBranch(ctx, flow, staleSnapshot, "b2", 0,
+	if err := eng.completeBranch(ctx, flow, staleSnapshot, "b2", 0, 0,
 		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"run":"stale"}`)}); err != nil {
 		t.Fatalf("complete stale branch: %v", err)
 	}
@@ -163,12 +163,59 @@ func TestStaleSyncBranchPersistCannotOverwriteCommittedOutput(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if err := eng.persistBranch(ctx, id, "b1", 0,
+	if err := eng.persistBranch(ctx, id, "b1", 0, 0,
 		store.BranchState{NodeID: "b1", Status: store.BranchCompleted, Attempt: 0}, "stale"); err != nil {
 		t.Fatalf("persist stale branch: %v", err)
 	}
 
 	assertResult(ctx, t, eng, id, "b1", `{"run":"fresh"}`)
+}
+
+func TestPersistBranchRejectsStaleGeneration(t *testing.T) {
+	ctx, st, eng, _ := newIdleRedriveEngine(t)
+
+	const id = "persist-branch-stale-generation"
+
+	if _, err := st.Create(ctx, &store.Execution{
+		ID:             id,
+		FlowName:       "redrive",
+		Status:         store.StatusRunning,
+		CurrentNode:    "fo",
+		NodeGeneration: 2,
+		Branches: map[string]store.BranchState{
+			"b1": {NodeID: "b1", Status: store.BranchPending, Generation: 2, Attempt: 0},
+		},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := eng.persistBranch(ctx, id, "b1", 1, 0,
+		store.BranchState{NodeID: "b1", Status: store.BranchCompleted, Generation: 1, Attempt: 0}, ""); err != nil {
+		t.Fatalf("persist stale generation: %v", err)
+	}
+
+	ex, err := st.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+
+	if bs := ex.Branches["b1"]; bs.Status != store.BranchPending || bs.Generation != 2 {
+		t.Fatalf("branch after stale persist = %+v, want pending generation 2", bs)
+	}
+
+	if err = eng.persistBranch(ctx, id, "b1", 2, 0,
+		store.BranchState{NodeID: "b1", Status: store.BranchCompleted, Generation: 2, Attempt: 0}, ""); err != nil {
+		t.Fatalf("persist fresh generation: %v", err)
+	}
+
+	ex, err = st.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+
+	if bs := ex.Branches["b1"]; bs.Status != store.BranchCompleted || bs.Generation != 2 {
+		t.Fatalf("branch after fresh persist = %+v, want completed generation 2", bs)
+	}
 }
 
 func newIdleRedriveEngine(t *testing.T) (context.Context, *store.Store, *Engine, *dsl.Flow) {

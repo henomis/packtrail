@@ -82,11 +82,11 @@ func (e *Engine) stepFanout(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 	if anyPending {
 		// Async branches outstanding: park at the fanin (waiting); their
 		// completions drive the join.
-		return e.parkAtFanin(ctx, node, exec.ID, fanin)
+		return e.parkAtFanin(ctx, node, exec.ID, updated.NodeGeneration, fanin)
 	}
 
 	// All branches settled synchronously; move to the fanin to apply the join.
-	return e.advanceTo(ctx, exec.ID, node.ID, fanin, nil)
+	return e.advanceToGenerationAttempt(ctx, exec.ID, node.ID, updated.NodeGeneration, updated.Attempt, fanin, nil)
 }
 
 // ensurePendingBranches is stepFanout's Mutate callback: it seeds a pending
@@ -101,8 +101,10 @@ func ensurePendingBranches(ex *store.Execution, node *dsl.Node) error {
 	}
 
 	for _, b := range node.Branches {
-		if _, ok := ex.Branches[b]; !ok {
-			ex.Branches[b] = store.BranchState{NodeID: b, Status: store.BranchPending}
+		bs, ok := ex.Branches[b]
+		if !ok || bs.Generation != ex.NodeGeneration {
+			ex.ClearOutput(b)
+			ex.Branches[b] = store.BranchState{NodeID: b, Status: store.BranchPending, Generation: ex.NodeGeneration}
 		}
 	}
 
@@ -132,8 +134,10 @@ func pendingBranchIDs(node *dsl.Node, exec *store.Execution) []string {
 // eval harmlessly no-ops; duplicates are state-safe (advanceTo is
 // guarded). This is the fanout counterpart to stepTask's
 // early-completion stash.
-func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin string) error {
-	evalItem, err := faninEvalWorkItem(execID, fanin)
+func (e *Engine) parkAtFanin(
+	ctx context.Context, node *dsl.Node, execID string, generation uint64, fanin string,
+) error {
+	evalItem, err := faninEvalWorkItem(execID, fanin, nextWorkGeneration(generation))
 	if err != nil {
 		return err
 	}
@@ -141,12 +145,13 @@ func (e *Engine) parkAtFanin(ctx context.Context, node *dsl.Node, execID, fanin 
 	parked, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		// Park only if still active at the fanout: a Cancel that landed while
 		// branches were dispatching must not be overwritten back to waiting.
-		if !ex.Active() || ex.CurrentNode != node.ID {
+		if !ex.Active() || ex.CurrentNode != node.ID || ex.NodeGeneration != generation {
 			return errSkip
 		}
 
 		ex.Status = store.StatusWaiting
 		ex.CurrentNode = fanin
+		ex.NodeGeneration++
 		ex.Attempt = 0
 		ex.AppendWork(evalItem)
 
@@ -230,9 +235,10 @@ func (e *Engine) dispatchBranches(
 				}
 			}()
 
-			startAttempt := exec.Branches[branchID].Attempt
+			branchState := exec.Branches[branchID]
+			startAttempt := branchState.Attempt
 
-			o := e.runBranch(ctx, flow, branchID, exec.ID, contextDoc, startAttempt)
+			o := e.runBranch(ctx, flow, branchID, exec.ID, contextDoc, branchState.Generation, startAttempt)
 			if o.pending {
 				pending.Store(true)
 				return
@@ -259,7 +265,9 @@ func (e *Engine) dispatchBranches(
 			writeMu.Lock()
 			defer writeMu.Unlock()
 
-			if pbErr := e.persistBranch(ctx, exec.ID, branchID, startAttempt, o.state, outputVersion); pbErr != nil {
+			if pbErr := e.persistBranch(
+				ctx, exec.ID, branchID, branchState.Generation, startAttempt, o.state, outputVersion,
+			); pbErr != nil {
 				// The settle CAS failed (e.g. an over-limit control document, or
 				// exhausted conflict retries), so the branch is still
 				// BranchPending. Surface it so stepFanout does not advance past it.
@@ -299,7 +307,7 @@ func firstDispatchErr(errs []error) error {
 // (nil); a real store failure is returned so the caller does not advance past a
 // branch left BranchPending.
 func (e *Engine) persistBranch(
-	ctx context.Context, execID, branchID string, startAttempt int,
+	ctx context.Context, execID, branchID string, startGeneration uint64, startAttempt int,
 	state store.BranchState, outputVersion string,
 ) error {
 	_, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
@@ -308,7 +316,10 @@ func (e *Engine) persistBranch(
 		}
 
 		bs, ok := ex.Branches[branchID]
-		if !ok || bs.Status != store.BranchPending || bs.Attempt != startAttempt {
+		if !ok ||
+			bs.Status != store.BranchPending ||
+			(startGeneration != 0 && bs.Generation != startGeneration) ||
+			bs.Attempt != startAttempt {
 			return errSkip // settled or re-dispatched elsewhere: stale write
 		}
 
@@ -356,11 +367,11 @@ type branchOutcome struct {
 // scheduler-based retry in settleTask, and TestAsyncBranchRetryDoesNotBlock).
 func (e *Engine) runBranch(
 	ctx context.Context, flow *dsl.Flow,
-	branchID, execID string, payload json.RawMessage, startAttempt int,
+	branchID, execID string, payload json.RawMessage, generation uint64, startAttempt int,
 ) branchOutcome {
 	node := flow.Node(branchID)
 	if node == nil || node.Type != dsl.NodeTask {
-		return failedBranch(branchID, startAttempt, "branch is not a task node")
+		return failedBranch(branchID, generation, startAttempt, "branch is not a task node")
 	}
 
 	maxAtt := maxAttempts(node)
@@ -371,14 +382,16 @@ func (e *Engine) runBranch(
 	)
 
 	for attempt := startAttempt; attempt < maxAtt; attempt++ {
-		res, callErr = e.invoke(ctx, node, execID, payload, attempt)
+		res, callErr = e.invoke(ctx, node, execID, payload, generation, attempt)
 		if callErr == nil && res.Status == invoker.StatusPending {
 			return branchOutcome{pending: true} // async: settled later via CompleteActivity
 		}
 
 		if callErr == nil && res.Status == invoker.StatusOK {
 			return branchOutcome{
-				state:   store.BranchState{NodeID: branchID, Status: store.BranchCompleted, Attempt: attempt},
+				state: store.BranchState{
+					NodeID: branchID, Status: store.BranchCompleted, Generation: generation, Attempt: attempt,
+				},
 				payload: res.Payload,
 			}
 		}
@@ -390,19 +403,19 @@ func (e *Engine) runBranch(
 		if attempt < maxAtt-1 {
 			select {
 			case <-ctx.Done():
-				return failedBranch(branchID, attempt, "cancelled")
+				return failedBranch(branchID, generation, attempt, "cancelled")
 			case <-time.After(backoff(node, attempt+1, e.cfg.RetryBaseDelay, e.cfg.RetryMaxDelay)):
 			}
 		}
 	}
 
-	return failedBranch(branchID, maxAtt-1, retryReason(res, callErr))
+	return failedBranch(branchID, generation, maxAtt-1, retryReason(res, callErr))
 }
 
 // failedBranch builds a settled, failed branch outcome.
-func failedBranch(branchID string, attempt int, errMsg string) branchOutcome {
+func failedBranch(branchID string, generation uint64, attempt int, errMsg string) branchOutcome {
 	return branchOutcome{state: store.BranchState{
-		NodeID: branchID, Status: store.BranchFailed, Attempt: attempt, Error: errMsg,
+		NodeID: branchID, Status: store.BranchFailed, Generation: generation, Attempt: attempt, Error: errMsg,
 	}}
 }
 
@@ -442,7 +455,8 @@ func (e *Engine) evalFanin(ctx context.Context, flow *dsl.Flow, exec *store.Exec
 
 	switch {
 	case completed >= required:
-		return e.advanceTo(ctx, exec.ID, node.ID, flow.Successor(node.ID), nil)
+		return e.advanceToGenerationAttempt(ctx, exec.ID, node.ID, exec.NodeGeneration, exec.Attempt,
+			flow.Successor(node.ID), nil)
 	case settled == total:
 		// Everything has settled but the policy was not met.
 		reason := fmt.Sprintf("fanin %q: join not satisfied (%d completed, need %d)", node.ID, completed, required)

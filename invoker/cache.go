@@ -32,11 +32,11 @@ import (
 // the work item is redelivered and the node would otherwise run twice — double
 // side effects (a re-billed LLM call, a duplicate write, a second e-mail).
 //
-// Cache keys a stored Result by (execution, node, attempt). A redelivery of the
-// same attempt is served from the cache and never reaches the delegate, while a
-// genuine retry (a new attempt number) gets a fresh key and does re-run, exactly
-// as the node's retry policy intends. Transport errors are never cached, so a
-// failed call is always retried.
+// Cache keys a stored Result by (execution, node, generation, attempt). A
+// redelivery of the same attempt is served from the cache and never reaches the
+// delegate, while a genuine retry (a new attempt number), Resume, or legal cycle
+// revisit gets a fresh key and does re-run. Transport errors are never cached, so
+// a failed call is always retried.
 //
 // Cache solves the engine-side double-dispatch window. It cannot make a
 // non-deterministic task deterministic; an Invoker with external side effects
@@ -70,16 +70,21 @@ func NewCache(kv jetstream.KeyValue, delegate Invoker) *Cache {
 
 // NewCacheKeyed wraps delegate like NewCache but namespaces every key with
 // prefix. Two Cache layers sharing one bucket must not collide on the same
-// (execution, node, attempt): packtrail's engine-side dispatch cache stores
-// StatusPending for an async node under that triple, while the async worker's
-// execution cache stores the real result of the same triple — a shared key
-// would either freeze the node at Pending or clobber the dispatch dedup.
+// (execution, node, generation, attempt): packtrail's engine-side dispatch cache
+// stores StatusPending for an async node under that tuple, while the async
+// worker's execution cache stores the real result of the same tuple — a shared
+// key would either freeze the node at Pending or clobber the dispatch dedup.
 func NewCacheKeyed(kv jetstream.KeyValue, delegate Invoker, prefix string) *Cache {
 	return &Cache{kv: kv, delegate: delegate, prefix: prefix}
 }
 
 func (c *Cache) key(req Request) string {
 	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are token-safe.
+	if req.Generation != 0 {
+		return c.prefix + req.ExecutionID + "." + req.NodeID + "." +
+			strconv.FormatUint(req.Generation, 10) + "." + strconv.Itoa(req.Attempt)
+	}
+
 	return c.prefix + req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
 }
 

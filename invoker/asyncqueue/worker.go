@@ -186,7 +186,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	defer cancelHB()
 
 	res := w.invoke(ctx, j)
-	if err := w.completer.CompleteActivity(ctx, j.ExecID, j.Node, j.Attempt, res); err != nil {
+	if err := w.complete(ctx, j, res); err != nil {
 		// A terminal completion error (e.g. the engine no longer knows the flow)
 		// can never succeed; an exhausted transient one would Nak forever. Either
 		// way, dead-letter the job (Term) instead of redelivering indefinitely.
@@ -214,6 +214,14 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	if ackErr := msg.Ack(); ackErr != nil {
 		w.log.Warn("ack job", "exec", j.ExecID, "node", j.Node, "err", ackErr)
 	}
+}
+
+func (w *Worker) complete(ctx context.Context, j job, res invoker.Result) error {
+	if c, ok := w.completer.(generationCompleter); ok {
+		return c.CompleteActivityWithGeneration(ctx, j.ExecID, j.Node, j.Generation, j.Attempt, res)
+	}
+
+	return w.completer.CompleteActivity(ctx, j.ExecID, j.Node, j.Attempt, res)
 }
 
 // invoke reconstructs the node invocation and runs the embedder's Invoker under
@@ -256,6 +264,7 @@ func (w *Worker) invoke(ctx context.Context, j job) (res invoker.Result) {
 		ExecutionID: j.ExecID,
 		NodeID:      j.Node,
 		Payload:     j.Payload,
+		Generation:  j.Generation,
 		Attempt:     j.Attempt,
 		Deadline:    time.Now().Add(timeout),
 	})

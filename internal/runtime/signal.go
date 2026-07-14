@@ -35,6 +35,14 @@ func (e *Engine) Signal(ctx context.Context, execID, name string, payload json.R
 	return e.signals.Publish(ctx, execID, name, payload)
 }
 
+// SignalWithID publishes an external signal with a caller-supplied idempotency
+// key for safe retry after ambiguous publish failures.
+func (e *Engine) SignalWithID(
+	ctx context.Context, execID, name, idempotencyKey string, payload json.RawMessage,
+) error {
+	return e.signals.PublishWithID(ctx, execID, name, idempotencyKey, payload)
+}
+
 // stepSignal makes the execution wait for an external signal. If the signal has
 // already arrived (early delivery), it is consumed immediately; otherwise the
 // execution enters the waiting state and a timeout is scheduled.
@@ -50,13 +58,13 @@ func (e *Engine) stepSignal(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 
 	// Both possible follow-ons are marshaled up front so the park/consume CAS
 	// can commit whichever it needs atomically (transactional outbox).
-	advanceItem, timeoutItem, err := signalWorkItems(exec.ID, node, next)
+	advanceItem, timeoutItem, err := signalWorkItems(exec.ID, exec.NodeGeneration, node, next)
 	if err != nil {
 		return err
 	}
 
 	updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-		return parkOrConsumeSignal(ex, node, name, next, advanceItem, timeoutItem)
+		return parkOrConsumeSignal(ex, node, exec.NodeGeneration, name, next, advanceItem, timeoutItem)
 	})
 	if err != nil {
 		if errors.Is(err, errSkip) {
@@ -74,9 +82,11 @@ func (e *Engine) stepSignal(ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 // signalWorkItems marshals the two possible signal-node follow-ons: the
 // advance item (if there is a successor) and the wait-timeout item (if the
 // node has a positive timeout).
-func signalWorkItems(execID string, node *dsl.Node, next string) (advanceItem, timeoutItem json.RawMessage, err error) {
+func signalWorkItems(
+	execID string, generation uint64, node *dsl.Node, next string,
+) (advanceItem, timeoutItem json.RawMessage, err error) {
 	if next != "" {
-		advanceItem, err = advanceWorkItem(execID, next, 0, time.Time{})
+		advanceItem, err = advanceWorkItem(execID, next, nextWorkGeneration(generation), 0, time.Time{})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -84,7 +94,10 @@ func signalWorkItems(execID string, node *dsl.Node, next string) (advanceItem, t
 
 	if node.Timeout.D() > 0 {
 		timeoutItem, err = json.Marshal(
-			workItem{ExecID: execID, Kind: kindWaitTimeout, Node: node.ID, Signal: node.SignalName})
+			workItem{
+				ExecID: execID, Kind: kindWaitTimeout, Node: node.ID,
+				Generation: generation, Signal: node.SignalName,
+			})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -100,11 +113,12 @@ func signalWorkItems(execID string, node *dsl.Node, next string) (advanceItem, t
 // us), so parking on the stale snapshot would strand the execution waiting for
 // a signal it already holds.
 func parkOrConsumeSignal(
-	ex *store.Execution, node *dsl.Node, name, next string, advanceItem, timeoutItem json.RawMessage,
+	ex *store.Execution, node *dsl.Node, generation uint64, name, next string,
+	advanceItem, timeoutItem json.RawMessage,
 ) error {
 	// Park only while still active at this node: a Cancel (or a competing
 	// transition) racing this step must not be overwritten back to waiting.
-	if !ex.Active() || ex.CurrentNode != node.ID {
+	if !ex.Active() || ex.CurrentNode != node.ID || ex.NodeGeneration != generation {
 		return errSkip
 	}
 
@@ -168,7 +182,7 @@ func (e *Engine) applySignal(ctx context.Context, d signal.Delivery) error {
 
 		node := flow.Node(updated.CurrentNode)
 		if node != nil && node.Type == dsl.NodeSignal && node.SignalName == d.Name {
-			return e.transitionFromSignal(ctx, flow, d.ExecID, node.ID, d.Name)
+			return e.transitionFromSignal(ctx, flow, d.ExecID, node.ID, updated.NodeGeneration, d.Name)
 		}
 	}
 
@@ -239,7 +253,10 @@ func (e *Engine) handleApplySignalErr(ctx context.Context, d signal.Delivery, er
 // advance item is committed in the same CAS write — transactional outbox —
 // and re-flushed by the next touch or the stall watchdog.)
 func (e *Engine) onWaitTimeout(ctx context.Context, flow *dsl.Flow, exec *store.Execution, wi workItem) error {
-	if exec.Status != store.StatusWaiting || exec.CurrentNode != wi.Node || exec.WaitSignal != wi.Signal {
+	if exec.Status != store.StatusWaiting ||
+		exec.CurrentNode != wi.Node ||
+		(wi.Generation != 0 && exec.NodeGeneration != wi.Generation) ||
+		exec.WaitSignal != wi.Signal {
 		return nil // signal already consumed, or moved on
 	}
 
@@ -249,42 +266,78 @@ func (e *Engine) onWaitTimeout(ctx context.Context, flow *dsl.Flow, exec *store.
 	}
 
 	if node.OnTimeout == "" {
-		return e.failNode(ctx, exec.ID, wi.Node, "signal "+node.SignalName+" timed out")
+		return e.failSignalTimeout(ctx, exec.ID, wi.Node, wi.Generation, wi.Signal,
+			"signal "+node.SignalName+" timed out")
 	}
 
-	return e.guardedAdvance(ctx, exec.ID, wi.Node, wi.Signal, node.OnTimeout)
+	return e.guardedAdvance(ctx, exec.ID, wi.Node, wi.Generation, wi.Signal, node.OnTimeout)
+}
+
+func (e *Engine) failSignalTimeout(
+	ctx context.Context, execID, nodeID string, generation uint64, signalName, reason string,
+) error {
+	reason = truncateReason(reason)
+
+	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		if ex.Status != store.StatusWaiting ||
+			ex.CurrentNode != nodeID ||
+			(generation != 0 && ex.NodeGeneration != generation) ||
+			ex.WaitSignal != signalName {
+			return errSkip
+		}
+
+		ex.Status = store.StatusFailed
+		ex.Error = reason
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil
+		}
+
+		return err
+	}
+
+	e.emitEvent(ctx, updated)
+
+	return nil
 }
 
 // transitionFromSignal advances a waiting execution to the signal node's
 // successor. The signal payload is already in the data plane and appears in
 // downstream contexts under signals.<name>.
-func (e *Engine) transitionFromSignal(ctx context.Context, flow *dsl.Flow, execID, signalNodeID, name string) error {
-	return e.guardedAdvance(ctx, execID, signalNodeID, name, flow.Successor(signalNodeID))
+func (e *Engine) transitionFromSignal(
+	ctx context.Context, flow *dsl.Flow, execID, signalNodeID string, generation uint64, name string,
+) error {
+	return e.guardedAdvance(ctx, execID, signalNodeID, generation, name, flow.Successor(signalNodeID))
 }
 
 // guardedAdvance atomically advances an execution out of a signal wait, but only
 // if it is still waiting on (signalNodeID, name). This makes signal arrival and
 // timeout mutually exclusive: whichever applies first wins, the other no-ops.
-func (e *Engine) guardedAdvance(ctx context.Context, execID, signalNodeID, name, nextNode string) error {
+func (e *Engine) guardedAdvance(
+	ctx context.Context, execID, signalNodeID string, generation uint64, name, nextNode string,
+) error {
 	var item json.RawMessage
 
-	if nextNode != "" {
-		data, err := advanceWorkItem(execID, nextNode, 0, time.Time{})
-		if err != nil {
-			return err
-		}
-
-		item = data
-	}
-
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
-		if ex.Status != store.StatusWaiting || ex.CurrentNode != signalNodeID || ex.WaitSignal != name {
+		if ex.Status != store.StatusWaiting ||
+			ex.CurrentNode != signalNodeID ||
+			(generation != 0 && ex.NodeGeneration != generation) ||
+			ex.WaitSignal != name {
 			return errSkip // guard failed: leave unchanged
 		}
 
 		consumeSignal(ex, name, nextNode)
 
 		if nextNode != "" {
+			data, itemErr := advanceWorkItem(execID, nextNode, ex.NodeGeneration, 0, time.Time{})
+			if itemErr != nil {
+				return itemErr
+			}
+
+			item = data
 			ex.AppendWork(item) // committed with the transition (transactional outbox)
 		}
 
@@ -323,5 +376,6 @@ func consumeSignal(ex *store.Execution, name, nextNode string) {
 	} else {
 		ex.Status = store.StatusRunning
 		ex.CurrentNode = nextNode
+		ex.NodeGeneration++
 	}
 }

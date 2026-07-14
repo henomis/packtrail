@@ -55,6 +55,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 		ExecutionID: "exec-1",
 		NodeID:      "node-1",
 		Payload:     json.RawMessage(`{"in":1}`),
+		Generation:  7,
 		Attempt:     3,
 	})
 	if err != nil {
@@ -69,8 +70,9 @@ func TestInvokeMapsResponse(t *testing.T) {
 		t.Fatalf("payload = %s, want {\"ok\":true}", res.Payload)
 	}
 
-	if gotReq.ExecutionID != "exec-1" || gotReq.NodeID != "node-1" || gotReq.Attempt != 3 {
-		t.Fatalf("worker saw %+v, want exec-1/node-1/attempt 3", gotReq)
+	if gotReq.ExecutionID != "exec-1" || gotReq.NodeID != "node-1" ||
+		gotReq.Generation != 7 || gotReq.Attempt != 3 {
+		t.Fatalf("worker saw %+v, want exec-1/node-1/generation 7/attempt 3", gotReq)
 	}
 }
 

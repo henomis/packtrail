@@ -81,6 +81,51 @@ func TestCacheDedupesSameAttempt(t *testing.T) {
 	}
 }
 
+func TestCacheSeparatesNodeGenerations(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-generation"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	delegate := invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
+		n := calls.Add(1)
+
+		return invoker.Result{Status: invoker.StatusOK, Payload: []byte(fmt.Sprintf(`{"call":%d}`, n))}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+
+	req := invoker.Request{ExecutionID: "exec-1", NodeID: "triage", Generation: 1, Attempt: 0}
+
+	res, err := cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("generation 1 invoke: %v", err)
+	}
+
+	if string(res.Payload) != `{"call":1}` {
+		t.Fatalf("generation 1 payload = %s, want first call", res.Payload)
+	}
+
+	req.Generation = 2
+
+	res, err = cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("generation 2 invoke: %v", err)
+	}
+
+	if string(res.Payload) != `{"call":2}` {
+		t.Fatalf("generation 2 payload = %s, want fresh call", res.Payload)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("delegate called %d times, want one per generation", got)
+	}
+}
+
 // TestCacheKeyedSeparatesKeyspaces encodes the two-layer contract behind
 // packtrail's async result caching: the engine-side dispatch cache stores
 // StatusPending for an async node under (execution, node, attempt), and the

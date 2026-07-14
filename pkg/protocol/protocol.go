@@ -41,6 +41,7 @@ type TaskRequest struct {
 	ExecutionID string          `json:"execution_id"`
 	NodeID      string          `json:"node_id"`
 	Payload     json.RawMessage `json:"payload"`
+	Generation  uint64          `json:"generation,omitempty"`
 	Attempt     int             `json:"attempt"`
 	Deadline    time.Time       `json:"deadline"`
 }

@@ -48,7 +48,7 @@ const (
 // buggy Invoker — sync or async — to its own execution.
 func (e *Engine) invoke(
 	ctx context.Context, node *dsl.Node, execID string,
-	payload json.RawMessage, attempt int,
+	payload json.RawMessage, generation uint64, attempt int,
 ) (res invoker.Result, err error) {
 	timeout := node.Timeout.D()
 	if timeout <= 0 {
@@ -78,6 +78,7 @@ func (e *Engine) invoke(
 		ExecutionID: execID,
 		NodeID:      node.ID,
 		Payload:     payload,
+		Generation:  generation,
 		Attempt:     attempt,
 		Deadline:    time.Now().Add(timeout),
 	})
@@ -93,7 +94,7 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 		return err
 	}
 
-	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, exec.Attempt)
+	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, exec.NodeGeneration, exec.Attempt)
 
 	// Async dispatch: park until CompleteActivity is called. The work item is
 	// acked, freeing the engine slot for the agent's whole runtime. If a
@@ -107,11 +108,14 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 			// Cancel (or a competing instance's transition) that landed while the
 			// dispatch was in flight must not be overwritten back to waiting. The
 			// outstanding CompleteActivity then no-ops against the terminal state.
-			if !ex.Active() || ex.CurrentNode != node.ID || ex.Attempt != exec.Attempt {
+			if !taskSettleMatches(ex, exec, node.ID) {
 				return errSkip
 			}
 
-			if a := ex.Activity; a != nil && a.Node == node.ID && a.Attempt == exec.Attempt {
+			if a := ex.Activity; a != nil &&
+				a.Node == node.ID &&
+				(a.Generation == 0 || a.Generation == ex.NodeGeneration) &&
+				a.Attempt == exec.Attempt {
 				early = a
 				ex.Activity = nil
 				ex.Status = store.StatusRunning // claim for settling
@@ -158,7 +162,7 @@ func (e *Engine) settleTask(
 
 	// Permanent error from the task: fail immediately, no retry.
 	if callErr == nil && res.Status == invoker.StatusError {
-		return e.failNode(ctx, exec.ID, node.ID, "task "+node.ID+": "+res.Error)
+		return e.failTaskNode(ctx, exec, node.ID, "task "+node.ID+": "+res.Error)
 	}
 
 	// Transient: a transport error (callErr != nil), an explicit retry request,
@@ -170,7 +174,7 @@ func (e *Engine) settleTask(
 	// callErr == nil but the status is none of the known values (e.g. an empty or
 	// misspelled status from a buggy worker). Retrying re-hits the same bug and
 	// burns the whole retry budget, so fail fast with an actionable reason.
-	return e.failNode(ctx, exec.ID, node.ID,
+	return e.failTaskNode(ctx, exec, node.ID,
 		fmt.Sprintf("task %s: unknown result status %q", node.ID, res.Status))
 }
 
@@ -187,7 +191,7 @@ func (e *Engine) settleTaskSuccess(
 		version, putErr := e.writeOutputCandidate(ctx, exec.ID, node.ID, res.Payload)
 		if putErr != nil {
 			if errors.Is(putErr, store.ErrPayloadTooLarge) {
-				return e.failNode(ctx, exec.ID, node.ID, putErr.Error())
+				return e.failTaskNode(ctx, exec, node.ID, putErr.Error())
 			}
 
 			return putErr
@@ -198,11 +202,14 @@ func (e *Engine) settleTaskSuccess(
 
 	next := flow.Successor(node.ID)
 
-	return e.advanceToAttempt(ctx, exec.ID, node.ID, exec.Attempt, next, func(ex *store.Execution) {
-		if outputVersion != "" {
-			ex.SetOutput(node.ID, outputVersion)
-		}
-	})
+	return e.advanceToGenerationAttempt(
+		ctx, exec.ID, node.ID, exec.NodeGeneration, exec.Attempt, next,
+		func(ex *store.Execution) {
+			if outputVersion != "" {
+				ex.SetOutput(node.ID, outputVersion)
+			}
+		},
+	)
 }
 
 // settleTaskRetry handles a transient failure (transport error, timeout, or
@@ -213,7 +220,7 @@ func (e *Engine) settleTaskRetry(
 ) error {
 	reason := retryReason(res, callErr)
 	if exec.Attempt+1 >= maxAttempts(node) {
-		return e.failNode(ctx, exec.ID, node.ID, "task "+node.ID+" exhausted retries: "+reason)
+		return e.failTaskNode(ctx, exec, node.ID, "task "+node.ID+" exhausted retries: "+reason)
 	}
 
 	// exec.Attempt is the pre-increment value; the attempt being scheduled is +1.
@@ -221,7 +228,7 @@ func (e *Engine) settleTaskRetry(
 
 	retryAt := time.Now().Add(delay).UTC()
 
-	item, marshalErr := advanceWorkItem(exec.ID, node.ID, exec.Attempt+1, retryAt)
+	item, marshalErr := advanceWorkItem(exec.ID, node.ID, exec.NodeGeneration, exec.Attempt+1, retryAt)
 	if marshalErr != nil {
 		return marshalErr
 	}
@@ -230,7 +237,7 @@ func (e *Engine) settleTaskRetry(
 		// Bump the attempt only while the execution is still active at this
 		// node/attempt: a cancelled execution must stay cancelled, and a stale or
 		// duplicate settlement must not double-bump (and double-schedule) a retry.
-		if !ex.Active() || ex.CurrentNode != node.ID || ex.Attempt != exec.Attempt {
+		if !taskSettleMatches(ex, exec, node.ID) {
 			return errSkip
 		}
 
@@ -255,6 +262,13 @@ func (e *Engine) settleTaskRetry(
 	}
 
 	return e.flushOutbox(ctx, updated)
+}
+
+func taskSettleMatches(ex, expected *store.Execution, nodeID string) bool {
+	return ex.Active() &&
+		ex.CurrentNode == nodeID &&
+		ex.NodeGeneration == expected.NodeGeneration &&
+		ex.Attempt == expected.Attempt
 }
 
 func maxAttempts(node *dsl.Node) int {

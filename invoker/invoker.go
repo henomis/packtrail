@@ -40,9 +40,10 @@ const (
 	// StatusRetry means the node asks to be retried per its node retry policy.
 	StatusRetry Status = "retry"
 	// StatusPending means the node was dispatched asynchronously and will be
-	// settled later via Engine.CompleteActivity. The engine parks the execution
-	// (waiting) and frees its work slot; Result.Payload is ignored. Use this for
-	// long-running activities (e.g. an agent call) so the engine does not block.
+	// settled later via Engine.CompleteActivityWithGeneration. The engine parks
+	// the execution (waiting) and frees its work slot; Result.Payload is ignored.
+	// Use this for long-running activities (e.g. an agent call) so the engine does
+	// not block.
 	StatusPending Status = "pending"
 )
 
@@ -55,6 +56,7 @@ type Request struct {
 	ExecutionID string          `json:"execution_id"` // owning execution
 	NodeID      string          `json:"node_id"`      // node being executed
 	Payload     json.RawMessage `json:"payload"`      // shared execution context
+	Generation  uint64          `json:"generation"`   // execution-scoped visit generation for this node
 	Attempt     int             `json:"attempt"`      // 0-based attempt number
 	Deadline    time.Time       `json:"deadline"`     // hard deadline for this attempt
 }

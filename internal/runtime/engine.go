@@ -49,12 +49,13 @@ import (
 // workItem is the JSON body of a message on packtrail.work.<execID>. The subject
 // also carries the execID; the body adds the kind of work to perform.
 type workItem struct {
-	ExecID    string    `json:"exec_id"`
-	Kind      string    `json:"kind"`
-	Node      string    `json:"node,omitempty"`      // node/branch this item is allowed to drive
-	Attempt   int       `json:"attempt,omitempty"`   // expected task/branch attempt
-	NotBefore time.Time `json:"not_before,omitzero"` // retry deadline guard
-	Signal    string    `json:"signal,omitempty"`    // signal name (wait timeout)
+	ExecID     string    `json:"exec_id"`
+	Kind       string    `json:"kind"`
+	Node       string    `json:"node,omitempty"`       // node/branch this item is allowed to drive
+	Generation uint64    `json:"generation,omitempty"` // expected node/branch visit generation (0 = legacy)
+	Attempt    int       `json:"attempt,omitempty"`    // expected task/branch attempt
+	NotBefore  time.Time `json:"not_before,omitzero"`  // retry deadline guard
+	Signal     string    `json:"signal,omitempty"`     // signal name (wait timeout)
 }
 
 // Work kinds.
@@ -406,27 +407,33 @@ var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validExecID(id string) bool { return execIDPattern.MatchString(id) }
 
-func advanceWorkItem(execID, node string, attempt int, notBefore time.Time) (json.RawMessage, error) {
+func advanceWorkItem(
+	execID, node string, generation uint64, attempt int, notBefore time.Time,
+) (json.RawMessage, error) {
 	return json.Marshal(workItem{
-		ExecID:    execID,
-		Kind:      kindAdvance,
-		Node:      node,
-		Attempt:   attempt,
-		NotBefore: notBefore.UTC(),
+		ExecID:     execID,
+		Kind:       kindAdvance,
+		Node:       node,
+		Generation: generation,
+		Attempt:    attempt,
+		NotBefore:  notBefore.UTC(),
 	})
 }
 
-func faninEvalWorkItem(execID, fanin string) (json.RawMessage, error) {
-	return json.Marshal(workItem{ExecID: execID, Kind: kindFaninEval, Node: fanin})
+func faninEvalWorkItem(execID, fanin string, generation uint64) (json.RawMessage, error) {
+	return json.Marshal(workItem{ExecID: execID, Kind: kindFaninEval, Node: fanin, Generation: generation})
 }
 
-func branchRetryWorkItem(execID, branchID string, attempt int, notBefore time.Time) (json.RawMessage, error) {
+func branchRetryWorkItem(
+	execID, branchID string, generation uint64, attempt int, notBefore time.Time,
+) (json.RawMessage, error) {
 	return json.Marshal(workItem{
-		ExecID:    execID,
-		Kind:      kindBranchRetry,
-		Node:      branchID,
-		Attempt:   attempt,
-		NotBefore: notBefore.UTC(),
+		ExecID:     execID,
+		Kind:       kindBranchRetry,
+		Node:       branchID,
+		Generation: generation,
+		Attempt:    attempt,
+		NotBefore:  notBefore.UTC(),
 	})
 }
 
@@ -487,16 +494,17 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 	}
 
 	exec := &store.Execution{
-		ID:          id,
-		FlowName:    flowName,
-		CurrentNode: flow.StartNode(),
-		Status:      store.StatusRunning,
+		ID:             id,
+		FlowName:       flowName,
+		CurrentNode:    flow.StartNode(),
+		Status:         store.StatusRunning,
+		NodeGeneration: 1,
 	}
 
 	// The first work item is committed in the same write that creates the
 	// execution (transactional outbox): the document and its driving message
 	// can never disagree, whatever crashes.
-	item, err := advanceWorkItem(id, exec.CurrentNode, exec.Attempt, time.Time{})
+	item, err := advanceWorkItem(id, exec.CurrentNode, exec.NodeGeneration, exec.Attempt, time.Time{})
 	if err != nil {
 		return "", err
 	}
@@ -683,7 +691,8 @@ func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan ti
 	switch {
 	case ex.Status == store.StatusRunning:
 		return true, e.enqueue(ctx, execID, workItem{
-			Kind: kindAdvance, Node: ex.CurrentNode, Attempt: ex.Attempt, NotBefore: ex.RetryAt,
+			Kind: kindAdvance, Node: ex.CurrentNode, Generation: ex.NodeGeneration,
+			Attempt: ex.Attempt, NotBefore: ex.RetryAt,
 		})
 	case ex.Status == store.StatusWaiting && ex.WaitSignal == "":
 		flow, ok := e.flows[ex.FlowName]
@@ -695,7 +704,9 @@ func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan ti
 			return false, nil // async task wait: CompleteActivity owns it
 		}
 
-		return true, e.enqueue(ctx, execID, workItem{Kind: kindFaninEval, Node: ex.CurrentNode})
+		return true, e.enqueue(ctx, execID, workItem{
+			Kind: kindFaninEval, Node: ex.CurrentNode, Generation: ex.NodeGeneration,
+		})
 	default:
 		return false, nil // signal wait: the wait timeout owns it
 	}
@@ -1461,7 +1472,9 @@ func advanceApplies(exec *store.Execution, wi workItem) bool {
 		return true // legacy item: still fenced by StatusRunning and RetryAt
 	}
 
-	return exec.CurrentNode == wi.Node && exec.Attempt == wi.Attempt
+	return exec.CurrentNode == wi.Node &&
+		(wi.Generation == 0 || exec.NodeGeneration == wi.Generation) &&
+		exec.Attempt == wi.Attempt
 }
 
 func advanceNotBefore(exec *store.Execution, wi workItem) time.Time {
@@ -1479,6 +1492,10 @@ func (e *Engine) processFaninEval(ctx context.Context, flow *dsl.Flow, exec *sto
 	}
 
 	if wi.Node != "" && exec.CurrentNode != wi.Node {
+		return nil
+	}
+
+	if wi.Generation != 0 && exec.NodeGeneration != wi.Generation {
 		return nil
 	}
 
@@ -1504,7 +1521,10 @@ func (e *Engine) processBranchRetry(ctx context.Context, flow *dsl.Flow, exec *s
 	}
 
 	bs, ok := exec.Branches[wi.Node]
-	if !ok || bs.Status != store.BranchPending || bs.Attempt != wi.Attempt {
+	if !ok ||
+		bs.Status != store.BranchPending ||
+		(wi.Generation != 0 && bs.Generation != wi.Generation) ||
+		bs.Attempt != wi.Attempt {
 		return nil
 	}
 
@@ -1522,12 +1542,12 @@ func (e *Engine) processBranchRetry(ctx context.Context, flow *dsl.Flow, exec *s
 		return err
 	}
 
-	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, wi.Attempt)
+	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, bs.Generation, wi.Attempt)
 	if callErr == nil && res.Status == invoker.StatusPending {
 		return nil
 	}
 
-	return e.completeBranch(ctx, flow, exec, wi.Node, wi.Attempt, settleResult(res, callErr))
+	return e.completeBranch(ctx, flow, exec, wi.Node, bs.Generation, wi.Attempt, settleResult(res, callErr))
 }
 
 func branchWorkApplies(flow *dsl.Flow, exec *store.Execution, branchID string) bool {
@@ -1601,7 +1621,10 @@ func deferredWorkApplies(ex *store.Execution, wi workItem) bool {
 	case kindBranchRetry:
 		bs, ok := ex.Branches[wi.Node]
 
-		return ok && bs.Status == store.BranchPending && bs.Attempt == wi.Attempt
+		return ok &&
+			bs.Status == store.BranchPending &&
+			(wi.Generation == 0 || bs.Generation == wi.Generation) &&
+			bs.Attempt == wi.Attempt
 	case kindFaninEval:
 		return ex.Status == store.StatusWaiting && (wi.Node == "" || ex.CurrentNode == wi.Node)
 	default:
@@ -1645,10 +1668,21 @@ func (e *Engine) advanceTo(
 func (e *Engine) advanceToAttempt(
 	ctx context.Context, execID, fromNode string, expectedAttempt int, nextNode string, mutate func(*store.Execution),
 ) error {
+	return e.advanceToGenerationAttempt(ctx, execID, fromNode, 0, expectedAttempt, nextNode, mutate)
+}
+
+func (e *Engine) advanceToGenerationAttempt(
+	ctx context.Context,
+	execID, fromNode string,
+	expectedGeneration uint64,
+	expectedAttempt int,
+	nextNode string,
+	mutate func(*store.Execution),
+) error {
 	var item json.RawMessage
 
 	if nextNode != "" {
-		data, err := advanceWorkItem(execID, nextNode, 0, time.Time{})
+		data, err := advanceWorkItem(execID, nextNode, nextWorkGeneration(expectedGeneration), 0, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -1657,12 +1691,8 @@ func (e *Engine) advanceToAttempt(
 	}
 
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
-		if !ex.Active() || ex.CurrentNode != fromNode {
+		if !advanceGuardMatches(ex, fromNode, expectedGeneration, expectedAttempt) {
 			return errSkip // cancelled, completed, or already moved on: stale advance
-		}
-
-		if expectedAttempt >= 0 && ex.Attempt != expectedAttempt {
-			return errSkip
 		}
 
 		if mutate != nil {
@@ -1684,6 +1714,7 @@ func (e *Engine) advanceToAttempt(
 		} else {
 			ex.Status = store.StatusRunning
 			ex.CurrentNode = nextNode
+			ex.NodeGeneration++
 			ex.AppendWork(item)
 		}
 
@@ -1698,7 +1729,7 @@ func (e *Engine) advanceToAttempt(
 		// actionable reason instead. failNode keeps the prior (within-limit)
 		// document, so its write succeeds.
 		if errors.Is(err, store.ErrPayloadTooLarge) || errors.Is(err, store.ErrDocumentTooLarge) {
-			return e.failNode(ctx, execID, fromNode, err.Error())
+			return e.failNodeGuarded(ctx, execID, fromNode, expectedGeneration, expectedAttempt, err.Error())
 		}
 
 		return err
@@ -1709,15 +1740,38 @@ func (e *Engine) advanceToAttempt(
 	return e.flushOutbox(ctx, updated)
 }
 
-// CompleteActivity settles an asynchronous activity that an Invoker previously
-// reported as StatusPending. node and attempt identify the dispatched work; res
-// is its outcome (StatusOK to advance, StatusError to fail, StatusRetry/transient
-// to retry per the node policy). It is idempotent and stale-safe: a duplicate or
-// out-of-date completion (the execution already moved on, or a different attempt)
-// is a no-op. It settles either the execution's current task node or a pending
-// fanout branch.
+func advanceGuardMatches(
+	ex *store.Execution, fromNode string, expectedGeneration uint64, expectedAttempt int,
+) bool {
+	return ex.Active() &&
+		ex.CurrentNode == fromNode &&
+		(expectedGeneration == 0 || ex.NodeGeneration == expectedGeneration) &&
+		(expectedAttempt < 0 || ex.Attempt == expectedAttempt)
+}
+
+func nextWorkGeneration(current uint64) uint64 {
+	if current == 0 {
+		return 0
+	}
+
+	return current + 1
+}
+
+// CompleteActivity settles an asynchronous activity using the legacy attempt-only
+// identity. Prefer CompleteActivityWithGeneration when Request.Generation is
+// available so stale completions from earlier node visits cannot settle a later
+// legal cycle or resume.
 func (e *Engine) CompleteActivity(
 	ctx context.Context, execID, node string, attempt int, res invoker.Result,
+) (err error) {
+	return e.CompleteActivityWithGeneration(ctx, execID, node, 0, attempt, res)
+}
+
+// CompleteActivityWithGeneration settles an asynchronous activity only if the
+// completion matches the node visit generation that dispatched it. A zero
+// generation preserves the legacy attempt-only API.
+func (e *Engine) CompleteActivityWithGeneration(
+	ctx context.Context, execID, node string, generation uint64, attempt int, res invoker.Result,
 ) (err error) {
 	// Top-level panic guard, parity with processGuarded and the invoke guards. The
 	// settle path (settleTask/completeBranch, JSON, store mutates) runs on the
@@ -1729,18 +1783,20 @@ func (e *Engine) CompleteActivity(
 	defer func() {
 		if r := recover(); r != nil {
 			e.log.Error("complete activity panic",
-				"exec", execID, "node", node, "attempt", attempt,
+				"exec", execID, "node", node, "generation", generation, "attempt", attempt,
 				"panic", r, "stack", string(debug.Stack()))
 
 			err = fmt.Errorf("complete activity panic: %v", r)
 		}
 	}()
 
-	return e.completeActivity(ctx, execID, node, attempt, res)
+	return e.completeActivity(ctx, execID, node, generation, attempt, res)
 }
 
 // completeActivity is CompleteActivity's body, run under its panic guard.
-func (e *Engine) completeActivity(ctx context.Context, execID, node string, attempt int, res invoker.Result) error {
+func (e *Engine) completeActivity(
+	ctx context.Context, execID, node string, generation uint64, attempt int, res invoker.Result,
+) error {
 	if !validExecID(execID) {
 		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
 	}
@@ -1779,7 +1835,7 @@ func (e *Engine) completeActivity(ctx context.Context, execID, node string, atte
 	// with the settle (transactional outbox) and re-flushed above, so it drops
 	// through to the stale no-op below.
 	if bs, found := exec.Branches[node]; found && bs.Status == store.BranchPending {
-		return e.completeBranch(ctx, flow, exec, node, attempt, res)
+		return e.completePendingBranch(ctx, flow, exec, node, bs, generation, attempt, res)
 	}
 
 	// Task-await path. If the task is parked (waiting) at this node/attempt, claim
@@ -1789,7 +1845,7 @@ func (e *Engine) completeActivity(ctx context.Context, execID, node string, atte
 	settle := false
 
 	claimed, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
-		if ex.CurrentNode != node || ex.Attempt != attempt {
+		if !taskCompletionMatches(ex, node, generation, attempt) {
 			return errSkip
 		}
 
@@ -1801,7 +1857,7 @@ func (e *Engine) completeActivity(ctx context.Context, execID, node string, atte
 			return nil
 		case store.StatusRunning:
 			ex.Activity = &store.ActivityResult{
-				Node: node, Attempt: attempt,
+				Node: node, Generation: generation, Attempt: attempt,
 				Status: string(res.Status), Payload: res.Payload, Error: res.Error,
 			}
 
@@ -1823,6 +1879,36 @@ func (e *Engine) completeActivity(ctx context.Context, execID, node string, atte
 	}
 
 	return e.settleClaimedTask(ctx, flow, claimed, node, attempt, res)
+}
+
+func (e *Engine) completePendingBranch(
+	ctx context.Context, flow *dsl.Flow, exec *store.Execution,
+	node string, bs store.BranchState, generation uint64, attempt int, res invoker.Result,
+) error {
+	if !branchCompletionMatches(flow, exec, bs, generation) {
+		return nil
+	}
+
+	return e.completeBranch(ctx, flow, exec, node, generation, attempt, res)
+}
+
+func branchCompletionMatches(flow *dsl.Flow, exec *store.Execution, bs store.BranchState, generation uint64) bool {
+	if generation != 0 && bs.Generation != generation {
+		return false
+	}
+
+	current := flow.Node(exec.CurrentNode)
+	if current != nil && current.Type == dsl.NodeFanout && bs.Generation != exec.NodeGeneration {
+		return false
+	}
+
+	return true
+}
+
+func taskCompletionMatches(ex *store.Execution, node string, generation uint64, attempt int) bool {
+	return ex.CurrentNode == node &&
+		(generation == 0 || ex.NodeGeneration == generation) &&
+		ex.Attempt == attempt
 }
 
 // settleClaimedTask settles a task-await node CompleteActivity just claimed
@@ -1895,7 +1981,7 @@ const (
 
 func (e *Engine) completeBranch(
 	ctx context.Context, flow *dsl.Flow, exec *store.Execution,
-	branchID string, attempt int, res invoker.Result,
+	branchID string, generation uint64, attempt int, res invoker.Result,
 ) error {
 	node := flow.Node(branchID)
 	if node == nil || node.Type != dsl.NodeTask {
@@ -1907,7 +1993,7 @@ func (e *Engine) completeBranch(
 		return nil
 	}
 
-	evalItem, marshalErr := faninEvalWorkItem(exec.ID, faninID)
+	evalItem, marshalErr := faninEvalWorkItem(exec.ID, faninID, faninEvalGeneration(flow, exec, faninID))
 	if marshalErr != nil {
 		return marshalErr
 	}
@@ -1915,7 +2001,9 @@ func (e *Engine) completeBranch(
 	nextAttempt := attempt + 1
 	retryAt := time.Now().Add(backoff(node, nextAttempt, e.cfg.RetryBaseDelay, e.cfg.RetryMaxDelay)).UTC()
 
-	retryItem, marshalErr := branchRetryWorkItem(exec.ID, branchID, nextAttempt, retryAt)
+	branchGeneration := branchGenerationForRetry(exec, branchID, generation)
+
+	retryItem, marshalErr := branchRetryWorkItem(exec.ID, branchID, branchGeneration, nextAttempt, retryAt)
 	if marshalErr != nil {
 		return marshalErr
 	}
@@ -1939,7 +2027,7 @@ func (e *Engine) completeBranch(
 		var mutErr error
 
 		_, mutErr = settleBranchAttempt(
-			ex, node, branchID, attempt, res, outputVersion, evalItem, retryItem, retryAt)
+			ex, node, branchID, generation, attempt, res, outputVersion, evalItem, retryItem, retryAt)
 
 		return mutErr
 	})
@@ -1987,13 +2075,45 @@ func faninOwnsBranch(flow *dsl.Flow, faninID, branchID string) bool {
 	return false
 }
 
+func faninEvalGeneration(flow *dsl.Flow, exec *store.Execution, faninID string) uint64 {
+	current := flow.Node(exec.CurrentNode)
+	if current == nil {
+		return 0
+	}
+
+	switch current.Type {
+	case dsl.NodeFanin:
+		if exec.CurrentNode == faninID {
+			return exec.NodeGeneration
+		}
+	case dsl.NodeFanout:
+		if flow.Successor(current.ID) == faninID {
+			return nextWorkGeneration(exec.NodeGeneration)
+		}
+	}
+
+	return 0
+}
+
+func branchGenerationForRetry(exec *store.Execution, branchID string, generation uint64) uint64 {
+	if generation != 0 {
+		return generation
+	}
+
+	if bs, ok := exec.Branches[branchID]; ok {
+		return bs.Generation
+	}
+
+	return 0
+}
+
 // settleBranchAttempt is completeBranch's Mutate callback: on the fresh
 // document, it decides whether the dispatched attempt still applies and, if
 // so, records the branch's next state (settled or bumped for redispatch),
 // committing the fanin re-evaluation when it settles or the scheduled
 // redispatch when it retries in the same write.
 func settleBranchAttempt(
-	ex *store.Execution, node *dsl.Node, branchID string, attempt int, res invoker.Result,
+	ex *store.Execution, node *dsl.Node, branchID string, generation uint64, attempt int, res invoker.Result,
 	outputVersion string, evalItem, retryItem json.RawMessage, retryAt time.Time,
 ) (action string, err error) {
 	// Decide on the fresh document: a Cancel (or completion) that landed
@@ -2003,7 +2123,10 @@ func settleBranchAttempt(
 	}
 
 	bs, ok := ex.Branches[branchID]
-	if !ok || bs.Status != store.BranchPending || bs.Attempt != attempt {
+	if !ok ||
+		bs.Status != store.BranchPending ||
+		(generation != 0 && bs.Generation != generation) ||
+		bs.Attempt != attempt {
 		return branchSettleSkip, errSkip
 	}
 
@@ -2043,15 +2166,18 @@ func nextBranchState(
 ) (next store.BranchState, action string) {
 	switch res.Status {
 	case invoker.StatusOK:
-		return store.BranchState{NodeID: branchID, Status: store.BranchCompleted, Attempt: attempt}, branchSettleSettled
+		return store.BranchState{
+			NodeID: branchID, Status: store.BranchCompleted, Generation: bs.Generation, Attempt: attempt,
+		}, branchSettleSettled
 	case invoker.StatusError:
 		return store.BranchState{
-			NodeID: branchID, Status: store.BranchFailed, Error: res.Error, Attempt: attempt,
+			NodeID: branchID, Status: store.BranchFailed, Generation: bs.Generation, Error: res.Error, Attempt: attempt,
 		}, branchSettleSettled
 	case invoker.StatusRetry, invoker.StatusPending: // transient/retry
 		if attempt+1 >= maxAttempts(node) {
 			return store.BranchState{
-				NodeID: branchID, Status: store.BranchFailed, Error: retryReason(res, nil), Attempt: attempt,
+				NodeID: branchID, Status: store.BranchFailed,
+				Generation: bs.Generation, Error: retryReason(res, nil), Attempt: attempt,
 			}, branchSettleSettled
 		}
 
@@ -2062,8 +2188,9 @@ func nextBranchState(
 
 	return store.BranchState{
 		NodeID: branchID, Status: store.BranchFailed,
-		Error:   fmt.Sprintf("branch %s: unknown result status %q", branchID, res.Status),
-		Attempt: attempt,
+		Generation: bs.Generation,
+		Error:      fmt.Sprintf("branch %s: unknown result status %q", branchID, res.Status),
+		Attempt:    attempt,
 	}, branchSettleSettled
 }
 
@@ -2101,7 +2228,7 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 		return fmt.Errorf("execution %s has no current node to resume", execID)
 	}
 
-	item, err := advanceWorkItem(execID, ex.CurrentNode, 0, time.Time{})
+	item, err := advanceWorkItem(execID, ex.CurrentNode, nextWorkGeneration(ex.NodeGeneration), 0, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -2113,6 +2240,7 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 
 		ex.Status = store.StatusRunning
 		ex.Attempt = 0
+		ex.NodeGeneration++
 		ex.Error = ""
 		ex.Activity = nil
 		ex.RetryAt = time.Time{}
@@ -2201,11 +2329,29 @@ func truncateReason(reason string) string {
 // stale failure — from a duplicate delivery or an instance that lost its lease
 // mid-invocation — cannot fail an execution that has already moved on.
 func (e *Engine) failNode(ctx context.Context, execID, nodeID, reason string) error {
+	return e.failNodeGuarded(ctx, execID, nodeID, 0, -1, reason)
+}
+
+func (e *Engine) failTaskNode(ctx context.Context, exec *store.Execution, nodeID, reason string) error {
+	return e.failNodeGuarded(ctx, exec.ID, nodeID, exec.NodeGeneration, exec.Attempt, reason)
+}
+
+func (e *Engine) failNodeGuarded(
+	ctx context.Context, execID, nodeID string, generation uint64, attempt int, reason string,
+) error {
 	reason = truncateReason(reason)
 
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() || (nodeID != "" && ex.CurrentNode != nodeID) {
 			return errSkip // terminal or moved on: stale failure, leave unchanged
+		}
+
+		if generation != 0 && ex.NodeGeneration != generation {
+			return errSkip
+		}
+
+		if attempt >= 0 && ex.Attempt != attempt {
+			return errSkip
 		}
 
 		ex.Status = store.StatusFailed

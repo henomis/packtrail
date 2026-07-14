@@ -589,17 +589,43 @@ func (s *Server) Signal(ctx context.Context, execID, name string, payload json.R
 	return s.signals.Publish(ctx, execID, name, payload)
 }
 
-// CompleteActivity settles an asynchronous activity a node's Invoker previously
-// reported as StatusPending. node and attempt identify the dispatched work (from
-// Request.NodeID / Request.Attempt); res is its outcome. It is idempotent and
-// stale-safe — a duplicate or out-of-date completion is a no-op — so an
-// at-least-once worker can call it freely.
+// SignalWithID sends an external signal with a caller-supplied idempotency key.
+// Reusing the same key for the same execution/signal within the signal stream's
+// duplicate window collapses ambiguous publish retries into one stream entry.
+func (s *Server) SignalWithID(
+	ctx context.Context, execID, name, idempotencyKey string, payload json.RawMessage,
+) error {
+	if err := s.Init(ctx); err != nil {
+		return err
+	}
+
+	return s.signals.PublishWithID(ctx, execID, name, idempotencyKey, payload)
+}
+
+// CompleteActivity settles an asynchronous activity using the legacy attempt-only
+// identity. Prefer CompleteActivityWithGeneration when Request.Generation is
+// available so stale completions from earlier node visits cannot settle a later
+// legal cycle or resume.
 func (s *Server) CompleteActivity(ctx context.Context, execID, node string, attempt int, res Result) error {
 	if err := s.Init(ctx); err != nil {
 		return err
 	}
 
 	return s.engine.CompleteActivity(ctx, execID, node, attempt, res)
+}
+
+// CompleteActivityWithGeneration settles an asynchronous activity for a specific
+// node visit generation. Use Request.Generation from the original asynchronous
+// dispatch to prevent stale completions from earlier legal cycles or resumes
+// settling a later visit with the same node/attempt.
+func (s *Server) CompleteActivityWithGeneration(
+	ctx context.Context, execID, node string, generation uint64, attempt int, res Result,
+) error {
+	if err := s.Init(ctx); err != nil {
+		return err
+	}
+
+	return s.engine.CompleteActivityWithGeneration(ctx, execID, node, generation, attempt, res)
 }
 
 // Resume revives a failed execution, re-running the node it failed on with a

@@ -70,6 +70,8 @@ type Execution struct {
 	FlowName    string `json:"flow_name"`
 	CurrentNode string `json:"current_node"`
 	Status      string `json:"status"`
+	// execution-scoped visit generation for CurrentNode; increments on node entry
+	NodeGeneration uint64 `json:"node_generation,omitempty"`
 	// attempts spent on CurrentNode (task retries)
 	Attempt int `json:"attempt"`
 	// node ids with a stored output, in settle order
@@ -110,6 +112,26 @@ func (e *Execution) SetOutput(node, version string) {
 	}
 
 	e.OutputVersions[node] = version
+}
+
+// ClearOutput removes node's selected output from the control plane. The payload
+// object itself may remain in the data plane until execution cleanup; without the
+// selection Results will not read it.
+func (e *Execution) ClearOutput(node string) {
+	if len(e.Outputs) > 0 {
+		outputs := e.Outputs[:0]
+		for _, out := range e.Outputs {
+			if out != node {
+				outputs = append(outputs, out)
+			}
+		}
+
+		e.Outputs = outputs
+	}
+
+	if e.OutputVersions != nil {
+		delete(e.OutputVersions, node)
+	}
 }
 
 // OutputVersion returns the committed version for node, or "" for legacy output
@@ -176,21 +198,23 @@ func (e *Execution) DropOutbox(flushed map[uint64]bool) (changed bool) {
 // "completion before wait" race). The parking task consumes it instead of
 // waiting. Status mirrors the invoker status string ("ok"/"error"/"retry").
 type ActivityResult struct {
-	Node    string          `json:"node"`
-	Attempt int             `json:"attempt"`
-	Status  string          `json:"status"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-	Error   string          `json:"error,omitempty"`
+	Node       string          `json:"node"`
+	Generation uint64          `json:"generation,omitempty"`
+	Attempt    int             `json:"attempt"`
+	Status     string          `json:"status"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 // BranchState is the persisted control state of a single fanout branch; a
 // completed branch's result lives in the data plane and is selected by
 // Execution.OutputVersions when versioned.
 type BranchState struct {
-	NodeID  string `json:"node_id"`
-	Status  string `json:"status"`
-	Attempt int    `json:"attempt,omitempty"` // attempts spent on this branch (async retries)
-	Error   string `json:"error,omitempty"`
+	NodeID     string `json:"node_id"`
+	Status     string `json:"status"`
+	Generation uint64 `json:"generation,omitempty"` // fanout visit generation that dispatched this branch
+	Attempt    int    `json:"attempt,omitempty"`    // attempts spent on this branch (async retries)
+	Error      string `json:"error,omitempty"`
 }
 
 // Active reports whether the execution is still in progress.

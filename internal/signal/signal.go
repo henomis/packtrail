@@ -44,6 +44,8 @@ var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // dropped by the stream's age limit.
 const defaultRetention = 7 * 24 * time.Hour
 
+const signalDedupWindow = 2 * time.Minute
+
 // Signals publishes and consumes external signals within one namespace.
 type Signals struct {
 	js        jetstream.JetStream
@@ -77,11 +79,12 @@ func (s *Signals) Subject(execID, name string) string { return s.prefix + execID
 // EnsureStream creates the signals stream if it does not exist.
 func (s *Signals) EnsureStream(ctx context.Context) error {
 	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      s.stream,
-		Subjects:  []string{s.prefix + ">"},
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
-		MaxAge:    s.retention,
+		Name:       s.stream,
+		Subjects:   []string{s.prefix + ">"},
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		MaxAge:     s.retention,
+		Duplicates: dedupWindow(s.retention),
 	})
 	if err != nil {
 		return fmt.Errorf("signals stream: %w", err)
@@ -90,9 +93,24 @@ func (s *Signals) EnsureStream(ctx context.Context) error {
 	return nil
 }
 
+func dedupWindow(retention time.Duration) time.Duration {
+	if retention > 0 && retention < signalDedupWindow {
+		return retention
+	}
+
+	return signalDedupWindow
+}
+
 // Publish sends a signal for execID/name with the given payload. Both execID
 // and name must match [A-Za-z0-9_-]{1,128} (they become subject tokens).
 func (s *Signals) Publish(ctx context.Context, execID, name string, payload []byte) error {
+	return s.PublishWithID(ctx, execID, name, "", payload)
+}
+
+// PublishWithID sends a signal with an optional caller-supplied idempotency key.
+// Reusing the same key for the same execution/signal within the stream's
+// duplicate window collapses ambiguous publish retries into one stream entry.
+func (s *Signals) PublishWithID(ctx context.Context, execID, name, idempotencyKey string, payload []byte) error {
 	if !tokenPattern.MatchString(execID) {
 		return fmt.Errorf("signal: invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
 	}
@@ -101,7 +119,17 @@ func (s *Signals) Publish(ctx context.Context, execID, name string, payload []by
 		return fmt.Errorf("signal: invalid signal name %q: must match [A-Za-z0-9_-]{1,128}", name)
 	}
 
-	_, err := s.js.Publish(ctx, s.Subject(execID, name), payload)
+	opts := []jetstream.PublishOpt(nil)
+
+	if idempotencyKey != "" {
+		if !tokenPattern.MatchString(idempotencyKey) {
+			return fmt.Errorf("signal: invalid idempotency key %q: must match [A-Za-z0-9_-]{1,128}", idempotencyKey)
+		}
+
+		opts = append(opts, jetstream.WithMsgID(execID+"."+name+"."+idempotencyKey))
+	}
+
+	_, err := s.js.Publish(ctx, s.Subject(execID, name), payload, opts...)
 
 	return err
 }

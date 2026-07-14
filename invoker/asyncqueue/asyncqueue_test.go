@@ -29,10 +29,11 @@ import (
 )
 
 type completion struct {
-	execID  string
-	node    string
-	attempt int
-	res     invoker.Result
+	execID     string
+	node       string
+	generation uint64
+	attempt    int
+	res        invoker.Result
 }
 
 // fakeCompleter records CompleteActivity calls and signals each on a channel.
@@ -46,7 +47,21 @@ func newFakeCompleter() *fakeCompleter { return &fakeCompleter{ch: make(chan str
 
 func (f *fakeCompleter) CompleteActivity(_ context.Context, execID, node string, attempt int, res invoker.Result) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, completion{execID, node, attempt, res})
+	f.calls = append(f.calls, completion{execID: execID, node: node, attempt: attempt, res: res})
+	f.mu.Unlock()
+
+	f.ch <- struct{}{}
+
+	return nil
+}
+
+func (f *fakeCompleter) CompleteActivityWithGeneration(
+	_ context.Context, execID, node string, generation uint64, attempt int, res invoker.Result,
+) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, completion{
+		execID: execID, node: node, generation: generation, attempt: attempt, res: res,
+	})
 	f.mu.Unlock()
 
 	f.ch <- struct{}{}
@@ -174,11 +189,17 @@ func TestDispatcherDedupsSameAttempt(t *testing.T) {
 
 	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
 
-	req := invoker.Request{ExecutionID: "e1", NodeID: "n1", Attempt: 0, Target: "agentA"}
+	req := invoker.Request{ExecutionID: "e1", NodeID: "n1", Generation: 1, Attempt: 0, Target: "agentA"}
 	for range 2 {
 		if _, err := d.Invoke(ctx, req); err != nil {
 			t.Fatalf("invoke: %v", err)
 		}
+	}
+
+	req.Generation = 2
+
+	if _, err := d.Invoke(ctx, req); err != nil {
+		t.Fatalf("invoke new generation: %v", err)
 	}
 
 	stream, err := srv.JS.Stream(ctx, asyncqueue.StreamName(prefix, kind))
@@ -191,9 +212,9 @@ func TestDispatcherDedupsSameAttempt(t *testing.T) {
 		t.Fatalf("info: %v", err)
 	}
 
-	// Same exec.node.attempt collapses to a single enqueued job.
-	if info.State.Msgs != 1 {
-		t.Errorf("queued msgs after duplicate dispatch: got %d, want 1", info.State.Msgs)
+	// Same exec.node.generation.attempt collapses, but a new generation enqueues.
+	if info.State.Msgs != 2 {
+		t.Errorf("queued msgs after duplicate/new-generation dispatches: got %d, want 2", info.State.Msgs)
 	}
 }
 
@@ -223,7 +244,7 @@ func TestWorkerRunsExecAndCompletes(t *testing.T) {
 
 	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
 	if _, err := d.Invoke(ctx, invoker.Request{
-		ExecutionID: "e1", NodeID: "n1", Attempt: 0, Target: "agentA", Payload: []byte(`"hello"`),
+		ExecutionID: "e1", NodeID: "n1", Generation: 7, Attempt: 0, Target: "agentA", Payload: []byte(`"hello"`),
 	}); err != nil {
 		t.Fatalf("invoke: %v", err)
 	}
@@ -244,8 +265,11 @@ func TestWorkerRunsExecAndCompletes(t *testing.T) {
 	}
 
 	c := calls[0]
-	if c.execID != "e1" || c.node != "n1" || c.attempt != 0 {
-		t.Errorf("completion ids: got (%q,%q,%d), want (e1,n1,0)", c.execID, c.node, c.attempt)
+	if c.execID != "e1" || c.node != "n1" || c.generation != 7 || c.attempt != 0 {
+		t.Errorf(
+			"completion ids: got (%q,%q,%d,%d), want (e1,n1,7,0)",
+			c.execID, c.node, c.generation, c.attempt,
+		)
 	}
 
 	if c.res.Status != invoker.StatusOK || string(c.res.Payload) != `"hello"` {

@@ -192,7 +192,7 @@ func TestCompleteBranchSkipsCancelledExecution(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 
-	if err = eng.completeBranch(ctx, flow, snapshot, "b2", 0,
+	if err = eng.completeBranch(ctx, flow, snapshot, "b2", 0, 0,
 		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"b2":1}`)}); err != nil {
 		t.Fatalf("completeBranch: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestBranchRetryOutboxRedrivesPendingAttempt(t *testing.T) {
 
 	retryAt := time.Now().Add(-time.Second).UTC()
 
-	item, err := branchRetryWorkItem("branch-retry-crash-1", "x", 1, retryAt)
+	item, err := branchRetryWorkItem("branch-retry-crash-1", "x", 0, 1, retryAt)
 	if err != nil {
 		t.Fatalf("marshal retry item: %v", err)
 	}

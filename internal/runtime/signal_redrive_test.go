@@ -174,7 +174,7 @@ func TestGuardedAdvanceFlushFailureLeavesDurableOutbox(t *testing.T) {
 	realJS := eng.js
 	eng.js = &failPublishJS{JetStream: realJS}
 
-	if err := eng.guardedAdvance(ctx, "sig-flushfail-1", "gate", "go", "work"); err == nil {
+	if err := eng.guardedAdvance(ctx, "sig-flushfail-1", "gate", 0, "go", "work"); err == nil {
 		t.Fatal("guardedAdvance with broken publish returned nil, want the flush error surfaced")
 	}
 
@@ -216,4 +216,55 @@ func TestGuardedAdvanceFlushFailureLeavesDurableOutbox(t *testing.T) {
 
 	ex, _ = st.Get(ctx, "sig-flushfail-1")
 	t.Fatalf("execution stranded after re-flush: status=%q node=%q", ex.Status, ex.CurrentNode)
+}
+
+func TestGuardedAdvanceRejectsStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	st, eng := signalHarness(t, invoker.Func(func(_ context.Context, req invoker.Request) (invoker.Result, error) {
+		return invoker.Result{Status: invoker.StatusOK, Payload: req.Payload}, nil
+	}))
+
+	exec := &store.Execution{
+		ID:             "sig-stale-generation",
+		FlowName:       "sig-redrive",
+		Status:         store.StatusWaiting,
+		CurrentNode:    "gate",
+		NodeGeneration: 2,
+		WaitSignal:     "go",
+	}
+	if _, err := st.Create(ctx, exec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := eng.guardedAdvance(ctx, exec.ID, "gate", 1, "go", "work"); err != nil {
+		t.Fatalf("stale guardedAdvance: %v", err)
+	}
+
+	afterStale, err := st.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+
+	if afterStale.Status != store.StatusWaiting ||
+		afterStale.CurrentNode != "gate" ||
+		afterStale.NodeGeneration != 2 ||
+		afterStale.WaitSignal != "go" {
+		t.Fatalf("after stale guardedAdvance = %+v, want unchanged signal wait", afterStale)
+	}
+
+	if err = eng.guardedAdvance(ctx, exec.ID, "gate", 2, "go", "work"); err != nil {
+		t.Fatalf("fresh guardedAdvance: %v", err)
+	}
+
+	afterFresh, err := st.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+
+	if afterFresh.Status != store.StatusRunning ||
+		afterFresh.CurrentNode != "work" ||
+		afterFresh.NodeGeneration != 3 ||
+		afterFresh.WaitSignal != "" {
+		t.Fatalf("after fresh guardedAdvance = %+v, want running work generation 3", afterFresh)
+	}
 }

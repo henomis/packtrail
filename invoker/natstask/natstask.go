@@ -57,6 +57,7 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 		ExecutionID: req.ExecutionID,
 		NodeID:      req.NodeID,
 		Payload:     req.Payload,
+		Generation:  req.Generation,
 		Attempt:     req.Attempt,
 		Deadline:    req.Deadline,
 	}

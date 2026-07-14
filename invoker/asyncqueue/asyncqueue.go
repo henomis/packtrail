@@ -48,19 +48,27 @@ import (
 )
 
 // Completer settles an asynchronous activity back on the packtrail engine.
-// *packtrail.Server satisfies it.
+// *packtrail.Server satisfies it; workers use its generation-aware completion
+// method when the concrete completer exposes one.
 type Completer interface {
 	CompleteActivity(ctx context.Context, execID, node string, attempt int, res invoker.Result) error
+}
+
+type generationCompleter interface {
+	CompleteActivityWithGeneration(
+		ctx context.Context, execID, node string, generation uint64, attempt int, res invoker.Result,
+	) error
 }
 
 // job is the durable work item a Dispatcher publishes and a Worker consumes. It
 // carries only generic invoker.Request fields — nothing about the kind of work.
 type job struct {
-	ExecID  string          `json:"exec_id"`
-	Node    string          `json:"node"`
-	Attempt int             `json:"attempt"`
-	Target  string          `json:"target"`
-	Payload json.RawMessage `json:"payload"`
+	ExecID     string          `json:"exec_id"`
+	Node       string          `json:"node"`
+	Generation uint64          `json:"generation,omitempty"`
+	Attempt    int             `json:"attempt"`
+	Target     string          `json:"target"`
+	Payload    json.RawMessage `json:"payload"`
 	// Timeout is the node's per-call duration budget, captured at dispatch from
 	// req.Deadline. It is a duration (not the absolute deadline) on purpose: an
 	// async job may sit queued arbitrarily long before a worker runs it, and that
@@ -102,8 +110,9 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, prefix, kind stri
 
 // Dispatcher implements invoker.Invoker by publishing a durable job and reporting
 // it as pending, so the engine parks the execution and frees its slot for the
-// node's whole runtime. The job's dedup id is exec.node.attempt, so a redelivered
-// dispatch of the same attempt is collapsed; a genuine retry (new attempt) is not.
+// node's whole runtime. The job's dedup id is exec.node.generation.attempt, so a
+// redelivered dispatch of the same attempt is collapsed; a genuine retry, Resume,
+// or legal cycle revisit is not.
 type Dispatcher struct {
 	js      jetstream.JetStream
 	subject string
@@ -117,18 +126,19 @@ func NewDispatcher(js jetstream.JetStream, prefix, kind string) *Dispatcher {
 // Invoke publishes the job and reports it as pending.
 func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.Result, error) {
 	data, err := json.Marshal(job{
-		ExecID:  req.ExecutionID,
-		Node:    req.NodeID,
-		Attempt: req.Attempt,
-		Target:  req.Target,
-		Payload: req.Payload,
-		Timeout: nodeTimeout(req.Deadline),
+		ExecID:     req.ExecutionID,
+		Node:       req.NodeID,
+		Generation: req.Generation,
+		Attempt:    req.Attempt,
+		Target:     req.Target,
+		Payload:    req.Payload,
+		Timeout:    nodeTimeout(req.Deadline),
 	})
 	if err != nil {
 		return invoker.Result{}, err
 	}
 
-	msgID := req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
+	msgID := jobMsgID(req)
 
 	_, err = d.js.Publish(ctx, d.subject, data, jetstream.WithMsgID(msgID))
 	if err != nil {
@@ -137,6 +147,15 @@ func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.R
 	}
 
 	return invoker.Result{Status: invoker.StatusPending}, nil
+}
+
+func jobMsgID(req invoker.Request) string {
+	if req.Generation != 0 {
+		return req.ExecutionID + "." + req.NodeID + "." +
+			strconv.FormatUint(req.Generation, 10) + "." + strconv.Itoa(req.Attempt)
+	}
+
+	return req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
 }
 
 // nodeTimeout converts the request's absolute deadline (set by the engine to

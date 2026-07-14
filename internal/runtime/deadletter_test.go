@@ -16,6 +16,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -152,5 +153,44 @@ func TestDeadLetterUnknownKind(t *testing.T) {
 	got := h.waitStatus(t, ex.ID, store.StatusFailed, 3*time.Second)
 	if !strings.Contains(got.Error, "bogus-kind") {
 		t.Fatalf("failure reason = %q, want it to mention the unknown kind", got.Error)
+	}
+}
+
+// TestFlushOutboxDropsUnknownKind: an outbox item of a kind this binary does not
+// recognize (a newer writer in a mixed-version fleet) is cleared from the outbox
+// so it cannot poison it forever, and a durable dead-letter trace is recorded so
+// the drop is observable rather than only logged (F-034).
+func TestFlushOutboxDropsUnknownKind(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	ctx := context.Background()
+
+	exec := &store.Execution{
+		ID:          "unknown-outbox-kind",
+		FlowName:    "linear",
+		CurrentNode: "a",
+		Status:      store.StatusRunning,
+		Outbox:      []store.OutboxItem{{Kind: "bogus-future-kind", Item: json.RawMessage(`{}`), Seq: 1}},
+	}
+	if _, err := h.store.Create(ctx, exec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	before := h.store.DeadLetters()
+
+	if err := h.engine.flushOutbox(ctx, exec); err != nil {
+		t.Fatalf("flushOutbox: %v", err)
+	}
+
+	got, err := h.store.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if len(got.Outbox) != 0 {
+		t.Fatalf("unknown outbox item not cleared: %v", got.Outbox)
+	}
+
+	if h.store.DeadLetters() <= before {
+		t.Fatalf("no dead-letter trace emitted for the dropped outbox item")
 	}
 }

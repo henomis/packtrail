@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -212,6 +213,22 @@ func (e *Engine) dispatchBranches(
 
 		go func(branchID string) {
 			defer wg.Done()
+
+			// Recover parity with the heartbeat/process guards: runBranch's invoke
+			// already recovers Invoker panics, but a panic in this goroutine's
+			// persist path (PutPayload/persistBranch) would otherwise be unrecovered
+			// on a goroutine with nothing above it and crash the whole engine. Record
+			// it as a dispatch error so the branch stays pending and stepFanout Naks
+			// (the dead-letter cap bounds any re-panic) — failing just this execution.
+			defer func() {
+				if r := recover(); r != nil {
+					e.log.Error("branch dispatch panic",
+						"exec", exec.ID, "branch", branchID,
+						"panic", r, "stack", string(debug.Stack()))
+
+					recordErr(fmt.Errorf("branch %q panicked: %v", branchID, r))
+				}
+			}()
 
 			startAttempt := exec.Branches[branchID].Attempt
 

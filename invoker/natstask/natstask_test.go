@@ -100,6 +100,37 @@ func TestInvokeMapsError(t *testing.T) {
 	}
 }
 
+// TestInvokeRejectsPending verifies an out-of-contract "pending" reply is
+// converted to a permanent error instead of parking the execution in a wait
+// no request/reply worker can ever settle.
+func TestInvokeRejectsPending(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.rogue.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: "pending"}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	inv := natstask.New(srv.NC, "packtrail")
+
+	res, err := inv.Invoke(context.Background(), invoker.Request{Target: "tasks.rogue.x", ExecutionID: "exec-5"})
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	if res.Status != invoker.StatusError {
+		t.Fatalf("status = %q, want error (pending must not park a request/reply node)", res.Status)
+	}
+
+	if res.Error == "" {
+		t.Fatal("expected an actionable error message for the pending reply")
+	}
+}
+
 // TestInvokeNoWorkerReturnsError verifies a request with no responder surfaces a
 // transport error (the engine treats this as a transient failure).
 func TestInvokeNoWorkerReturnsError(t *testing.T) {

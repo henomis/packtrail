@@ -16,6 +16,8 @@ package runtime
 
 import (
 	"context"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,7 +27,7 @@ import (
 // instance, the first to finish must not release the KV lease out from under
 // the second — only the last holder releases it.
 func TestLeaseRefcountSurvivesConcurrentItems(t *testing.T) {
-	_, eng := newIdleEngine(t, guardLinearFlow)
+	_, eng := newIdleEngine(t)
 	ctx := context.Background()
 
 	const execID = "exec-lease"
@@ -66,5 +68,54 @@ func TestLeaseRefcountSurvivesConcurrentItems(t *testing.T) {
 	foreign, err = eng.store.AcquireLease(ctx, execID, "other-owner", time.Second)
 	if err != nil || !foreign {
 		t.Fatalf("foreign acquire after full release: held=%v err=%v", foreign, err)
+	}
+}
+
+// TestLeaseRefcountConcurrentChurn hammers the acquire/retain → release cycle
+// from many goroutines across two executions. Under -race it pins down the
+// per-execution locking: the entry unlink racing a goroutine that still holds
+// the stale pointer, and concurrent map access from unrelated handlers. Every
+// cycle is balanced, so afterwards no KV lease may survive.
+func TestLeaseRefcountConcurrentChurn(t *testing.T) {
+	_, eng := newIdleEngine(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+
+	for g := range 8 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			execID := "exec-churn-" + strconv.Itoa(g%2)
+
+			for range 50 {
+				if !eng.retainLease(execID) {
+					// Same owner everywhere: a self-owned acquire always succeeds.
+					if _, err := eng.store.AcquireLease(ctx, execID, eng.cfg.OwnerID, eng.cfg.LeaseTTL); err != nil {
+						t.Errorf("acquire: %v", err)
+						return
+					}
+
+					eng.trackLease(execID)
+				}
+
+				eng.releaseLease(ctx, execID)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Balanced cycles: the last holder of each execution released its KV lease,
+	// so a foreign owner can acquire both.
+	for g := range 2 {
+		execID := "exec-churn-" + strconv.Itoa(g)
+
+		foreign, err := eng.store.AcquireLease(ctx, execID, "other-owner", time.Second)
+		if err != nil || !foreign {
+			t.Fatalf("foreign acquire of %s after churn: held=%v err=%v", execID, foreign, err)
+		}
 	}
 }

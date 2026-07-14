@@ -382,6 +382,11 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 		return 0, err
 	}
 
+	// Only sweep data-plane entries older than the staleness horizon, revision-
+	// guarded, so a re-Start that recreated one of these ids (same id, new
+	// generation) between the absence check and the delete keeps its fresh data.
+	cutoff := time.Now().Add(-staleAfter)
+
 	pruned := 0
 
 	for _, c := range candidates {
@@ -397,7 +402,7 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 		_ = ix.idxFlow.Delete(ctx, c.flow+sep+c.id)
 		_ = ix.idxStatus.Delete(ctx, c.status+sep+c.id)
 		_ = ix.idxFlow.Delete(ctx, metaKey(c.id))
-		_ = ix.store.DeletePayloads(ctx, c.id) // sweep any data-plane orphans the archive sweep missed
+		_ = ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff) // sweep stale data-plane orphans the archive sweep missed
 		pruned++
 	}
 

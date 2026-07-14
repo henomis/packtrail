@@ -38,16 +38,36 @@ import (
 // NATS rejection or a misrouted subject.
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// defaultRetention is the signals-stream MaxAge when none is configured: an
+// undelivered signal survives an engine outage of up to this long before it is
+// dropped by the stream's age limit.
+const defaultRetention = 7 * 24 * time.Hour
+
 // Signals publishes and consumes external signals within one namespace.
 type Signals struct {
-	js     jetstream.JetStream
-	stream string
-	prefix string // subject prefix, followed by "<execID>.<signalName>"
+	js        jetstream.JetStream
+	stream    string
+	prefix    string // subject prefix, followed by "<execID>.<signalName>"
+	retention time.Duration
 }
 
-// New returns a Signals bound to the given JetStream context and namespace.
+// New returns a Signals bound to the given JetStream context and namespace, with
+// the default signal retention. Override with SetRetention before EnsureStream.
 func New(js jetstream.JetStream, n names.Names) *Signals {
-	return &Signals{js: js, stream: n.StreamSignals, prefix: n.SubjSignalPrefix}
+	return &Signals{js: js, stream: n.StreamSignals, prefix: n.SubjSignalPrefix, retention: defaultRetention}
+}
+
+// SetRetention overrides the signals-stream MaxAge applied by EnsureStream. A
+// positive duration bounds how long an undelivered signal survives; a negative
+// value disables the age limit; zero keeps the current (default) value. Call
+// before EnsureStream.
+func (s *Signals) SetRetention(d time.Duration) {
+	switch {
+	case d > 0:
+		s.retention = d
+	case d < 0:
+		s.retention = 0 // no MaxAge
+	}
 }
 
 // Subject returns the signal subject for an execution and signal name.
@@ -60,7 +80,7 @@ func (s *Signals) EnsureStream(ctx context.Context) error {
 		Subjects:  []string{s.prefix + ">"},
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
-		MaxAge:    7 * 24 * time.Hour,
+		MaxAge:    s.retention,
 	})
 	if err != nil {
 		return fmt.Errorf("signals stream: %w", err)

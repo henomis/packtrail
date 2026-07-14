@@ -216,7 +216,7 @@ func TestCancelDuringSyncInvoke(t *testing.T) {
 
 // newIdleEngine builds an engine without running its consumers, so a test can
 // call unexported transitions directly against hand-crafted execution state.
-func newIdleEngine(t *testing.T, flowYAML string) (*store.Store, *Engine) {
+func newIdleEngine(t *testing.T) (*store.Store, *Engine) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -232,7 +232,7 @@ func newIdleEngine(t *testing.T, flowYAML string) (*store.Store, *Engine) {
 		t.Fatalf("scheduler: %v", err)
 	}
 
-	flow, err := dsl.Parse([]byte(flowYAML))
+	flow, err := dsl.Parse([]byte(guardLinearFlow))
 	if err != nil {
 		t.Fatalf("flow: %v", err)
 	}
@@ -251,7 +251,7 @@ func newIdleEngine(t *testing.T, flowYAML string) (*store.Store, *Engine) {
 // a node the execution has already moved past is a no-op, so a stale instance
 // (lost lease, duplicate delivery) cannot rewind CurrentNode.
 func TestStaleAdvanceNoRewind(t *testing.T) {
-	st, eng := newIdleEngine(t, guardLinearFlow)
+	st, eng := newIdleEngine(t)
 	ctx := context.Background()
 
 	exec := &store.Execution{
@@ -285,7 +285,7 @@ func TestStaleAdvanceNoRewind(t *testing.T) {
 // the execution has moved past is dropped, and a terminal (cancelled) execution
 // is never flipped to failed (which would make it resumable).
 func TestStaleFailNodeNoOverwrite(t *testing.T) {
-	st, eng := newIdleEngine(t, guardLinearFlow)
+	st, eng := newIdleEngine(t)
 	ctx := context.Background()
 
 	// Moved on: failing node a while the execution is at b is a no-op.

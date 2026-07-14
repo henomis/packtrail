@@ -16,6 +16,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/henomis/packtrail/internal/dsl"
 	"github.com/henomis/packtrail/internal/store"
@@ -24,7 +25,9 @@ import (
 // stepChoice evaluates a choice node's rules in order against the assembled
 // invocation context ({input, results, signals}) and advances to the first
 // matching rule's target, or the default. A rule whose expression errors (e.g.
-// a missing field) is treated as no-match so the default still applies.
+// a missing field) is treated as no-match so the default still applies — unless
+// the node sets on_error: fail, which fails the execution on any eval error
+// instead of silently routing to default (for safety-relevant routing).
 func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, exec *store.Execution) error {
 	contextDoc, err := e.assembleContext(ctx, exec)
 	if err != nil {
@@ -50,7 +53,13 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 
 		match, matchErr := prog.Match(contextDoc)
 		if matchErr != nil {
+			if node.OnError == dsl.OnErrorFail {
+				return e.failNode(ctx, exec.ID, node.ID,
+					fmt.Sprintf("choice %s: rule %q evaluation error: %v", node.ID, r.When, matchErr))
+			}
+
 			e.log.Warn("choice rule eval", "node", node.ID, "when", r.When, "err", matchErr)
+
 			continue
 		}
 

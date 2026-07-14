@@ -131,3 +131,33 @@ func recv(t *testing.T, ch <-chan signal.Delivery) signal.Delivery {
 		return signal.Delivery{}
 	}
 }
+
+// TestSetRetentionAppliesToStream verifies SetRetention changes the signals-stream
+// MaxAge that EnsureStream applies, so WithSignalRetention can tune how long an
+// undelivered signal survives an outage (F-023).
+func TestSetRetentionAppliesToStream(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+	n := names.New("")
+
+	sigs := signal.New(srv.JS, n)
+	sigs.SetRetention(48 * time.Hour)
+
+	if err := sigs.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	stream, err := srv.JS.Stream(ctx, n.StreamSignals)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.Config.MaxAge != 48*time.Hour {
+		t.Fatalf("MaxAge = %v, want 48h", info.Config.MaxAge)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -66,19 +67,28 @@ func (s *Store) PutPayload(ctx context.Context, key string, data json.RawMessage
 
 // CreatePayload stores a data-plane entry only if absent — first write wins.
 // Used for the start input: an idempotent Start retry carrying a different
-// payload must not overwrite the input the original execution runs on. An
-// existing entry is left untouched and no error is returned.
-func (s *Store) CreatePayload(ctx context.Context, key string, data json.RawMessage) error {
+// payload must not overwrite the input the original execution runs on. When the
+// key already exists it is left untouched and its current value is returned, so
+// the caller can detect an id being reused with different data instead of
+// silently binding the control plane to another caller's payload; existing is
+// nil when this call created the entry.
+func (s *Store) CreatePayload(
+	ctx context.Context, key string, data json.RawMessage,
+) (existing json.RawMessage, err error) {
 	if s.maxPayloadBytes > 0 && len(data) > s.maxPayloadBytes {
-		return fmt.Errorf("%w: payload %s is %d bytes, limit %d",
+		return nil, fmt.Errorf("%w: payload %s is %d bytes, limit %d",
 			ErrPayloadTooLarge, key, len(data), s.maxPayloadBytes)
 	}
 
-	if _, err := s.payloads.Create(ctx, key, data); err != nil && !errors.Is(err, jetstream.ErrKeyExists) {
-		return err
+	if _, err = s.payloads.Create(ctx, key, data); err != nil {
+		if !errors.Is(err, jetstream.ErrKeyExists) {
+			return nil, err
+		}
+
+		return s.GetPayload(ctx, key)
 	}
 
-	return nil
+	return nil, nil
 }
 
 // GetPayload loads one data-plane entry, or ErrNotFound.
@@ -93,6 +103,56 @@ func (s *Store) GetPayload(ctx context.Context, key string) (json.RawMessage, er
 	}
 
 	return append(json.RawMessage(nil), entry.Value()...), nil
+}
+
+// DeletePayloadsOlderThan removes an execution's data-plane entries created
+// before cutoff, each via a revision-guarded delete. It is the race-safe
+// counterpart to DeletePayloads for the visibility GC, which prunes an id only
+// after confirming the execution is gone from both hot and archive: if that id
+// was meanwhile *recreated* (a re-Start binds the same id), the new generation's
+// entries are young (created after cutoff, so not selected) and/or at a bumped
+// revision (so the guarded delete no-ops), and are never wiped. A non-positive
+// staleness (cutoff in the future) selects every entry but still revision-guards
+// each delete, so a delete that races a recreation still no-ops.
+func (s *Store) DeletePayloadsOlderThan(ctx context.Context, execID string, cutoff time.Time) error {
+	w, err := s.payloads.Watch(ctx, execID+".>", jetstream.IgnoreDeletes(), jetstream.MetaOnly())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil
+		}
+
+		return err
+	}
+	defer func() { _ = w.Stop() }()
+
+	type staleEntry struct {
+		key string
+		rev uint64
+	}
+
+	var stale []staleEntry
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				for _, se := range stale {
+					// Revision-guarded: a concurrent re-Start that recreated this key
+					// bumps its revision, so this delete no-ops rather than wiping the
+					// new generation's data.
+					_ = s.payloads.Delete(ctx, se.key, jetstream.LastRevision(se.rev))
+				}
+
+				return nil
+			}
+
+			if entry.Created().Before(cutoff) {
+				stale = append(stale, staleEntry{entry.Key(), entry.Revision()})
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // DeletePayloads removes every data-plane entry of one execution. Used by the

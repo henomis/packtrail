@@ -224,9 +224,10 @@ func TestWorkerErrorMapsToRetry(t *testing.T) {
 }
 
 // observeCallBudget dispatches one job whose node deadline is now+nodeTimeout
-// (nodeTimeout==0 means "no node deadline") to a worker configured with the given
-// activity-timeout backstop, and returns the call budget (ctx deadline) the
-// embedder's Invoker actually received.
+// (nodeTimeout==0 means "no node deadline"; negative means an already-expired
+// deadline) to a worker configured with the given activity-timeout backstop, and
+// returns the call budget (ctx deadline) the embedder's Invoker actually
+// received.
 func observeCallBudget(t *testing.T, activityTimeout, nodeTimeout time.Duration) time.Duration {
 	t.Helper()
 
@@ -258,7 +259,7 @@ func observeCallBudget(t *testing.T, activityTimeout, nodeTimeout time.Duration)
 	go func() { _ = w.Run(ctx) }()
 
 	req := invoker.Request{ExecutionID: "e1", NodeID: "n1", Target: "agentA"}
-	if nodeTimeout > 0 {
+	if nodeTimeout != 0 {
 		req.Deadline = time.Now().Add(nodeTimeout)
 	}
 
@@ -298,5 +299,15 @@ func TestWorkerActivityTimeoutCaps(t *testing.T) {
 	// No node timeout → the full backstop applies.
 	if got := observeCallBudget(t, 90*time.Second, 0); got < 30*time.Second {
 		t.Fatalf("budget without node timeout = %v, want ~90s (the activityTimeout)", got)
+	}
+}
+
+// TestWorkerExpiredDeadlineFailsFast: a job dispatched with an already-expired
+// node deadline must get a token budget that fails the call immediately — not
+// collapse to 0 ("no node timeout") and run at the full activityTimeout
+// backstop, which would widen the budget exactly when it is exhausted.
+func TestWorkerExpiredDeadlineFailsFast(t *testing.T) {
+	if got := observeCallBudget(t, time.Hour, -time.Second); got > time.Second {
+		t.Fatalf("budget for expired deadline = %v, want ~0 (fail fast), not the 1h backstop", got)
 	}
 }

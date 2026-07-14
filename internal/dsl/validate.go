@@ -16,6 +16,7 @@ package dsl
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -46,6 +47,10 @@ func (f *Flow) Validate() error {
 	if !namePattern.MatchString(f.Name) {
 		return fmt.Errorf(
 			"flow %q: name must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject token and KV key segment)", f.Name)
+	}
+
+	if err := f.validateVersion(); err != nil {
+		return err
 	}
 
 	if len(f.Nodes) == 0 {
@@ -80,9 +85,65 @@ func (f *Flow) Validate() error {
 		}
 	}
 
-	// Build the edge map; an explicit edge defines the single successor of a node.
-	f.next = make(map[string]string, len(f.Edges))
+	if err := f.resolveGraph(); err != nil {
+		return err
+	}
+
+	if err := f.validateFanMembership(); err != nil {
+		return err
+	}
+
+	if err := f.validateFanAdjacency(); err != nil {
+		return err
+	}
+
+	if err := f.rejectUnreachable(); err != nil {
+		return err
+	}
+
+	return f.rejectFanCycles()
+}
+
+// validateVersion checks the flow's schema version: SupportedVersion is accepted;
+// an omitted version is accepted with a warning (it becomes required at v1.0); any
+// other value is rejected so a future/typo'd schema fails fast at parse rather than
+// silently running under assumptions that may not hold.
+func (f *Flow) validateVersion() error {
+	switch strings.TrimSpace(f.Version) {
+	case SupportedVersion:
+		return nil
+	case "":
+		slog.Warn("flow definition has no version; assuming current schema (version will be required at v1.0)",
+			"flow", f.Name, "expected", SupportedVersion)
+
+		return nil
+	default:
+		return fmt.Errorf("flow %q: unsupported version %q (this build supports %q)", f.Name, f.Version, SupportedVersion)
+	}
+}
+
+// resolveGraph builds the edge map (f.next), marks every node with an inbound
+// transition — an explicit edge, or a node-internal transition (fanout branch,
+// fanin wait_for, choice rule target, signal on_timeout) — and determines the
+// unique start node (f.startID), the one node with no inbound transition. It
+// rejects unknown/duplicate/self edges and a missing or ambiguous start node.
+func (f *Flow) resolveGraph() error {
 	inbound := make(map[string]bool)
+
+	if err := f.buildEdges(inbound); err != nil {
+		return err
+	}
+
+	f.markInternalInbound(inbound)
+
+	return f.determineStartNode(inbound)
+}
+
+// buildEdges builds f.next from the explicit edges, recording each edge target
+// as inbound, and rejects an unknown endpoint, a self-edge (an advance loop with
+// no exit), or a node with more than one outgoing edge.
+func (f *Flow) buildEdges(inbound map[string]bool) error {
+	f.next = make(map[string]string, len(f.Edges))
 
 	for _, e := range f.Edges {
 		if f.byID[e.From] == nil {
@@ -93,7 +154,6 @@ func (f *Flow) Validate() error {
 			return fmt.Errorf("flow %q: edge to unknown node %q", f.Name, e.To)
 		}
 
-		// A self-edge is an unconditional advance loop with no exit.
 		if e.From == e.To {
 			return fmt.Errorf("flow %q: node %q has a self-edge (would advance-loop forever)", f.Name, e.From)
 		}
@@ -106,8 +166,13 @@ func (f *Flow) Validate() error {
 		inbound[e.To] = true
 	}
 
-	// Mark targets reachable only via node-internal transitions as inbound, so
-	// they are not mistaken for start nodes (fanout branches, choice/signal targets).
+	return nil
+}
+
+// markInternalInbound records nodes reachable only via a node-internal
+// transition (fanout branch, fanin wait_for, choice rule target, signal
+// on_timeout) as inbound, so they are not mistaken for start nodes.
+func (f *Flow) markInternalInbound(inbound map[string]bool) {
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 		switch n.Type {
@@ -129,8 +194,11 @@ func (f *Flow) Validate() error {
 			}
 		}
 	}
+}
 
-	// Determine the unique start node.
+// determineStartNode sets f.startID to the unique node with no inbound
+// transition, rejecting a flow with no start node or with more than one.
+func (f *Flow) determineStartNode(inbound map[string]bool) error {
 	var starts []string
 
 	for i := range f.Nodes {
@@ -148,19 +216,7 @@ func (f *Flow) Validate() error {
 		return fmt.Errorf("flow %q: multiple start nodes %v (exactly one required)", f.Name, starts)
 	}
 
-	if err := f.validateFanMembership(); err != nil {
-		return err
-	}
-
-	if err := f.validateFanAdjacency(); err != nil {
-		return err
-	}
-
-	if err := f.rejectUnreachable(); err != nil {
-		return err
-	}
-
-	return f.rejectFanCycles()
+	return nil
 }
 
 // rejectUnreachable refuses flows containing nodes no execution can ever
@@ -447,7 +503,7 @@ func (f *Flow) validateTaskNode(n *Node) error {
 
 	if n.Retry != nil {
 		switch strings.TrimSpace(n.Retry.Backoff) {
-		case "", "fixed", "linear", "exponential":
+		case "", BackoffFixed, BackoffLinear, BackoffExponential:
 		default:
 			return fmt.Errorf("flow %q: task node %q: unknown retry.backoff %q (want exponential, linear, or fixed)",
 				f.Name, n.ID, n.Retry.Backoff)
@@ -514,7 +570,8 @@ func (f *Flow) validateNode(n *Node) error {
 			}
 		}
 
-		if jp := strings.TrimSpace(n.JoinPolicy); jp != "" && jp != JoinAll && jp != JoinAny && !strings.HasPrefix(jp, JoinQuorum+":") {
+		jp := strings.TrimSpace(n.JoinPolicy)
+		if jp != "" && jp != JoinAll && jp != JoinAny && !strings.HasPrefix(jp, JoinQuorum+":") {
 			return fmt.Errorf("flow %q: fanin node %q: unknown join_policy %q (want all, any, or quorum:N)",
 				f.Name, n.ID, n.JoinPolicy)
 		}
@@ -595,6 +652,12 @@ func (f *Flow) validateChoiceRules(n *Node, ref func(id, field string) error) er
 		// More than one default silently last-wins at runtime; reject the
 		// ambiguity at load time.
 		return fmt.Errorf("flow %q: choice node %q: only one default rule is allowed", f.Name, n.ID)
+	}
+
+	switch strings.TrimSpace(n.OnError) {
+	case OnErrorDefault, OnErrorFail:
+	default:
+		return fmt.Errorf("flow %q: choice node %q: unknown on_error %q (want \"fail\" or omit)", f.Name, n.ID, n.OnError)
 	}
 
 	return nil

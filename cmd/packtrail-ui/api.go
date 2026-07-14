@@ -133,12 +133,30 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	result, err := a.fetchSummaries(ctx, ids)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	writeJSON(w, result)
+}
+
+// fetchSummaries fetches a summary for each id concurrently. An id archived or
+// pruned between List and Get (ErrNotFound) is an expected skip; any other Get
+// error is returned (first one wins) so the caller surfaces the fault rather than
+// returning a silently-truncated list.
+func (a *api) fetchSummaries(ctx context.Context, ids []string) ([]execSummary, error) {
 	const maxParallel = 32
 
 	out := make([]execSummary, len(ids))
 	sem := make(chan struct{}, maxParallel)
 
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		errMu  sync.Mutex
+		getErr error
+	)
 
 	for i, id := range ids {
 		wg.Add(1)
@@ -149,17 +167,30 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			ex, getErr := a.srv.Get(ctx, id)
-			if getErr == nil {
+			ex, gerr := a.srv.Get(ctx, id)
+			switch {
+			case gerr == nil:
 				out[i] = execSummary{
 					ID: ex.ID, Flow: ex.Flow, Status: ex.Status,
 					CurrentNode: ex.CurrentNode, Error: ex.Error, UpdatedAt: ex.UpdatedAt,
 				}
+			case errors.Is(gerr, packtrail.ErrNotFound):
+				// Expected: gone between List and Get. Skip.
+			default:
+				errMu.Lock()
+				if getErr == nil {
+					getErr = gerr
+				}
+				errMu.Unlock()
 			}
 		}(i, id)
 	}
 
 	wg.Wait()
+
+	if getErr != nil {
+		return nil, getErr
+	}
 
 	result := make([]execSummary, 0, len(out))
 	for _, e := range out {
@@ -168,7 +199,7 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, result)
+	return result, nil
 }
 
 func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {

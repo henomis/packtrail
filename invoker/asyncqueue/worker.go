@@ -271,11 +271,19 @@ func (w *Worker) invoke(ctx context.Context, j job) (res invoker.Result) {
 // the worker's activityTimeout is the ceiling/backstop, and a node that sets a
 // shorter timeout tightens it. A node with no timeout (j.Timeout == 0) runs at
 // the full activityTimeout. A node timeout longer than the backstop is capped at
-// it — raise WithActivityTimeout if longer calls are required.
+// it — raise WithActivityTimeout if longer calls are required. The cap is logged:
+// silently truncating a 2h node timeout to a 5m backstop turns into inexplicable
+// retry/fail loops otherwise, so the mismatch must be diagnosable from the logs.
 func (w *Worker) effectiveTimeout(j job) time.Duration {
 	timeout := w.cfg.activityTimeout
 	if j.Timeout > 0 && j.Timeout < timeout {
 		timeout = j.Timeout
+	}
+
+	if j.Timeout > w.cfg.activityTimeout {
+		w.log.Warn("node timeout capped by activityTimeout backstop",
+			"exec", j.ExecID, "node", j.Node,
+			"node_timeout", j.Timeout, "activity_timeout", w.cfg.activityTimeout)
 	}
 
 	return timeout

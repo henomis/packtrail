@@ -43,6 +43,7 @@ type config struct {
 	reconcileFullCron   string
 	archiveRetention    time.Duration
 	historyRetention    time.Duration
+	signalRetention     time.Duration // 0 = default (7d); < 0 disables the age limit
 	stallRedrive        time.Duration // 0 = engine default (5×AckWait); < 0 disables the watchdog
 
 	invokers       map[string]invoker.Invoker
@@ -196,6 +197,16 @@ func WithReconcileFull(cronExpr string) Option {
 // remain resumable. Without this option the hot bucket retains every execution.
 func WithArchive(retention time.Duration) Option {
 	return func(c *config) { c.archiveRetention = retention }
+}
+
+// WithSignalRetention sets how long the signals stream retains messages (its
+// MaxAge) — the window during which an undelivered signal survives an engine
+// outage before it is dropped. A positive duration sets that window; a negative
+// value disables the age limit (retain until the stream's other limits); zero
+// keeps the default (7 days). Raise it if executions may wait for a signal
+// through a longer outage than a week.
+func WithSignalRetention(d time.Duration) Option {
+	return func(c *config) { c.signalRetention = d }
 }
 
 // WithOwnerID sets this instance's ownership-lease owner id. Defaults to a

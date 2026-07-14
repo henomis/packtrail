@@ -142,21 +142,27 @@ func (d *Dispatcher) Invoke(ctx context.Context, req invoker.Request) (invoker.R
 // default". The conversion happens at dispatch so queue wait does not consume the
 // budget.
 //
-// Caveat: 0 is overloaded — both "no node timeout" and "deadline already expired"
-// (d < 0) map to 0, which effectiveTimeout reads as "run at the full
-// activityTimeout backstop". This is unreachable today because the engine sets
-// Deadline = now+timeout immediately before dispatch, so time.Until is
-// essentially the full budget and never negative; it is only a latent fragility
-// if the dispatch path ever gains latency between setting the deadline and here.
+// An already-expired deadline (d <= 0) is clamped to expiredBudget rather than
+// 0: 0 encodes "no node timeout", which effectiveTimeout reads as "run at the
+// full activityTimeout backstop" — handing a stale call its widest budget
+// exactly when it has none left. The floor makes the call fail fast on its
+// context deadline and re-drive per the node's retry policy instead. The engine
+// sets Deadline = now+timeout immediately before dispatch, so this is only
+// reachable for external dispatcher callers passing stale deadlines.
 func nodeTimeout(deadline time.Time) time.Duration {
 	if deadline.IsZero() {
 		return 0
 	}
 
-	d := time.Until(deadline)
-	if d < 0 {
-		d = 0
+	if d := time.Until(deadline); d > 0 {
+		return d
 	}
 
-	return d
+	return expiredBudget
 }
+
+// expiredBudget is the token per-call budget assigned to a job dispatched with
+// an already-expired deadline: enough to be a valid context timeout, short
+// enough that the call fails immediately rather than running on the worker's
+// full activityTimeout backstop.
+const expiredBudget = time.Millisecond

@@ -64,7 +64,7 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 		done  = make(chan struct{})
 	)
 
-	cc, err := sched.ConsumeFired(ctx, "test-fired-err", 10, nil, func(string, []byte) error {
+	cc, err := sched.ConsumeFired(ctx, "test-fired-err", 10, nil, func(string, []byte, string) error {
 		// Fail the first delivery (Nak), succeed on redelivery (Ack).
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded
@@ -115,7 +115,7 @@ func TestConsumeFiredTerminalDeadLetters(t *testing.T) {
 
 	var calls atomic.Int32
 
-	cc, err := sched.ConsumeFired(ctx, "test-fired-terminal", 10, nil, func(string, []byte) error {
+	cc, err := sched.ConsumeFired(ctx, "test-fired-terminal", 10, nil, func(string, []byte, string) error {
 		calls.Add(1)
 
 		return terminalError{}

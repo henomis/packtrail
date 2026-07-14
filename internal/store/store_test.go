@@ -329,3 +329,40 @@ func TestDeletePayloads(t *testing.T) {
 		t.Fatalf("other execution's entry was swept: %v", err)
 	}
 }
+
+// TestDeletePayloadsOlderThan verifies the age-guarded sweep (F-029): entries
+// created before the cutoff are removed, while a fresh entry (as a recreated
+// execution generation would write) is preserved, so GC cannot wipe a re-Started
+// id's data.
+func TestDeletePayloadsOlderThan(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	// Old entry: created before the cutoff.
+	if err := s.PutPayload(ctx, InputKey("a"), json.RawMessage(`{"old":1}`)); err != nil {
+		t.Fatalf("put old: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	cutoff := time.Now()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Young entry: created after the cutoff (as a recreated generation would write).
+	if err := s.PutPayload(ctx, OutputKey("a", "fresh"), json.RawMessage(`{"new":1}`)); err != nil {
+		t.Fatalf("put young: %v", err)
+	}
+
+	if err := s.DeletePayloadsOlderThan(ctx, "a", cutoff); err != nil {
+		t.Fatalf("delete older than: %v", err)
+	}
+
+	if _, err := s.GetPayload(ctx, InputKey("a")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old entry survived the age-guarded sweep: %v", err)
+	}
+
+	if _, err := s.GetPayload(ctx, OutputKey("a", "fresh")); err != nil {
+		t.Fatalf("fresh entry was swept (age guard failed): %v", err)
+	}
+}

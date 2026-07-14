@@ -166,8 +166,10 @@ func TestRedriveStalledSkips(t *testing.T) {
 		// Async task wait: CompleteActivity owns it (waiting, no WaitSignal, not a fanin).
 		{ID: "skip-async", FlowName: "sig-redrive", Status: store.StatusWaiting, CurrentNode: "work"},
 		// Scheduled retry backoff still pending: quiet is intentional.
-		{ID: "skip-backoff", FlowName: "sig-redrive", Status: store.StatusRunning, CurrentNode: "work", Attempt: 1,
-			RetryAt: time.Now().Add(time.Hour).UTC()},
+		{
+			ID: "skip-backoff", FlowName: "sig-redrive", Status: store.StatusRunning, CurrentNode: "work", Attempt: 1,
+			RetryAt: time.Now().Add(time.Hour).UTC(),
+		},
 		// Terminal: nothing to drive.
 		{ID: "skip-done", FlowName: "sig-redrive", Status: store.StatusCompleted},
 		// Lease held: an instance is actively processing it right now.

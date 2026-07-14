@@ -37,7 +37,7 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 	// The half-started execution: the input landed in the data plane and the
 	// create committed the first work item in its outbox — the flush never ran
 	// (crash).
-	if err := h.store.CreatePayload(ctx, store.InputKey("order-1"), json.RawMessage(`{"orig":true}`)); err != nil {
+	if _, err := h.store.CreatePayload(ctx, store.InputKey("order-1"), json.RawMessage(`{"orig":true}`)); err != nil {
 		t.Fatalf("put input: %v", err)
 	}
 
@@ -57,8 +57,9 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	// The caller retries its Start with the same idempotency key.
-	id, err := h.engine.StartWithID(ctx, "order-1", "async-linear", json.RawMessage(`{"retry":true}`))
+	// The caller retries its Start with the same idempotency key and the same
+	// arguments (the contract for retries).
+	id, err := h.engine.StartWithID(ctx, "order-1", "async-linear", json.RawMessage(`{"orig":true}`))
 	if err != nil {
 		t.Fatalf("retried StartWithID: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 		t.Fatalf("id = %q, want order-1", id)
 	}
 
-	// The repair re-enqueued the first step; first-write wins on the input.
+	// The repair re-enqueued the first step with the original input.
 	r := h.nextReq(t)
 	if r.NodeID != "a" {
 		t.Fatalf("dispatched node = %q, want a", r.NodeID)
@@ -75,6 +76,47 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 
 	if got := parseCtx(t, r.Payload); string(got.Input) != `{"orig":true}` {
 		t.Fatalf("input = %s, want the original (first-write wins)", got.Input)
+	}
+}
+
+// TestStartWithIDRejectsDifferentPayload: reusing an idempotency key with a
+// different payload must return an error, not silently report the existing
+// execution as this caller's own. Without the check, two concurrent StartWithID
+// calls racing the data and control planes could bind one caller's document to
+// the other caller's payload — with both callers told success.
+func TestStartWithIDRejectsDifferentPayload(t *testing.T) {
+	h := newAsyncHarness(t, asyncLinearFlow)
+	ctx := context.Background()
+
+	if _, err := h.engine.StartWithID(ctx, "order-3", "async-linear", json.RawMessage(`{"orig":true}`)); err != nil {
+		t.Fatalf("first StartWithID: %v", err)
+	}
+
+	_, err := h.engine.StartWithID(ctx, "order-3", "async-linear", json.RawMessage(`{"other":true}`))
+	if err == nil {
+		t.Fatal("StartWithID with a different payload succeeded, want mismatch error")
+	}
+
+	// A genuine retry (same arguments) stays idempotent.
+	id, err := h.engine.StartWithID(ctx, "order-3", "async-linear", json.RawMessage(`{"orig":true}`))
+	if err != nil || id != "order-3" {
+		t.Fatalf("same-args retry: id=%q err=%v", id, err)
+	}
+}
+
+// TestStartWithIDRejectsDifferentFlow: reusing an idempotency key against a
+// different flow must return an error rather than idempotent success bound to
+// a flow the caller did not name.
+func TestStartWithIDRejectsDifferentFlow(t *testing.T) {
+	h := newAsyncHarness(t, asyncLinearFlow, sigGuardFlow)
+	ctx := context.Background()
+
+	if _, err := h.engine.StartWithID(ctx, "order-4", "async-linear", nil); err != nil {
+		t.Fatalf("first StartWithID: %v", err)
+	}
+
+	if _, err := h.engine.StartWithID(ctx, "order-4", "sig-guard", nil); err == nil {
+		t.Fatal("StartWithID with a different flow succeeded, want mismatch error")
 	}
 }
 

@@ -244,3 +244,64 @@ edges:
 		t.Fatalf("err = %v, want unreachable ghost rejection", err)
 	}
 }
+
+// TestValidateRejectsUnknownVersion: a version other than SupportedVersion is a
+// future/typo'd schema and must fail fast at parse (F-032).
+func TestValidateRejectsUnknownVersion(t *testing.T) {
+	_, err := Parse([]byte(`
+version: "2.0"
+name: bad-version
+nodes:
+  - {id: a, type: task, subject: "x"}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unsupported version") {
+		t.Fatalf("err = %v, want unsupported-version rejection", err)
+	}
+}
+
+// TestValidateAcceptsVersions: the supported version and an omitted version both
+// parse (omitted is accepted with a warning until v1.0) (F-032).
+func TestValidateAcceptsVersions(t *testing.T) {
+	for _, doc := range []string{
+		"version: \"1.0\"\nname: v\nnodes:\n  - {id: a, type: task, subject: \"x\"}\n",
+		"name: no-version\nnodes:\n  - {id: a, type: task, subject: \"x\"}\n",
+	} {
+		if _, err := Parse([]byte(doc)); err != nil {
+			t.Fatalf("Parse(%q) = %v, want accepted", doc, err)
+		}
+	}
+}
+
+// TestValidateRejectsUnknownOnError: a choice on_error other than "fail" (or
+// omitted) is rejected at parse (F-033).
+func TestValidateRejectsUnknownOnError(t *testing.T) {
+	_, err := Parse([]byte(`
+name: bad-onerror
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: d, type: choice, on_error: retry, rules: [{default: true, to: b}]}
+edges:
+  - {from: a, to: d}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unknown on_error") {
+		t.Fatalf("err = %v, want unknown-on_error rejection", err)
+	}
+}
+
+// TestValidateAcceptsOnErrorFail: on_error: fail is a valid choice option (F-033).
+func TestValidateAcceptsOnErrorFail(t *testing.T) {
+	_, err := Parse([]byte(`
+name: good-onerror
+nodes:
+  - {id: s, type: task, subject: "s"}
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: d, type: choice, on_error: fail, rules: [{when: 'input.x == 1', to: a}, {default: true, to: b}]}
+edges:
+  - {from: s, to: d}
+`))
+	if err != nil {
+		t.Fatalf("Parse = %v, want accepted", err)
+	}
+}

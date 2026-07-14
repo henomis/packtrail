@@ -352,6 +352,8 @@ func (s *Server) Init(ctx context.Context) error {
 	// scheduler's) and the same instance serves both the engine's consumer and
 	// Server.Signal's publishes.
 	signals := signal.New(s.js, s.names)
+	signals.SetRetention(s.cfg.signalRetention) // 0 keeps the default
+
 	if err = signals.EnsureStream(ctx); err != nil {
 		return err
 	}
@@ -499,10 +501,14 @@ func (s *Server) Start(ctx context.Context, flow string, payload json.RawMessage
 
 // StartWithID is an idempotent Start keyed by a caller-supplied execution id
 // (an idempotency key): the first call creates the execution, and any retry with
-// the same id returns that id without creating a duplicate. Use it to make Start
-// safe to retry — e.g. key it on a domain id so a timed-out Start does not spawn
-// a second execution. First-write wins; the id must match [A-Za-z0-9_-]{1,128}.
-// Like Start, the payload must be a JSON object (or empty).
+// the same id and the same arguments returns that id without creating a
+// duplicate. Use it to make Start safe to retry — e.g. key it on a domain id so
+// a timed-out Start does not spawn a second execution. First-write wins, and
+// reuse is checked: a call whose flow or payload differs from what the id is
+// already bound to returns an error instead of silently reporting the existing
+// execution as its own — retries must replay byte-identical arguments. The id
+// must match [A-Za-z0-9_-]{1,128}. Like Start, the payload must be a JSON
+// object (or empty).
 func (s *Server) StartWithID(ctx context.Context, execID, flow string, payload json.RawMessage) (string, error) {
 	if err := s.Init(ctx); err != nil {
 		return "", err
@@ -512,7 +518,14 @@ func (s *Server) StartWithID(ctx context.Context, execID, flow string, payload j
 }
 
 // ScheduleFlow installs a recurring schedule named name that starts flow on the
-// given 6-field cron expression. Reusing name replaces the schedule.
+// given 6-field cron expression ("sec min hour dom mon dow"). Reusing name
+// replaces the schedule.
+//
+// Timing semantics (the JetStream Message Scheduler's, NATS 2.12+): the cron
+// expression is evaluated in UTC, not the server's or the caller's local time
+// zone. Ticks that would have fired while the NATS server was down are skipped,
+// not replayed — after recovery the schedule resumes at its next occurrence, so
+// downtime spanning N ticks starts zero executions for them, never N.
 func (s *Server) ScheduleFlow(ctx context.Context, name, flow, cronExpr string, payload json.RawMessage) error {
 	if err := s.Init(ctx); err != nil {
 		return err
@@ -744,6 +757,17 @@ func (s *Server) ArchiveTerminal(ctx context.Context) (int, error) {
 func (s *Server) reconcileFull(ctx context.Context) error {
 	if err := s.indexer.Reconcile(ctx); err != nil {
 		return err
+	}
+
+	// Reclaim consumed fired-schedule messages (independent of archival) so the
+	// schedule stream does not grow without bound.
+	reclaimed, reclaimErr := s.engine.ReclaimFiredSchedules(ctx)
+	if reclaimErr != nil {
+		return reclaimErr
+	}
+
+	if reclaimed > 0 {
+		slog.Debug("reclaimed fired-schedule messages", "count", reclaimed)
 	}
 
 	if s.cfg.archiveRetention <= 0 {

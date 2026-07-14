@@ -50,8 +50,9 @@ func TestStartWithIDIsIdempotent(t *testing.T) {
 		t.Fatalf("first start: %v", err)
 	}
 
-	// A retry (e.g. the caller timed out) with the same key must not duplicate.
-	id2, err := h.engine.StartWithID(ctx, key, "linear", json.RawMessage(`{"v":2}`))
+	// A retry (e.g. the caller timed out) with the same key and the same
+	// arguments must not duplicate.
+	id2, err := h.engine.StartWithID(ctx, key, "linear", json.RawMessage(`{"v":1}`))
 	if err != nil {
 		t.Fatalf("retry start: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestStartWithIDIsIdempotent(t *testing.T) {
 
 	h.waitStatus(t, key, store.StatusCompleted, 5*time.Second)
 
-	// First-write wins: the input is the first call's, not the retry's.
+	// First-write wins: the input is the first call's.
 	doc, err := h.engine.Results(ctx, key)
 	if err != nil {
 		t.Fatalf("results: %v", err)
@@ -73,7 +74,7 @@ func TestStartWithIDIsIdempotent(t *testing.T) {
 	}
 
 	// A late retry after completion is still a no-op (does not re-run the flow).
-	if id3, lateErr := h.engine.StartWithID(ctx, key, "linear", json.RawMessage(`{"v":3}`)); lateErr != nil || id3 != key {
+	if id3, lateErr := h.engine.StartWithID(ctx, key, "linear", json.RawMessage(`{"v":1}`)); lateErr != nil || id3 != key {
 		t.Fatalf("late retry = %q, %v; want %q, nil", id3, lateErr, key)
 	}
 

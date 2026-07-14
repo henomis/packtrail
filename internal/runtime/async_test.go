@@ -57,12 +57,12 @@ type asyncHarness struct {
 	inv    *pendingInvoker
 }
 
-func newAsyncHarness(t *testing.T, flowYAML string) *asyncHarness {
+func newAsyncHarness(t *testing.T, flowYAML string, moreFlows ...string) *asyncHarness {
 	t.Helper()
-	return newAsyncHarnessCfg(t, flowYAML, Config{})
+	return newAsyncHarnessCfg(t, flowYAML, Config{}, moreFlows...)
 }
 
-func newAsyncHarnessCfg(t *testing.T, flowYAML string, cfg Config) *asyncHarness {
+func newAsyncHarnessCfg(t *testing.T, flowYAML string, cfg Config, moreFlows ...string) *asyncHarness {
 	t.Helper()
 
 	ctx := context.Background()
@@ -78,14 +78,20 @@ func newAsyncHarnessCfg(t *testing.T, flowYAML string, cfg Config) *asyncHarness
 		t.Fatalf("scheduler: %v", err)
 	}
 
-	flow, err := dsl.Parse([]byte(flowYAML))
-	if err != nil {
-		t.Fatalf("flow: %v", err)
+	flows := map[string]*dsl.Flow{}
+
+	for _, y := range append([]string{flowYAML}, moreFlows...) {
+		flow, parseErr := dsl.Parse([]byte(y))
+		if parseErr != nil {
+			t.Fatalf("flow: %v", parseErr)
+		}
+
+		flows[flow.Name] = flow
 	}
 
 	inv := &pendingInvoker{reqs: make(chan invoker.Request, 16)}
 
-	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, cfg)
+	eng, err := New(inv, st, sch, testSignals(t, st), flows, cfg)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}

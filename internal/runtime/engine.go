@@ -141,9 +141,22 @@ type Engine struct {
 	// the same execution). Without it, the first item to finish would release
 	// the KV lease out from under the one still processing, opening the door
 	// for another instance to acquire mid-flight. The KV lease is acquired on
-	// 0→1 and released on 1→0 only.
+	// 0→1 and released on 1→0 only. leaseMu guards only the map itself; each
+	// entry carries its own mutex so the final KV release round-trip serializes
+	// work items of that one execution, never unrelated ones.
 	leaseMu   sync.Mutex
-	leaseRefs map[string]int
+	leaseRefs map[string]*leaseRef
+}
+
+// leaseRef is one execution's in-process lease bookkeeping. Its mutex
+// serializes retain/track/release — including the last holder's KV delete —
+// for that execution only. removed marks an entry that has been unlinked from
+// the map: a goroutine that fetched it before the unlink must re-fetch rather
+// than mutate a refcount nobody can see anymore.
+type leaseRef struct {
+	mu      sync.Mutex
+	refs    int
+	removed bool
 }
 
 // New builds an engine and precompiles every choice expression in flows. flows
@@ -214,47 +227,107 @@ func New(
 		cfg:       cfg,
 		log:       slog.Default().With("owner", cfg.OwnerID),
 		sem:       make(chan struct{}, cfg.MaxConcurrency),
-		leaseRefs: map[string]int{},
+		leaseRefs: map[string]*leaseRef{},
 	}, nil
+}
+
+// getLeaseRef returns execID's live refcount entry, creating it if absent. The
+// map mutex is held only for the lookup/insert — never across NATS I/O. The
+// returned entry may since have been unlinked by a concurrent release; callers
+// detect that via removed (under the entry's own mutex) and re-fetch.
+func (e *Engine) getLeaseRef(execID string) *leaseRef {
+	e.leaseMu.Lock()
+	defer e.leaseMu.Unlock()
+
+	r := e.leaseRefs[execID]
+	if r == nil {
+		r = &leaseRef{}
+		e.leaseRefs[execID] = r
+	}
+
+	return r
 }
 
 // retainLease increments the in-process lease refcount if this instance already
 // holds the lease (refcount > 0), reporting whether it did. The fast path skips
 // the KV round-trip entirely for concurrent work items of one execution.
 func (e *Engine) retainLease(execID string) bool {
-	e.leaseMu.Lock()
-	defer e.leaseMu.Unlock()
+	for {
+		r := e.getLeaseRef(execID)
+		r.mu.Lock()
 
-	if e.leaseRefs[execID] > 0 {
-		e.leaseRefs[execID]++
-		return true
+		if r.removed {
+			r.mu.Unlock()
+			continue // unlinked by a concurrent release: re-fetch the live entry
+		}
+
+		held := r.refs > 0
+		if held {
+			r.refs++
+		}
+
+		r.mu.Unlock()
+
+		return held
 	}
-
-	return false
 }
 
 // trackLease registers a freshly KV-acquired lease in the refcount.
 func (e *Engine) trackLease(execID string) {
-	e.leaseMu.Lock()
-	e.leaseRefs[execID]++
-	e.leaseMu.Unlock()
+	for {
+		r := e.getLeaseRef(execID)
+		r.mu.Lock()
+
+		if r.removed {
+			r.mu.Unlock()
+			continue
+		}
+
+		r.refs++
+		r.mu.Unlock()
+
+		return
+	}
 }
 
 // releaseLease decrements the refcount and, on the last holder, deletes the KV
-// lease. The KV delete happens under the mutex so a concurrent retain/acquire
-// for the same execution cannot interleave between the decision and the delete.
+// lease. The KV delete happens under the entry's mutex so a concurrent
+// retain/acquire for the same execution cannot interleave between the decision
+// and the delete — but the mutex is per-execution, so the network round-trip
+// never serializes work items of unrelated executions.
 func (e *Engine) releaseLease(ctx context.Context, execID string) {
-	e.leaseMu.Lock()
-	defer e.leaseMu.Unlock()
+	for {
+		r := e.getLeaseRef(execID)
+		r.mu.Lock()
 
-	if n := e.leaseRefs[execID] - 1; n > 0 {
-		e.leaseRefs[execID] = n
+		if r.removed {
+			r.mu.Unlock()
+			continue
+		}
+
+		if r.refs > 1 {
+			r.refs--
+			r.mu.Unlock()
+
+			return
+		}
+
+		// Last holder: release the KV lease, then unlink the entry. Unlinking
+		// happens under both mutexes and only after removed is set, so the map
+		// invariantly points at a live entry (or nothing) and any goroutine
+		// holding this stale pointer re-fetches instead of mutating it.
+		_ = e.store.ReleaseLease(ctx, execID, e.cfg.OwnerID)
+
+		r.removed = true
+
+		e.leaseMu.Lock()
+		delete(e.leaseRefs, execID)
+		e.leaseMu.Unlock()
+
+		r.mu.Unlock()
+
 		return
 	}
-
-	delete(e.leaseRefs, execID)
-
-	_ = e.store.ReleaseLease(ctx, execID, e.cfg.OwnerID)
 }
 
 // compilePrograms compiles every non-default choice rule expression up front so
@@ -304,13 +377,14 @@ func (e *Engine) Start(ctx context.Context, flowName string, payload json.RawMes
 
 // StartWithID is an idempotent Start keyed by a caller-supplied execution id (an
 // idempotency key). The first call creates and enqueues the execution; any later
-// call with the same id is a no-op that returns the id unchanged — so a
-// timed-out-then-retried Start produces exactly one execution. First-write wins:
-// the id is bound to the first call's flow and payload; a repeat with a
-// still-valid but different flow/payload returns the existing execution and does
-// not overwrite it. (Note the arguments are validated before the existence check,
-// so a retry that supplies an unknown flow or a non-object payload returns that
-// validation error rather than the existing id — retries should replay the same
+// call with the same id and the same arguments is a no-op that returns the id
+// unchanged — so a timed-out-then-retried Start produces exactly one execution.
+// First-write wins, and reuse is checked: the id is bound to the first call's
+// flow and byte-identical payload; a repeat naming a different flow or carrying
+// a different payload returns an error rather than silently reporting the
+// existing execution as its own. (The arguments are also validated before the
+// existence check, so a retry that supplies an unknown flow or a non-object
+// payload returns that validation error — retries must replay the same
 // arguments.) The id must match [A-Za-z0-9_-]{1,128} (it becomes a NATS subject
 // token and KV key); supply a stable key such as your domain id (e.g.
 // "order-12345"). Like Start, the payload must be a JSON object (or empty).
@@ -368,9 +442,20 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 	// write is create-if-absent — first write wins — so an idempotent Start
 	// retry carrying a different payload cannot overwrite the input the
 	// original execution runs on. A crash before Create leaves a tiny orphaned
-	// entry the retry reuses.
-	if err := e.store.CreatePayload(ctx, store.InputKey(id), payload); err != nil {
+	// entry the retry reuses. A pre-existing input that differs from this
+	// call's payload is a contract violation (the id was reused with different
+	// arguments) and errors out here: without the check, two concurrent
+	// StartWithID calls racing the two planes could bind one caller's document
+	// to the other caller's payload — with both callers told success.
+	existing, err := e.store.CreatePayload(ctx, store.InputKey(id), payload)
+	if err != nil {
 		return "", err
+	}
+
+	if existing != nil && !bytes.Equal(existing, payload) {
+		return "", fmt.Errorf(
+			"execution id %q is already bound to a different input payload: "+
+				"an idempotency key must be retried with byte-identical arguments", id)
 	}
 
 	exec := &store.Execution{
@@ -394,7 +479,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 		if errors.Is(err, store.ErrAlreadyExists) {
 			// Idempotent: this id already started. Re-flush anything the
 			// original commit left unpublished before returning it.
-			if repairErr := e.repairStart(ctx, id); repairErr != nil {
+			if repairErr := e.repairStart(ctx, id, flowName); repairErr != nil {
 				return "", repairErr
 			}
 
@@ -419,8 +504,10 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 // repairStart heals the crash window between the create and the first outbox
 // flush: a retried Start/StartWithID re-flushes whatever the original commit
 // left unpublished. The flush is msg-id-deduped, so nudging an id whose first
-// item is merely still in the queue publishes nothing new.
-func (e *Engine) repairStart(ctx context.Context, id string) error {
+// item is merely still in the queue publishes nothing new. A retry naming a
+// different flow than the one the id is bound to is a contract violation and
+// errors instead of masquerading as idempotent success.
+func (e *Engine) repairStart(ctx context.Context, id, flowName string) error {
 	ex, err := e.store.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -428,6 +515,11 @@ func (e *Engine) repairStart(ctx context.Context, id string) error {
 		}
 
 		return err
+	}
+
+	if ex.FlowName != flowName {
+		return fmt.Errorf("execution id %q is bound to flow %q, not %q: "+
+			"an idempotency key must be retried with the same arguments", id, ex.FlowName, flowName)
 	}
 
 	return e.flushOutbox(ctx, ex)
@@ -460,9 +552,13 @@ func (e *Engine) flushOutbox(ctx context.Context, exec *store.Execution) error {
 		case store.OutboxSched:
 			pubErr = e.sched.AtID(ctx, exec.ID, msgID, it.At, it.Item)
 		default:
-			// Unknown kind (a newer writer?): it can never publish, so clear it
-			// rather than poisoning the outbox forever.
+			// Unknown kind (a newer writer in a mixed-version fleet): it can never
+			// publish, so clear it rather than poisoning the outbox forever. Emit a
+			// durable dead-letter trace so the dropped item is observable, not just
+			// logged — the upgrade rule is engines first, kind-producing features after.
 			e.log.Error("dropping outbox item of unknown kind", "exec", exec.ID, "kind", it.Kind, "seq", it.Seq)
+			e.emitDeadLetter(ctx, store.DeadLetterWork, exec.ID,
+				fmt.Sprintf("dropped outbox item of unknown kind %q (seq %d)", it.Kind, it.Seq), 0)
 
 			flushed[it.Seq] = true
 
@@ -592,6 +688,14 @@ func (e *Engine) ScheduleFlow(ctx context.Context, name, flowName, cronExpr stri
 	}
 
 	return e.sched.Cron(ctx, name, "start."+flowName, cronExpr, payload)
+}
+
+// ReclaimFiredSchedules purges already-processed fired-schedule messages from
+// the schedule stream (see scheduler.ReclaimFired), bounding the growth of
+// consumed fire.* messages. It is safe to run on the full-reconcile cadence.
+// Returns how many messages were purged.
+func (e *Engine) ReclaimFiredSchedules(ctx context.Context) (uint64, error) {
+	return e.sched.ReclaimFired(ctx, e.names.DurFired)
 }
 
 // OnReconcileActive registers the callback fired by the active-set reconcile
@@ -852,8 +956,15 @@ func (e *Engine) Run(ctx context.Context) error {
 // the matching callback, starts a new execution for a "start.<flow>" cron key (a
 // removed flow is terminal, so the tick dead-letters rather than Nak-looping), and
 // otherwise re-injects the fired payload as a work item on its execution subject.
-func (e *Engine) handleFired(ctx context.Context) func(key string, payload []byte) error {
-	return func(key string, payload []byte) error {
+//
+// firedID is a stable per-firing idempotency key (the fired message's stream
+// sequence). A cron tick can be redelivered — the handler Naks on a transient
+// Start fault, or the ack itself is lost after the Start — so the execution is
+// created via StartWithID keyed on firedID: every redelivery of the same tick
+// resolves to the same id and dedups on the KV create, producing exactly one
+// execution per firing instead of one per delivery.
+func (e *Engine) handleFired(ctx context.Context) func(key string, payload []byte, firedID string) error {
+	return func(key string, payload []byte, firedID string) error {
 		switch key {
 		case reconcileActiveKey:
 			if e.onReconcileActive != nil {
@@ -874,6 +985,15 @@ func (e *Engine) handleFired(ctx context.Context) func(key string, payload []byt
 				// The scheduled flow was removed; every cron tick would Nak forever.
 				// Terminal: the fired consumer dead-letters this tick.
 				return terminal("cron start: unknown flow %q", flowName)
+			}
+
+			// StartWithID keyed on the firing makes a redelivered tick idempotent.
+			// firedID is empty only when metadata is unavailable; fall back to a
+			// random id then (a rare best-effort at-least-once tick).
+			if firedID != "" {
+				_, startErr := e.StartWithID(ctx, "cron-"+firedID, flowName, payload)
+
+				return startErr
 			}
 
 			_, startErr := e.Start(ctx, flowName, payload)
@@ -999,24 +1119,54 @@ func (e *Engine) deliveriesExhausted(msg jetstream.Msg) bool {
 	return meta.NumDelivered >= uint64(e.cfg.MaxDeliver) //nolint:gosec // MaxDeliver is a small positive config value
 }
 
+// deadLetterHardCapMult bounds how long deadLetter keeps Nak-ing when it cannot
+// record the failure on the execution document. Past MaxDeliver × this multiple
+// the item is Term'd anyway — but only once the durable dead-letter trace is
+// emitted, so the drop is always observable. Until the cap it keeps retrying, so
+// a transient store/NATS blip never loses work.
+const deadLetterHardCapMult = 3
+
 // deadLetter settles a poisoned work item: it fails the execution with reason
 // (best-effort — a missing or already-terminal execution is fine), records a
-// durable dead-letter trace, and Terms the message so it is never redelivered. If
-// the failure cannot be recorded, the message is Naked so a later delivery retries
-// the dead-lettering rather than silently dropping the work.
+// durable dead-letter trace, and Terms the message so it is never redelivered.
+//
+// If the failure cannot be recorded on the document, the message is normally
+// Naked so a later delivery retries the dead-lettering rather than silently
+// dropping the work. A *persistently* broken recording path would Nak forever
+// (livelock); past a hard cap the item is dropped anyway, but only if the durable
+// dead-letter trace lands first — so the drop is never silent. If even the trace
+// cannot be written (total NATS outage) it keeps Nak-ing, which is correct: the
+// loop clears once NATS recovers.
 func (e *Engine) deadLetter(ctx context.Context, msg jetstream.Msg, execID, reason string) {
-	if err := e.fail(ctx, execID, reason); err != nil && !errors.Is(err, store.ErrNotFound) {
-		e.log.Error("dead-letter: record failure", "exec", execID, "err", err)
+	failErr := e.fail(ctx, execID, reason)
+	if failErr == nil || errors.Is(failErr, store.ErrNotFound) {
+		e.emitDeadLetter(ctx, store.DeadLetterWork, execID, reason, deliveries(msg))
+		e.log.Warn("dead-lettered work item", "exec", execID, "reason", reason)
 
-		_ = msg.NakWithDelay(nakDelayLong)
+		_ = msg.Term()
 
 		return
 	}
 
-	e.emitDeadLetter(ctx, store.DeadLetterWork, execID, reason, deliveries(msg))
-	e.log.Warn("dead-lettered work item", "exec", execID, "reason", reason)
+	//nolint:gosec // MaxDeliver is a small positive config value (clamped in New)
+	if deliveries(msg) >= uint64(e.cfg.MaxDeliver)*deadLetterHardCapMult {
+		dl := store.DeadLetter{
+			Kind: store.DeadLetterWork, Key: execID, Deliveries: deliveries(msg),
+			Reason: "failure could not be recorded on the execution (persistent): " + reason,
+		}
+		if emitErr := e.store.EmitDeadLetter(ctx, dl); emitErr == nil {
+			e.log.Error("dropping work item after persistent record failure",
+				"exec", execID, "err", failErr, "reason", reason)
 
-	_ = msg.Term()
+			_ = msg.Term()
+
+			return
+		}
+	}
+
+	e.log.Error("dead-letter: record failure", "exec", execID, "err", failErr)
+
+	_ = msg.NakWithDelay(nakDelayLong)
 }
 
 // emitDeadLetter records a durable dead-letter trace (best-effort: a failure to
@@ -1069,52 +1219,68 @@ func (e *Engine) heartbeat(ctx context.Context, onLost context.CancelFunc, msg j
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						e.log.Error("heartbeat panic",
-							"exec", execID,
-							"panic", r, "stack", string(debug.Stack()))
-						onLost()
-					}
-				}()
-
-				_ = msg.InProgress()
-			}()
-
-			if ctx.Err() != nil {
-				return
-			}
-
-			held, err := e.store.AcquireLease(ctx, execID, e.cfg.OwnerID, e.cfg.LeaseTTL)
-			if err != nil {
-				// A single failed renewal is a blip; a full TTL of them means
-				// the lease may have expired and been taken over while this
-				// instance runs blind — exactly the double-fire window the
-				// heartbeat exists to narrow. Assume lost and abort: the CAS
-				// still fences state and the work redelivers.
-				renewalErrs++
-				if renewalErrs >= heartbeatDivisor {
-					e.log.Warn("lease renewal failing; assuming lost and aborting",
-						"exec", execID, "err", err)
-					onLost()
-
-					return
-				}
-
-				continue
-			}
-
-			renewalErrs = 0
-
-			if !held {
-				e.log.Warn("lease lost during processing; aborting", "exec", execID)
-				onLost()
-
+			if !e.heartbeatTick(ctx, onLost, msg, execID, &renewalErrs) {
 				return
 			}
 		}
 	}
+}
+
+// heartbeatTick performs one heartbeat cycle: it extends the ack window
+// (InProgress, under a panic guard) and renews the ownership lease. It returns
+// false — after calling onLost where appropriate — when processing should abort:
+// the InProgress panic-guard fired (onLost cancels ctx), ctx was cancelled,
+// renewals have failed heartbeatDivisor times in a row, or the lease is no longer
+// held. renewalErrs accumulates transient renewal failures across ticks and is
+// reset on a successful renewal.
+func (e *Engine) heartbeatTick(
+	ctx context.Context, onLost context.CancelFunc, msg jetstream.Msg, execID string, renewalErrs *int,
+) bool {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.log.Error("heartbeat panic",
+					"exec", execID,
+					"panic", r, "stack", string(debug.Stack()))
+				onLost()
+			}
+		}()
+
+		_ = msg.InProgress()
+	}()
+
+	if ctx.Err() != nil {
+		return false
+	}
+
+	held, err := e.store.AcquireLease(ctx, execID, e.cfg.OwnerID, e.cfg.LeaseTTL)
+	if err != nil {
+		// A single failed renewal is a blip; a full TTL of them means the lease
+		// may have expired and been taken over while this instance runs blind —
+		// exactly the double-fire window the heartbeat exists to narrow. Assume
+		// lost and abort: the CAS still fences state and the work redelivers.
+		*renewalErrs++
+		if *renewalErrs >= heartbeatDivisor {
+			e.log.Warn("lease renewal failing; assuming lost and aborting",
+				"exec", execID, "err", err)
+			onLost()
+
+			return false
+		}
+
+		return true // transient blip: keep heartbeating without resetting the count
+	}
+
+	*renewalErrs = 0
+
+	if !held {
+		e.log.Warn("lease lost during processing; aborting", "exec", execID)
+		onLost()
+
+		return false
+	}
+
+	return true
 }
 
 // processGuarded runs process under a top-level panic recovery. process runs on
@@ -1282,7 +1448,31 @@ func (e *Engine) advanceTo(
 // out-of-date completion (the execution already moved on, or a different attempt)
 // is a no-op. It settles either the execution's current task node or a pending
 // fanout branch.
-func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, attempt int, res invoker.Result) error {
+func (e *Engine) CompleteActivity(
+	ctx context.Context, execID, node string, attempt int, res invoker.Result,
+) (err error) {
+	// Top-level panic guard, parity with processGuarded and the invoke guards. The
+	// settle path (settleTask/completeBranch, JSON, store mutates) runs on the
+	// async worker's goroutine or a direct external caller's goroutine — neither
+	// has recovery above it — so an unrecovered panic would crash the hosting
+	// process (and, on the claim path, could strand the execution mid-flip). Recover
+	// into a returned error instead: the worker Naks and retries (bounded by its
+	// delivery cap), and a synchronous caller gets an error rather than a panic.
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("complete activity panic",
+				"exec", execID, "node", node, "attempt", attempt,
+				"panic", r, "stack", string(debug.Stack()))
+
+			err = fmt.Errorf("complete activity panic: %v", r)
+		}
+	}()
+
+	return e.completeActivity(ctx, execID, node, attempt, res)
+}
+
+// completeActivity is CompleteActivity's body, run under its panic guard.
+func (e *Engine) completeActivity(ctx context.Context, execID, node string, attempt int, res invoker.Result) error {
 	if !validExecID(execID) {
 		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
 	}
@@ -1364,6 +1554,15 @@ func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, atte
 		return nil // stashed for stepTask to consume
 	}
 
+	return e.settleClaimedTask(ctx, flow, claimed, node, attempt, res)
+}
+
+// settleClaimedTask settles a task-await node CompleteActivity just claimed
+// (waiting→running). On a transient settle failure it reverts the claim so a
+// redelivered completion re-settles cleanly instead of stranding in running.
+func (e *Engine) settleClaimedTask(
+	ctx context.Context, flow *dsl.Flow, claimed *store.Execution, node string, attempt int, res invoker.Result,
+) error {
 	n := flow.Node(node)
 	if n == nil || n.Type != dsl.NodeTask {
 		return nil
@@ -1371,7 +1570,38 @@ func (e *Engine) CompleteActivity(ctx context.Context, execID, node string, atte
 
 	r, callErr := activityResult(store.ActivityResult{Status: string(res.Status), Payload: res.Payload, Error: res.Error})
 
-	return e.settleTask(ctx, flow, n, claimed, r, callErr)
+	settleErr := e.settleTask(ctx, flow, n, claimed, r, callErr)
+	if settleErr != nil {
+		// The claim above flipped waiting→running. A transient settle failure would
+		// otherwise leave the execution stuck running with no follow-on work: a
+		// redelivered completion would only re-stash it, so recovery would hinge on
+		// the stall watchdog (and be impossible if it is disabled). Revert the claim
+		// to waiting so the worker's redelivered completion re-claims and settles it
+		// directly. Guarded, so a settle that actually advanced (or a Cancel) is
+		// never rewound.
+		e.revertClaim(ctx, claimed.ID, node, attempt)
+	}
+
+	return settleErr
+}
+
+// revertClaim undoes CompleteActivity's waiting→running claim after a transient
+// settle failure, flipping the execution back to waiting so a redelivered
+// completion can re-claim and settle it (instead of stranding in running until
+// the watchdog). It is guarded — it reverts only an execution still running at
+// the claimed node/attempt, so a settleTask that advanced the execution, or a
+// Cancel that landed meanwhile, is left untouched — and best-effort: if the
+// revert itself fails, the stall watchdog remains the backstop.
+func (e *Engine) revertClaim(ctx context.Context, execID, node string, attempt int) {
+	_, _ = e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
+		if ex.Status != store.StatusRunning || ex.CurrentNode != node || ex.Attempt != attempt {
+			return errSkip
+		}
+
+		ex.Status = store.StatusWaiting
+
+		return nil
+	})
 }
 
 // activityResult converts a stored ActivityResult into an invoker.Result and a
@@ -1641,11 +1871,31 @@ func (e *Engine) fail(ctx context.Context, execID, reason string) error {
 	return e.failNode(ctx, execID, "", reason)
 }
 
+// maxFailReasonBytes caps the failure reason stored on the execution document.
+// The reason is control metadata folded into the (size-guarded) document; an
+// unbounded one — e.g. a giant error string from an Invoker, or a message that
+// itself embeds an over-limit payload — could push the document past the size
+// guard and dead-end the very write that records the failure. Truncating keeps
+// the failure path always able to persist; the full detail remains in logs.
+const maxFailReasonBytes = 4096
+
+// truncateReason bounds a failure reason to maxFailReasonBytes so recording a
+// failure can never itself exceed the document-size guard.
+func truncateReason(reason string) string {
+	if len(reason) <= maxFailReasonBytes {
+		return reason
+	}
+
+	return reason[:maxFailReasonBytes] + "… (truncated)"
+}
+
 // failNode is fail additionally guarded on the failing node: when nodeID is
 // non-empty the write applies only while the execution is still at nodeID, so a
 // stale failure — from a duplicate delivery or an instance that lost its lease
 // mid-invocation — cannot fail an execution that has already moved on.
 func (e *Engine) failNode(ctx context.Context, execID, nodeID, reason string) error {
+	reason = truncateReason(reason)
+
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
 		if !ex.Active() || (nodeID != "" && ex.CurrentNode != nodeID) {
 			return errSkip // terminal or moved on: stale failure, leave unchanged

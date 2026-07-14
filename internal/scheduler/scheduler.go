@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -128,6 +129,9 @@ func (s *Scheduler) AtID(ctx context.Context, key, msgID string, when time.Time,
 // Cron installs (or replaces) a recurring schedule named name that delivers
 // payload to FireSubject(key) on the given 6-field cron expression
 // ("sec min hour dom mon dow"). Reusing name replaces the schedule.
+// The server evaluates the expression in UTC, and ticks missed while the
+// server was down are skipped, not replayed (the schedule resumes at its
+// next occurrence).
 func (s *Scheduler) Cron(ctx context.Context, name, key, expr string, payload []byte) error {
 	subj := s.subj + "cron." + name
 	_, err := s.js.Publish(ctx, subj, payload,
@@ -146,8 +150,12 @@ const (
 )
 
 // ConsumeFired sets up a durable consumer that invokes handler for every fired
-// schedule. handler receives the fire subject's key and the original payload.
-// The returned ConsumeContext must be stopped by the caller.
+// schedule. handler receives the fire subject's key, the original payload, and a
+// stable per-firing id (the fired message's stream sequence, identical across
+// redeliveries of the same firing) that the handler can use as an idempotency
+// key — e.g. so a redelivered cron tick starts at most one execution. The id is
+// empty only when the message metadata is unavailable. The returned
+// ConsumeContext must be stopped by the caller.
 //
 // A handler error normally Naks for redelivery, but a fired message is
 // dead-lettered (Term, never redelivered) when the handler returns a terminal
@@ -159,7 +167,7 @@ const (
 func (s *Scheduler) ConsumeFired(
 	ctx context.Context, durable string, maxDeliver int,
 	onDeadLetter func(key, reason string, deliveries uint64),
-	handler func(key string, payload []byte) error,
+	handler func(key string, payload []byte, firedID string) error,
 ) (jetstream.ConsumeContext, error) {
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
 		Durable:       durable,
@@ -174,7 +182,7 @@ func (s *Scheduler) ConsumeFired(
 	return cons.Consume(func(msg jetstream.Msg) {
 		key := msg.Subject()[len(s.fire):]
 
-		handlerErr := handler(key, msg.Data())
+		handlerErr := handler(key, msg.Data(), firedID(msg))
 		if handlerErr == nil {
 			_ = msg.Ack()
 			return
@@ -196,6 +204,65 @@ func (s *Scheduler) ConsumeFired(
 	})
 }
 
+// ReclaimFired purges already-processed fired-schedule messages (sched.fire.*)
+// from the schedule stream: those strictly below the fired consumer's ack floor
+// have been delivered and acked, so they can never be redelivered and are safe to
+// remove. It bounds the otherwise-unbounded growth of consumed fire.* messages
+// (they are not rolled up and Acking does not remove them under LimitsPolicy).
+//
+// It never applies a blanket age/size limit: the same stream retains cron
+// definitions (sched.cron.*) and pending one-shot timers (sched.once.*, e.g. a
+// multi-day signal timeout) indefinitely, so a MaxAge would silently delete a
+// pending timer. The purge is scoped to the fire.> subject and bounded by the ack
+// floor, so definitions and undelivered timers are untouched. Returns the number
+// of messages purged.
+func (s *Scheduler) ReclaimFired(ctx context.Context, durable string) (uint64, error) {
+	stream, err := s.js.Stream(ctx, s.stream)
+	if err != nil {
+		return 0, fmt.Errorf("schedule stream: %w", err)
+	}
+
+	cons, err := stream.Consumer(ctx, durable)
+	if err != nil {
+		return 0, fmt.Errorf("fired consumer: %w", err)
+	}
+
+	info, err := cons.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("fired consumer info: %w", err)
+	}
+
+	// AckFloor.Stream is the highest stream sequence up to which every fire.*
+	// delivery is acked. Purge fire.* messages strictly below it (WithPurgeSequence
+	// purges seq < floor), so the boundary message and anything pending/undelivered
+	// is kept.
+	floor := info.AckFloor.Stream
+	if floor <= 1 {
+		return 0, nil // nothing acked yet
+	}
+
+	before, err := stream.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("stream info: %w", err)
+	}
+
+	if err = stream.Purge(ctx,
+		jetstream.WithPurgeSubject(s.fire+">"), jetstream.WithPurgeSequence(floor)); err != nil {
+		return 0, fmt.Errorf("purge fired: %w", err)
+	}
+
+	after, err := stream.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("stream info: %w", err)
+	}
+
+	if before.State.Msgs < after.State.Msgs {
+		return 0, nil // concurrent growth; report nothing purged rather than underflow
+	}
+
+	return before.State.Msgs - after.State.Msgs, nil
+}
+
 // numDelivered returns a message's delivery count, or 0 if unavailable.
 func numDelivered(msg jetstream.Msg) uint64 {
 	if meta, err := msg.Metadata(); err == nil {
@@ -203,6 +270,19 @@ func numDelivered(msg jetstream.Msg) uint64 {
 	}
 
 	return 0
+}
+
+// firedID returns a stable idempotency id for a fired message: its stream
+// sequence, which is fixed for a stored message and identical across
+// redeliveries. It is empty when metadata is unavailable, in which case the
+// handler falls back to non-idempotent handling.
+func firedID(msg jetstream.Msg) string {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return ""
+	}
+
+	return strconv.FormatUint(meta.Sequence.Stream, 10)
 }
 
 // isTerminal reports whether err (or one it wraps) declares itself non-retryable

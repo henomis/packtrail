@@ -79,6 +79,46 @@ func TestWithFlowsDir(t *testing.T) {
 	}
 }
 
+func TestFlowsSorted(t *testing.T) {
+	srv := natstest.Start(t)
+
+	zFlow := []byte(`
+version: "1.0"
+name: zed
+nodes:
+  - {id: a, type: task, invoker: custom, target: agent-a}
+`)
+	aFlow := []byte(`
+version: "1.0"
+name: alpha
+nodes:
+  - {id: a, type: task, invoker: custom, target: agent-a}
+`)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("flow-sort"),
+		packtrail.WithFlow(zFlow),
+		packtrail.WithFlow(aFlow),
+		packtrail.WithInvoker("custom", okInvoker()),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	if flows := s.Flows(); len(flows) != 2 || flows[0] != "alpha" || flows[1] != "zed" {
+		t.Fatalf("Flows() = %v, want [alpha zed]", flows)
+	}
+
+	listed, err := s.ListFlows(context.Background())
+	if err != nil {
+		t.Fatalf("ListFlows: %v", err)
+	}
+
+	if len(listed) != 2 || listed[0] != "alpha" || listed[1] != "zed" {
+		t.Fatalf("ListFlows() = %v, want [alpha zed]", listed)
+	}
+}
+
 // TestObservabilityMethods runs a flow to completion and exercises every
 // read-side Server method, plus the engine-tuning options passed to New.
 func TestObservabilityMethods(t *testing.T) {

@@ -101,3 +101,18 @@ func TestNewRejectsInvokerKindCollisions(t *testing.T) {
 		t.Errorf("async nats-task kind: err = %v, want rejection", err)
 	}
 }
+
+func TestNewRejectsNilInvokers(t *testing.T) {
+	srv := natstest.Start(t)
+	flow := packtrail.WithFlow([]byte(ghostKindFlow))
+
+	if _, err := packtrail.New(srv.NC, flow, packtrail.WithInvoker("ghost", nil)); err == nil ||
+		!strings.Contains(err.Error(), "nil Invoker") {
+		t.Fatalf("New(WithInvoker nil) err = %v, want nil-invoker rejection", err)
+	}
+
+	if _, err := packtrail.New(srv.NC, flow, packtrail.WithAsyncInvoker("ghost", nil)); err == nil ||
+		!strings.Contains(err.Error(), "nil Invoker") {
+		t.Fatalf("New(WithAsyncInvoker nil) err = %v, want nil-invoker rejection", err)
+	}
+}

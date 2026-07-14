@@ -16,6 +16,7 @@ package packtrail_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,5 +111,28 @@ func TestHistoryDisabled(t *testing.T) {
 	trace, err := s.History(ctx, "whatever", 0)
 	if err != nil || len(trace) != 0 {
 		t.Fatalf("history disabled = %v, %v; want empty, nil", trace, err)
+	}
+}
+
+func TestHistoryRejectsWildcardExecutionID(t *testing.T) {
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("histbadid"),
+		packtrail.WithFlow([]byte(observeFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+		packtrail.WithHistory(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	_, err = s.History(context.Background(), "exec-*", 0)
+	if err == nil {
+		t.Fatal("History accepted wildcard-shaped execution id; want validation error")
+	}
+
+	if !strings.Contains(err.Error(), "invalid execution id") {
+		t.Fatalf("error = %q, want invalid-id rejection", err)
 	}
 }

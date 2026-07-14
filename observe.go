@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -151,6 +152,8 @@ func (s *Server) ListFlows(ctx context.Context) ([]string, error) {
 
 		return nil, err
 	}
+
+	sort.Strings(keys)
 
 	return keys, nil
 }
@@ -301,6 +304,10 @@ func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) 
 // otherwise it returns nothing — and records expire after the configured
 // retention.
 func (s *Server) History(ctx context.Context, execID string, limit int) ([]Event, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}

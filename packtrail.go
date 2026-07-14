@@ -42,7 +42,9 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"regexp"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,6 +133,12 @@ const defaultResultCacheTTL = 24 * time.Hour
 // which become NATS stream/bucket name segments and subject tokens.
 var resourceTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// execIDPattern mirrors runtime's execution-id contract for public read APIs
+// that build NATS subjects directly.
+var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func validExecID(id string) bool { return execIDPattern.MatchString(id) }
+
 // Server is an embeddable packtrail engine instance: it runs the work consumer,
 // visibility indexer and (optionally) reconciliation, and can host built-in
 // nats-task workers in the same process.
@@ -176,36 +184,8 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		o(&c)
 	}
 
-	// The namespace prefixes every bucket, stream, subject and durable name; an
-	// unsafe one would otherwise fail much later with an opaque NATS error.
-	if c.prefix != "" && !resourceTokenPattern.MatchString(c.prefix) {
-		return nil, fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
-	}
-
-	// An async invoker kind names its work-queue stream and subject. Kinds must
-	// also be unambiguous: the registry silently overwrites on re-register, so
-	// a kind registered twice (or both sync and async, or shadowing the
-	// built-in nats-task) would drop an invoker without a trace.
-	asyncKinds := make(map[string]bool, len(c.asyncInvokers))
-
-	for _, ai := range c.asyncInvokers {
-		if !resourceTokenPattern.MatchString(ai.kind) {
-			return nil, fmt.Errorf("invalid async invoker kind %q: must match [A-Za-z0-9_-]{1,64}", ai.kind)
-		}
-
-		if ai.kind == dsl.DefaultInvoker {
-			return nil, fmt.Errorf("async invoker kind %q collides with the built-in nats-task invoker", ai.kind)
-		}
-
-		if asyncKinds[ai.kind] {
-			return nil, fmt.Errorf("async invoker kind %q registered twice", ai.kind)
-		}
-
-		asyncKinds[ai.kind] = true
-
-		if _, alsoSync := c.invokers[ai.kind]; alsoSync {
-			return nil, fmt.Errorf("invoker kind %q registered with both WithInvoker and WithAsyncInvoker", ai.kind)
-		}
+	if err := validateConfig(&c); err != nil {
+		return nil, err
 	}
 
 	js, err := jetstream.New(nc)
@@ -276,6 +256,72 @@ func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 	}
 
 	return nil
+}
+
+func validateConfig(c *config) error {
+	// The namespace prefixes every bucket, stream, subject and durable name; an
+	// unsafe one would otherwise fail much later with an opaque NATS error.
+	if c.prefix != "" && !resourceTokenPattern.MatchString(c.prefix) {
+		return fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
+	}
+
+	for kind, inv := range c.invokers {
+		if isNilInvoker(inv) {
+			return fmt.Errorf("invoker kind %q registered with nil Invoker", kind)
+		}
+	}
+
+	return validateAsyncInvokers(c)
+}
+
+func validateAsyncInvokers(c *config) error {
+	// An async invoker kind names its work-queue stream and subject. Kinds must
+	// also be unambiguous: the registry silently overwrites on re-register, so
+	// a kind registered twice (or both sync and async, or shadowing the
+	// built-in nats-task) would drop an invoker without a trace.
+	asyncKinds := make(map[string]bool, len(c.asyncInvokers))
+
+	for _, ai := range c.asyncInvokers {
+		if isNilInvoker(ai.exec) {
+			return fmt.Errorf("async invoker kind %q registered with nil Invoker", ai.kind)
+		}
+
+		if !resourceTokenPattern.MatchString(ai.kind) {
+			return fmt.Errorf("invalid async invoker kind %q: must match [A-Za-z0-9_-]{1,64}", ai.kind)
+		}
+
+		if ai.kind == dsl.DefaultInvoker {
+			return fmt.Errorf("async invoker kind %q collides with the built-in nats-task invoker", ai.kind)
+		}
+
+		if asyncKinds[ai.kind] {
+			return fmt.Errorf("async invoker kind %q registered twice", ai.kind)
+		}
+
+		asyncKinds[ai.kind] = true
+
+		if _, alsoSync := c.invokers[ai.kind]; alsoSync {
+			return fmt.Errorf("invoker kind %q registered with both WithInvoker and WithAsyncInvoker", ai.kind)
+		}
+	}
+
+	return nil
+}
+
+func isNilInvoker(inv invoker.Invoker) bool {
+	if inv == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(inv)
+	kind := v.Kind()
+
+	return (kind == reflect.Chan ||
+		kind == reflect.Func ||
+		kind == reflect.Interface ||
+		kind == reflect.Map ||
+		kind == reflect.Pointer ||
+		kind == reflect.Slice) && v.IsNil()
 }
 
 // Init provisions every NATS resource the Server needs — KV buckets, streams,
@@ -975,6 +1021,8 @@ func flowNames(flows map[string]*dsl.Flow) []string {
 	for n := range flows {
 		out = append(out, n)
 	}
+
+	sort.Strings(out)
 
 	return out
 }

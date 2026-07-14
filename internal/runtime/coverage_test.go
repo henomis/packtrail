@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,21 +26,21 @@ import (
 	"github.com/henomis/packtrail/invoker"
 )
 
-// waitBranch polls until branch b of execution id reaches status, or fails.
-func waitBranch(t *testing.T, h *asyncHarness, id, b, status string) {
+// waitBranchXFailed polls until branch x of execution id fails, or fails.
+func waitBranchXFailed(t *testing.T, h *asyncHarness, id string) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		ex := h.get(t, id)
-		if ex.Branches[b].Status == status {
+		if ex.Branches["x"].Status == store.BranchFailed {
 			return
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	t.Fatalf("branch %s of %s never reached %q (have %q)", b, id, status, h.get(t, id).Branches[b].Status)
+	t.Fatalf("branch x of %s never reached failed (have %q)", id, h.get(t, id).Branches["x"].Status)
 }
 
 // TestScheduleFlowUnknown verifies ScheduleFlow rejects an unknown flow name.
@@ -179,7 +180,7 @@ func TestAsyncBranchError(t *testing.T) {
 		t.Fatalf("complete x: %v", completeErr)
 	}
 
-	waitBranch(t, h, id, "x", store.BranchFailed)
+	waitBranchXFailed(t, h, id)
 
 	// Settle the other branch OK; the "all" join is unmet → execution fails.
 	if completeErr := h.engine.CompleteActivity(ctx, id, "y", 0,
@@ -210,7 +211,69 @@ func TestAsyncBranchRetryExhausted(t *testing.T) {
 	}
 
 	// No attempts remain for branch x, so retry settles it as failed.
-	waitBranch(t, h, id, "x", store.BranchFailed)
+	waitBranchXFailed(t, h, id)
+}
+
+func TestAsyncBranchUnknownStatusFailsBranch(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanFlow)
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	drainBranchDispatches(t, h)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	if err = h.engine.CompleteActivity(ctx, id, "x", 0, invoker.Result{Status: invoker.Status("bogus")}); err != nil {
+		t.Fatalf("complete x: %v", err)
+	}
+
+	waitBranchXFailed(t, h, id)
+
+	if err = h.engine.CompleteActivity(ctx, id, "y", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"y"}`)}); err != nil {
+		t.Fatalf("complete y: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed)
+	if !strings.Contains(ex.Branches["x"].Error, "unknown result status") {
+		t.Fatalf("branch error = %q, want unknown-status failure", ex.Branches["x"].Error)
+	}
+}
+
+func TestAsyncBranchOversizedOutputFailsBranch(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanFlow)
+	h.store.SetMaxPayloadBytes(128)
+
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	drainBranchDispatches(t, h)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	big := setField(json.RawMessage(`{}`), "blob", strings.Repeat("x", 256))
+	if err = h.engine.CompleteActivity(ctx, id, "x", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: big}); err != nil {
+		t.Fatalf("complete x: %v", err)
+	}
+
+	waitBranchXFailed(t, h, id)
+
+	if err = h.engine.CompleteActivity(ctx, id, "y", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"y"}`)}); err != nil {
+		t.Fatalf("complete y: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed)
+	if !strings.Contains(ex.Branches["x"].Error, "exceeds max size") {
+		t.Fatalf("branch error = %q, want payload-size failure", ex.Branches["x"].Error)
+	}
 }
 
 const asyncFanRetryFlow = `

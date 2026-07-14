@@ -519,7 +519,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 	e.emitEvent(ctx, exec)
 
 	if err = e.flushOutbox(ctx, exec); err != nil {
-		return "", fmt.Errorf(
+		return id, fmt.Errorf(
 			"execution %s created and its first work item committed, but publishing is failing "+
 				"(retry StartWithID with the same id, or the stall watchdog re-publishes it): %w",
 			id, err)
@@ -1858,7 +1858,11 @@ func (e *Engine) completeBranch(
 	// overwritable entry.
 	if res.Status == invoker.StatusOK && len(res.Payload) > 0 {
 		if err := e.store.PutPayload(ctx, store.OutputKey(exec.ID, branchID), res.Payload); err != nil {
-			return err
+			if !errors.Is(err, store.ErrPayloadTooLarge) {
+				return err
+			}
+
+			res = invoker.Result{Status: invoker.StatusError, Error: err.Error()}
 		}
 	}
 
@@ -1986,7 +1990,11 @@ func nextBranchState(
 		return bs, branchSettleRedispatch // stays pending at the new attempt
 	}
 
-	return bs, branchSettleSkip
+	return store.BranchState{
+		NodeID: branchID, Status: store.BranchFailed,
+		Error:   fmt.Sprintf("branch %s: unknown result status %q", branchID, res.Status),
+		Attempt: attempt,
+	}, branchSettleSettled
 }
 
 // settleResult normalises a raw invoke outcome (result + transport error) into a

@@ -79,6 +79,37 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 	}
 }
 
+func TestStartReturnsIDWhenInitialFlushFails(t *testing.T) {
+	ctx := context.Background()
+
+	inv := invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+
+	st, eng := signalHarness(t, inv)
+
+	realJS := eng.js
+	eng.js = &failPublishJS{JetStream: realJS}
+
+	id, err := eng.Start(ctx, "sig-redrive", nil)
+	if err == nil {
+		t.Fatal("Start with broken publish returned nil error, want surfaced flush error")
+	}
+
+	if id == "" {
+		t.Fatal("Start returned empty id even though the execution was committed")
+	}
+
+	ex, getErr := st.Get(ctx, id)
+	if getErr != nil {
+		t.Fatalf("committed execution %q not readable: %v", id, getErr)
+	}
+
+	if len(ex.Outbox) != 1 {
+		t.Fatalf("outbox len = %d, want initial work item durably committed", len(ex.Outbox))
+	}
+}
+
 // TestStartWithIDRejectsDifferentPayload: reusing an idempotency key with a
 // different payload must return an error, not silently report the existing
 // execution as this caller's own. Without the check, two concurrent StartWithID

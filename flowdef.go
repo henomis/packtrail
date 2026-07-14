@@ -15,6 +15,7 @@
 package packtrail
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/henomis/packtrail/internal/dsl"
@@ -81,13 +82,22 @@ type RetryPolicy struct {
 // errors New would raise at startup. It returns the first validation error (which
 // already names the offending flow).
 func ValidateFlowDef(defs ...FlowDef) error {
+	flows := make(map[string]*dsl.Flow, len(defs))
+
 	for _, d := range defs {
-		if _, err := flowDefToDSL(d); err != nil {
+		f, err := flowDefToDSL(d)
+		if err != nil {
 			return err
 		}
+
+		if _, dup := flows[f.Name]; dup {
+			return fmt.Errorf("duplicate flow %q", f.Name)
+		}
+
+		flows[f.Name] = f
 	}
 
-	return nil
+	return compileChoiceRules(flows)
 }
 
 // flowDefToDSL converts a FlowDef into a validated *dsl.Flow.
@@ -106,8 +116,8 @@ func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 			Target:     n.Target,
 			Subject:    n.Subject,
 			Timeout:    dsl.Duration(n.Timeout),
-			Branches:   n.Branches,
-			WaitFor:    n.WaitFor,
+			Branches:   append([]string(nil), n.Branches...),
+			WaitFor:    append([]string(nil), n.WaitFor...),
 			JoinPolicy: n.JoinPolicy,
 			Rules:      rules,
 			SignalName: n.SignalName,

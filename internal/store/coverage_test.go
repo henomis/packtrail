@@ -153,6 +153,34 @@ func TestEmitEvent(t *testing.T) {
 	}
 }
 
+func TestEmitEventDedupesByRevision(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	e := &Execution{ID: "ev-dedupe", FlowName: "flow", Status: StatusRunning, Revision: 3}
+	if err := s.EmitEvent(ctx, e); err != nil {
+		t.Fatalf("emit first: %v", err)
+	}
+
+	if err := s.EmitEvent(ctx, e); err != nil {
+		t.Fatalf("emit duplicate: %v", err)
+	}
+
+	stream, err := s.JS().Stream(ctx, s.Names().StreamEvents)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.State.Msgs != 1 {
+		t.Fatalf("events stream messages = %d, want 1", info.State.Msgs)
+	}
+}
+
 func TestListExecutionKeys(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
@@ -219,18 +247,24 @@ func TestIsWrongLastSeq(t *testing.T) {
 	}
 }
 
-// TestAcquireLeaseContendedTakeover races several instances to take over a single
-// expired lease. Exactly one must win, exercising the CAS-conflict re-read path.
+// TestAcquireLeaseContendedTakeover races several instances to take over a
+// lease revision that has stayed unchanged for a full TTL. Exactly one must win,
+// exercising the CAS-conflict re-read path.
 func TestAcquireLeaseContendedTakeover(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
-	// Seed an already-expired lease so every contender sees a takeover candidate.
+	const ttl = 20 * time.Millisecond
+
 	if ok, _ := s.AcquireLease(ctx, "e", "old", time.Millisecond); !ok {
 		t.Fatal("seed acquire")
 	}
 
-	time.Sleep(20 * time.Millisecond)
+	if ok, _ := s.AcquireLease(ctx, "e", "observer", ttl); ok {
+		t.Fatal("observer took over before recording the first stale observation")
+	}
+
+	time.Sleep(ttl + 10*time.Millisecond)
 
 	const contenders = 8
 
@@ -248,7 +282,7 @@ func TestAcquireLeaseContendedTakeover(t *testing.T) {
 
 			<-start
 
-			ok, err := s.AcquireLease(ctx, "e", string(rune('A'+i)), 30*time.Second)
+			ok, err := s.AcquireLease(ctx, "e", string(rune('A'+i)), ttl)
 			if err != nil {
 				t.Errorf("contender %d: %v", i, err)
 			}
@@ -265,7 +299,7 @@ func TestAcquireLeaseContendedTakeover(t *testing.T) {
 	wg.Wait()
 
 	if wins != 1 {
-		t.Fatalf("expired-lease takeover had %d winners, want exactly 1", wins)
+		t.Fatalf("stale-lease takeover had %d winners, want exactly 1", wins)
 	}
 }
 

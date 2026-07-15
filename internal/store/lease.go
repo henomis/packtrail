@@ -29,19 +29,24 @@ type Lease struct {
 	Expires time.Time `json:"expires"`
 }
 
-func (l Lease) expired() bool { return time.Now().After(l.Expires) }
+type leaseObservation struct {
+	revision uint64
+	at       time.Time
+}
 
 // AcquireLease attempts to take or renew ownership of execID for owner with the
 // given TTL. It succeeds if the key is absent, already owned by owner, or held
-// by an expired lease. The CAS guarantees that at most one *distinct* owner wins
-// a single acquisition race; a write that loses to our own concurrent renewal
-// still counts as held. It returns true if the lease is now held by owner.
+// by another owner whose lease revision has remained unchanged for a full TTL as
+// measured by this process's monotonic clock. The CAS guarantees that at most
+// one distinct owner wins a single acquisition race. It returns true if the
+// lease is now held by owner.
 //
 // This bounds concurrency but is not a hard lock across time: once a lease
-// expires (its holder paused or crashed past the TTL) another instance can
-// acquire it while the original is still mid-invocation. Callers must therefore
-// treat node invocation as at-least-once (the engine renews via heartbeat and
-// aborts on a detected loss to narrow, not eliminate, the overlap window).
+// revision stops advancing for a TTL (its holder paused or crashed) another
+// instance can acquire it while the original is still mid-invocation. Callers
+// must therefore treat node invocation as at-least-once (the engine renews via
+// heartbeat and aborts on a detected loss to narrow, not eliminate, the overlap
+// window).
 //
 //nolint:gocognit,funlen
 func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time.Duration) (bool, error) {
@@ -63,6 +68,8 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 				return false, createErr
 			}
 
+			s.clearLeaseObservation(execID)
+
 			return true, nil
 		}
 
@@ -75,25 +82,21 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 			return false, unmarshalErr
 		}
 
-		if cur.Owner != owner && !cur.expired() {
-			return false, nil // held by someone else
+		if cur.Owner != owner && !s.leaseRevisionStale(execID, entry.Revision(), ttl) {
+			return false, nil // held by someone else that is still heartbeating, or not yet proven stale
 		}
-		// We own it, or it expired: take/renew via CAS at the observed revision.
+
+		// We own it, or the observed foreign lease revision has stayed unchanged
+		// for a full TTL: take/renew via CAS at the observed revision.
 		if _, updateErr := s.leases.Update(ctx, execID, val, entry.Revision()); updateErr != nil {
 			if errors.Is(updateErr, jetstream.ErrKeyExists) || isWrongLastSeq(updateErr) {
-				// Only an unexpired self-owned lease guarantees the conflicting
-				// writer was our own heartbeat: no other instance may touch a
-				// live lease. Once expired, the conflict can be another
-				// instance's takeover — re-read to see who actually won.
-				if cur.Owner == owner && !cur.expired() {
-					return true, nil
-				}
-
-				continue // takeover race: re-read to see who won
+				continue // renewal/takeover race: re-read to see who won
 			}
 
 			return false, updateErr
 		}
+
+		s.clearLeaseObservation(execID)
 
 		return true, nil
 	}
@@ -101,14 +104,15 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 	return false, nil
 }
 
-// LeaseHeld reports whether execID's ownership lease is currently held by any
-// live owner — i.e. some engine instance is actively processing (and
-// heartbeat-renewing) work for this execution right now. An absent or expired
-// lease returns false. Used by the stall watchdog to avoid re-driving an
-// execution whose work is legitimately in flight.
-func (s *Store) LeaseHeld(ctx context.Context, execID string) (bool, error) {
+// LeaseHeld reports whether execID's ownership lease should be treated as held
+// by a live owner — i.e. the lease key exists and its revision has not remained
+// unchanged for a full TTL as observed by this process. Used by the stall
+// watchdog to avoid re-driving an execution whose work is legitimately in flight.
+func (s *Store) LeaseHeld(ctx context.Context, execID string, ttl time.Duration) (bool, error) {
 	entry, err := s.leases.Get(ctx, execID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		s.clearLeaseObservation(execID)
+
 		return false, nil
 	}
 
@@ -121,7 +125,7 @@ func (s *Store) LeaseHeld(ctx context.Context, execID string) (bool, error) {
 		return false, err
 	}
 
-	return !cur.expired(), nil
+	return !s.leaseRevisionStale(execID, entry.Revision(), ttl), nil
 }
 
 // ReleaseLease drops ownership of execID if held by owner. Releasing a lease not
@@ -159,5 +163,40 @@ func (s *Store) ReleaseLease(ctx context.Context, execID, owner string) error {
 		return nil // someone else took over; leave it alone
 	}
 
+	if err == nil {
+		s.clearLeaseObservation(execID)
+	}
+
 	return err
+}
+
+func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
+	}
+
+	now := time.Now()
+
+	s.leaseObsMu.Lock()
+	defer s.leaseObsMu.Unlock()
+
+	if s.leaseObs == nil {
+		s.leaseObs = make(map[string]leaseObservation)
+	}
+
+	obs, ok := s.leaseObs[execID]
+	if !ok || obs.revision != revision {
+		s.leaseObs[execID] = leaseObservation{revision: revision, at: now}
+
+		return false
+	}
+
+	return now.Sub(obs.at) >= ttl
+}
+
+func (s *Store) clearLeaseObservation(execID string) {
+	s.leaseObsMu.Lock()
+	defer s.leaseObsMu.Unlock()
+
+	delete(s.leaseObs, execID)
 }

@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -96,8 +97,49 @@ type Registry struct {
 // NewRegistry returns an empty Registry.
 func NewRegistry() *Registry { return &Registry{m: map[string]Invoker{}} }
 
-// Register binds kind to inv, replacing any previous binding for kind.
-func (r *Registry) Register(kind string, inv Invoker) { r.m[kind] = inv }
+// Register binds kind to inv. It rejects nil invokers and duplicate kinds so a
+// registration mistake cannot silently replace the invoker that will execute
+// later work. Use Replace when replacement is intentional.
+func (r *Registry) Register(kind string, inv Invoker) error {
+	if isNilInvoker(inv) {
+		return fmt.Errorf("invoker: kind %q registered with nil Invoker", kind)
+	}
+
+	if _, ok := r.m[kind]; ok {
+		return fmt.Errorf("invoker: kind %q already registered", kind)
+	}
+
+	r.m[kind] = inv
+
+	return nil
+}
+
+// Replace binds kind to inv, replacing any previous binding for kind.
+func (r *Registry) Replace(kind string, inv Invoker) error {
+	if isNilInvoker(inv) {
+		return fmt.Errorf("invoker: kind %q registered with nil Invoker", kind)
+	}
+
+	r.m[kind] = inv
+
+	return nil
+}
+
+func isNilInvoker(inv Invoker) bool {
+	if inv == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(inv)
+	kind := v.Kind()
+
+	return (kind == reflect.Chan ||
+		kind == reflect.Func ||
+		kind == reflect.Interface ||
+		kind == reflect.Map ||
+		kind == reflect.Pointer ||
+		kind == reflect.Slice) && v.IsNil()
+}
 
 // Has reports whether kind is registered.
 func (r *Registry) Has(kind string) bool { _, ok := r.m[kind]; return ok }

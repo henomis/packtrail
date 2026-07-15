@@ -62,7 +62,7 @@ nodes:
 	cancelled := make(chan struct{}, 1)
 
 	reg := invoker.NewRegistry()
-	reg.Register("block", invoker.Func(func(ic context.Context, _ invoker.Request) (invoker.Result, error) {
+	if err = reg.Register("block", invoker.Func(func(ic context.Context, _ invoker.Request) (invoker.Result, error) {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -76,7 +76,9 @@ nodes:
 		}
 
 		return invoker.Result{Status: invoker.StatusError, Error: "aborted"}, ic.Err()
-	}))
+	})); err != nil {
+		t.Fatalf("register invoker: %v", err)
+	}
 
 	eng, err := New(reg, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow},
 		Config{LeaseTTL: 200 * time.Millisecond, AckWait: 2 * time.Second})

@@ -231,8 +231,8 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 	known := map[string]bool{dsl.DefaultInvoker: true}
 
-	for kind := range c.invokers {
-		known[kind] = true
+	for _, si := range c.invokers {
+		known[si.kind] = true
 	}
 
 	for _, ai := range c.asyncInvokers {
@@ -265,20 +265,26 @@ func validateConfig(c *config) error {
 		return fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
 	}
 
-	for kind, inv := range c.invokers {
-		if isNilInvoker(inv) {
-			return fmt.Errorf("invoker kind %q registered with nil Invoker", kind)
+	syncKinds := make(map[string]bool, len(c.invokers))
+	for _, si := range c.invokers {
+		if isNilInvoker(si.exec) {
+			return fmt.Errorf("invoker kind %q registered with nil Invoker", si.kind)
 		}
+
+		if syncKinds[si.kind] {
+			return fmt.Errorf("invoker kind %q registered twice", si.kind)
+		}
+
+		syncKinds[si.kind] = true
 	}
 
-	return validateAsyncInvokers(c)
+	return validateAsyncInvokers(c, syncKinds)
 }
 
-func validateAsyncInvokers(c *config) error {
+func validateAsyncInvokers(c *config, syncKinds map[string]bool) error {
 	// An async invoker kind names its work-queue stream and subject. Kinds must
-	// also be unambiguous: the registry silently overwrites on re-register, so
-	// a kind registered twice (or both sync and async, or shadowing the
-	// built-in nats-task) would drop an invoker without a trace.
+	// also be unambiguous: a kind registered twice (or both sync and async, or
+	// shadowing the built-in nats-task) would drop an invoker or dispatcher.
 	asyncKinds := make(map[string]bool, len(c.asyncInvokers))
 
 	for _, ai := range c.asyncInvokers {
@@ -300,7 +306,7 @@ func validateAsyncInvokers(c *config) error {
 
 		asyncKinds[ai.kind] = true
 
-		if _, alsoSync := c.invokers[ai.kind]; alsoSync {
+		if syncKinds[ai.kind] {
 			return fmt.Errorf("invoker kind %q registered with both WithInvoker and WithAsyncInvoker", ai.kind)
 		}
 	}
@@ -352,22 +358,9 @@ func (s *Server) Init(ctx context.Context) error {
 		return err
 	}
 
-	// Build the invoker registry: built-in nats-task plus any user invokers.
-	reg := invoker.NewRegistry()
-	reg.Register(natstask.Kind, natstask.New(s.nc, s.prefix))
-
-	for kind, inv := range s.cfg.invokers {
-		reg.Register(kind, inv)
-	}
-
-	// Async invokers: ensure each kind's work-queue stream and register its
-	// Dispatcher (the parking side). The Worker (execution side) is started by Run.
-	for _, ai := range s.cfg.asyncInvokers {
-		if err = asyncqueue.EnsureStream(ctx, s.js, s.prefix, ai.kind, ai.opts...); err != nil {
-			return err
-		}
-
-		reg.Register(ai.kind, asyncqueue.NewDispatcher(s.js, s.prefix, ai.kind))
+	reg, err := s.buildInvokerRegistry(ctx)
+	if err != nil {
+		return err
 	}
 
 	var inv invoker.Invoker = reg
@@ -436,6 +429,39 @@ func (s *Server) Init(ctx context.Context) error {
 	s.initialized.Store(true)
 
 	return nil
+}
+
+func (s *Server) buildInvokerRegistry(ctx context.Context) (*invoker.Registry, error) {
+	reg := invoker.NewRegistry()
+	if err := reg.Register(natstask.Kind, natstask.New(s.nc, s.prefix)); err != nil {
+		return nil, err
+	}
+
+	for _, si := range s.cfg.invokers {
+		if err := registerSyncInvoker(reg, si); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, ai := range s.cfg.asyncInvokers {
+		if err := asyncqueue.EnsureStream(ctx, s.js, s.prefix, ai.kind, ai.opts...); err != nil {
+			return nil, err
+		}
+
+		if err := reg.Register(ai.kind, asyncqueue.NewDispatcher(s.js, s.prefix, ai.kind)); err != nil {
+			return nil, err
+		}
+	}
+
+	return reg, nil
+}
+
+func registerSyncInvoker(reg *invoker.Registry, si syncInvoker) error {
+	if si.kind == natstask.Kind {
+		return reg.Replace(si.kind, si.exec)
+	}
+
+	return reg.Register(si.kind, si.exec)
 }
 
 // compileChoiceRules compiles every non-default choice expression so an invalid

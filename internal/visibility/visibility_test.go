@@ -75,6 +75,25 @@ func waitIndex(t *testing.T, ix *Indexer, status, id string, want bool) {
 	t.Fatalf("ByStatus(%q) membership of %s = %v, want %v (have %v)", status, id, !want, want, ids)
 }
 
+func waitFlow(t *testing.T, ix *Indexer, flow, id string, want bool) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	deadline := time.Now().Add(waitIndexTimeout)
+	for time.Now().Before(deadline) {
+		ids, err := ix.ByFlow(ctx, flow)
+		if err == nil && contains(ids, id) == want {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	ids, _ := ix.ByFlow(ctx, flow)
+	t.Fatalf("ByFlow(%q) membership of %s = %v, want %v (have %v)", flow, id, !want, want, ids)
+}
+
 func mkExec(t *testing.T, st *store.Store, flow string) *store.Execution {
 	t.Helper()
 
@@ -137,6 +156,47 @@ func TestByFlow(t *testing.T) {
 	if !contains(beta, a.ID) || !contains(beta, b.ID) || contains(beta, c.ID) {
 		t.Fatalf("ByFlow(beta) = %v, want {%s,%s} only", beta, a.ID, b.ID)
 	}
+}
+
+func TestIndexCleansPreviousFlowMembership(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "oldflow")
+	waitFlow(t, ix, "oldflow", ex.ID, true)
+
+	updated, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.FlowName = "newflow"
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	_ = st.EmitEvent(ctx, updated)
+
+	waitFlow(t, ix, "newflow", ex.ID, true)
+	waitFlow(t, ix, "oldflow", ex.ID, false)
+}
+
+func TestReconcileCleansPreviousFlowMembership(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "reconcile-old")
+	waitFlow(t, ix, "reconcile-old", ex.ID, true)
+
+	if _, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.FlowName = "reconcile-new"
+
+		return nil
+	}); err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
+	}
+
+	waitFlow(t, ix, "reconcile-new", ex.ID, true)
+	waitFlow(t, ix, "reconcile-old", ex.ID, false)
 }
 
 // TestStaleEventIgnored verifies an out-of-order (lower-revision) event does not
@@ -294,12 +354,74 @@ func TestReconcileRepairsDrift(t *testing.T) {
 		t.Fatalf("expected corrupted index to drop %s", ex.ID)
 	}
 
-	if err := ix.Reconcile(ctx); err != nil {
-		t.Fatalf("reconcile: %v", err)
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
 	}
 
 	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); !contains(ids, ex.ID) {
 		t.Fatalf("reconcile did not restore %s: %v", ex.ID, ids)
+	}
+}
+
+func TestReconcileRestoresArchivedExecution(t *testing.T) {
+	ctx, st, ix := setup(t)
+
+	if err := st.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	ex := &store.Execution{ID: "archived-visible", FlowName: "archflow", Status: store.StatusRunning}
+	if _, err := st.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	ex, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate completed: %v", err)
+	}
+
+	if emitErr := st.EmitEvent(ctx, ex); emitErr != nil {
+		t.Fatalf("emit: %v", emitErr)
+	}
+
+	waitIndex(t, ix, store.StatusCompleted, ex.ID, true)
+
+	moved, err := st.ArchiveTerminal(ctx)
+	if err != nil || moved != 1 {
+		t.Fatalf("archive: moved=%d err=%v, want 1/nil", moved, err)
+	}
+
+	_ = st.IdxStatus().Delete(ctx, store.StatusCompleted+sep+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "archflow"+sep+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, metaKey(ex.ID))
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, ex.ID) {
+		t.Fatalf("precondition: corrupted index still contains %s", ex.ID)
+	}
+
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, ex.ID) {
+		t.Fatalf("reconcile did not restore archived %s by status: %v", ex.ID, ids)
+	}
+
+	if ids, _ := ix.ByFlow(ctx, "archflow"); !contains(ids, ex.ID) {
+		t.Fatalf("reconcile did not restore archived %s by flow: %v", ex.ID, ids)
+	}
+
+	evs, err := ix.ByStatusEvents(ctx, store.StatusCompleted)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	if got := findEvent(t, evs, ex.ID); got.Revision != ex.Revision {
+		t.Fatalf("reconciled archived revision = %d, want final hot revision %d", got.Revision, ex.Revision)
 	}
 }
 

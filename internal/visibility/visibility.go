@@ -170,20 +170,12 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 	}
 
 	if exists && prev.Revision >= ev.Revision {
-		// Stale or duplicate: already indexed at >= this revision. An earlier
-		// conflicted attempt of this very event may have written its status and
-		// flow memberships before losing the CAS; re-assert them from the
-		// authoritative record so the read model matches the winner.
-		if prev.Status != ev.Status {
-			_ = ix.idxStatus.Delete(ctx, ev.Status+sep+ev.ExecID)
-
-			if val, mErr := json.Marshal(prev); mErr == nil {
-				_, _ = ix.idxStatus.Put(ctx, prev.Status+sep+prev.ExecID, val)
-				_, _ = ix.idxFlow.Put(ctx, prev.FlowName+sep+prev.ExecID, val)
-			}
+		applied, reassertErr := ix.reassertIndexedEvent(ctx, prev, ev, kvRev)
+		if reassertErr != nil {
+			return false, reassertErr
 		}
 
-		return true, nil
+		return applied, nil
 	}
 
 	val, err := json.Marshal(ev)
@@ -206,6 +198,12 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 		return false, putErr
 	}
 
+	if exists && prev.FlowName != "" && prev.FlowName != ev.FlowName {
+		if deleteErr := ix.deleteFlowMembership(ctx, prev.FlowName, ev.ExecID); deleteErr != nil {
+			return false, deleteErr
+		}
+	}
+
 	// The meta record is committed last: it is what a later event reads, so a
 	// crash before this point simply reprocesses idempotently. The CAS
 	// (create-if-absent / update-at-revision) fences concurrent indexers.
@@ -220,6 +218,58 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 	}
 
 	return err == nil, err
+}
+
+// reassertIndexedEvent handles a stale or duplicate event: the meta record
+// already points at prev, but a conflicted attempt for stale may have written
+// stale memberships before losing the CAS.
+func (ix *Indexer) reassertIndexedEvent(ctx context.Context, prev, stale store.Event, kvRev uint64) (bool, error) {
+	if prev.Revision == stale.Revision {
+		return true, nil
+	}
+
+	val, err := json.Marshal(prev)
+	if err != nil {
+		return false, err
+	}
+
+	if prev.Status != stale.Status {
+		_ = ix.idxStatus.Delete(ctx, stale.Status+sep+stale.ExecID)
+	}
+
+	if prev.FlowName != stale.FlowName {
+		if deleteErr := ix.deleteFlowMembership(ctx, stale.FlowName, stale.ExecID); deleteErr != nil {
+			return false, deleteErr
+		}
+	}
+
+	if _, err = ix.idxStatus.Put(ctx, prev.Status+sep+prev.ExecID, val); err != nil {
+		return false, err
+	}
+
+	if _, err = ix.idxFlow.Put(ctx, prev.FlowName+sep+prev.ExecID, val); err != nil {
+		return false, err
+	}
+
+	_, err = ix.idxFlow.Update(ctx, metaKey(prev.ExecID), val, kvRev)
+	if errors.Is(err, jetstream.ErrKeyExists) || isWrongLastSeq(err) {
+		return false, nil
+	}
+
+	return err == nil, err
+}
+
+func (ix *Indexer) deleteFlowMembership(ctx context.Context, flow, execID string) error {
+	if flow == "" {
+		return nil
+	}
+
+	err := ix.idxFlow.Delete(ctx, flow+sep+execID)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil
+	}
+
+	return err
 }
 
 // lastIndexed reads the per-execution bookkeeping record: the stored event
@@ -259,15 +309,21 @@ func isWrongLastSeq(err error) bool {
 
 // Reconcile rebuilds the indexes from the source of truth, closing any drift
 // the asynchronous projection may have left behind (spec §9). It streams every
-// execution in packtrail-executions through a single last-per-key watch and
-// authoritatively re-asserts each one's membership, so a full pass costs one
-// round-trip rather than a key listing plus a Get per execution.
+// hot execution in packtrail-executions, then every retained cold execution in
+// the archive, through last-per-key watches and authoritatively re-asserts each
+// one's membership, so a full pass avoids a key listing plus a Get per execution.
 //
-// Per §13 this full scan still grows with the total number of executions ever
-// created; ReconcileActive is the cheap, frequent counterpart that only touches
-// in-flight executions. Run Reconcile infrequently as the deep backstop.
+// Per §13 this full scan still grows with the hot set plus retained archive set;
+// ReconcileActive is the cheap, frequent counterpart that only touches in-flight
+// executions. Run Reconcile infrequently as the deep backstop.
 func (ix *Indexer) Reconcile(ctx context.Context) error {
-	return ix.store.ForEachExecution(ctx, func(ex *store.Execution) error {
+	if err := ix.store.ForEachExecution(ctx, func(ex *store.Execution) error {
+		return ix.reassert(ctx, ex)
+	}); err != nil {
+		return err
+	}
+
+	return ix.store.ForEachArchivedExecution(ctx, func(ex *store.Execution) error {
 		return ix.reassert(ctx, ex)
 	})
 }
@@ -324,6 +380,11 @@ func (ix *Indexer) ReconcileActive(ctx context.Context) error {
 // last-writer-wins against a concurrent event projection, and the periodic
 // reconcile re-runs it anyway.
 func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
+	prev, _, exists, err := ix.lastIndexed(ctx, ex.ID)
+	if err != nil {
+		return err
+	}
+
 	ev := store.Event{
 		ExecID:   ex.ID,
 		FlowName: ex.FlowName,
@@ -351,6 +412,12 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 
 	if _, putErr := ix.idxFlow.Put(ctx, ex.FlowName+sep+ex.ID, val); putErr != nil {
 		return putErr
+	}
+
+	if exists && prev.FlowName != "" && prev.FlowName != ex.FlowName {
+		if deleteErr := ix.deleteFlowMembership(ctx, prev.FlowName, ex.ID); deleteErr != nil {
+			return deleteErr
+		}
 	}
 
 	_, err = ix.idxFlow.Put(ctx, metaKey(ex.ID), val)

@@ -137,6 +137,10 @@ packtrail.WithFlowDef(packtrail.FlowDef{
 `WithFlowDef` may be combined freely with `WithFlow` and `WithFlowsDir`; duplicate
 flow names across any source are rejected at startup.
 
+Use keyed composite literals for `FlowDef` and `NodeDef`. These structs mirror
+the YAML schema and may grow as the schema gains fields (for example `Version`
+and choice-node `OnError`).
+
 - `invoker:` / `Invoker` selects a registered Invoker kind (default `nats-task`).
 - `target:` / `Target` is interpreted by that Invoker (an agent name, a URL, …);
   `subject:` / `Subject` is the nats-task alias. `{execution_id}` is substituted
@@ -197,6 +201,10 @@ evaluated against the assembled context:
   (`==`, `!=`, `<`, `>`), boolean logic (`&&`, `||`, `!`), membership (`in`),
   string and arithmetic operators. Compiled once on load — a syntax error is a
   validation error, not a runtime surprise.
+- **Bounded evaluation.** Choice rules run as straight-line predicates with an
+  explicit VM memory budget. To keep evaluation bounded, validation rejects
+  ranges, iteration helpers (`map`, `filter`, `all`, `any`, `sortBy`, …), and
+  function calls other than `len(...)`.
 - **Variables in scope.** `input` (the start payload), `results` (each visited
   node's output, keyed by node id), `signals` (received signal payloads, keyed
   by signal name), `branches` (the current fan's outputs) and `last_node` (the
@@ -524,4 +532,3 @@ make build-ui         # self-contained packtrail-ui binary in bin/ (assets embed
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
-

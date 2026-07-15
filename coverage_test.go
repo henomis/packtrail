@@ -23,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/henomis/packtrail"
+	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
 )
 
@@ -550,4 +553,97 @@ func TestServerScheduleFlow(t *testing.T) {
 	}); !ok {
 		t.Fatal("scheduled flow did not start any execution")
 	}
+}
+
+// TestFullReconcileReclaimsFiredSchedules verifies the scheduled full-reconcile
+// maintenance path bounds retained sched.fire.* messages instead of leaving
+// cleanup to callers.
+func TestFullReconcileReclaimsFiredSchedules(t *testing.T) {
+	srv := natstest.Start(t)
+
+	const namespace = "full-reclaim"
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace(namespace),
+		packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+		packtrail.WithReconcileFull("* * * * * *"),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	n := names.New(namespace)
+
+	var ackFloor uint64
+
+	if ok := poll(t, 20*time.Second, func() bool {
+		floor, floorErr := firedAckFloor(ctx, srv, n)
+		if floorErr != nil {
+			return false
+		}
+
+		ackFloor = floor
+
+		return floor >= 5
+	}); !ok {
+		t.Fatalf("full reconcile consumed too few fired schedules; ack floor stream sequence = %d", ackFloor)
+	}
+
+	var retained uint64
+	if ok := poll(t, 5*time.Second, func() bool {
+		count, countErr := firedScheduleMessages(ctx, srv, n)
+		if countErr != nil {
+			return false
+		}
+
+		retained = count
+
+		return count <= 2
+	}); !ok {
+		t.Fatalf("retained fired schedule messages = %d, want <= 2 after full-reconcile reclaim", retained)
+	}
+}
+
+func firedAckFloor(ctx context.Context, srv *natstest.Server, n names.Names) (uint64, error) {
+	stream, err := srv.JS.Stream(ctx, n.StreamSchedule)
+	if err != nil {
+		return 0, err
+	}
+
+	consumer, err := stream.Consumer(ctx, n.DurFired)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := consumer.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.AckFloor.Stream, nil
+}
+
+func firedScheduleMessages(ctx context.Context, srv *natstest.Server, n names.Names) (uint64, error) {
+	stream, err := srv.JS.Stream(ctx, n.StreamSchedule)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(n.SubjSchedFirePrefix+">"))
+	if err != nil {
+		return 0, err
+	}
+
+	var total uint64
+	for _, count := range info.State.Subjects {
+		total += count
+	}
+
+	return total, nil
 }

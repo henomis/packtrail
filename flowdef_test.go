@@ -18,6 +18,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/internal/natstest"
@@ -55,6 +56,23 @@ func TestValidateFlowDefRejectsOverCapRetry(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "max_attempts") {
 		t.Fatalf("error = %q, want it to mention max_attempts", err)
+	}
+}
+
+func TestValidateFlowDefRejectsUnsupportedVersion(t *testing.T) {
+	def := packtrail.FlowDef{
+		Version: "2.0",
+		Name:    "bad-version",
+		Nodes:   []packtrail.NodeDef{{ID: "a", Type: "task", Subject: "tasks.a"}},
+	}
+
+	err := packtrail.ValidateFlowDef(def)
+	if err == nil {
+		t.Fatal("unsupported version accepted; want validation error")
+	}
+
+	if !strings.Contains(err.Error(), "unsupported version") {
+		t.Fatalf("error = %q, want unsupported-version rejection", err)
 	}
 }
 
@@ -105,6 +123,31 @@ func TestValidateFlowDefRejectsInvalidChoiceExpression(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "rules: compile") {
 		t.Fatalf("error = %q, want choice compile failure", err)
+	}
+}
+
+func TestValidateFlowDefRejectsInvalidChoiceOnError(t *testing.T) {
+	def := packtrail.FlowDef{
+		Name: "bad-on-error",
+		Nodes: []packtrail.NodeDef{
+			{
+				ID: "pick", Type: "choice", OnError: "retry",
+				Rules: []packtrail.RuleDef{
+					{When: "input.x == 1", To: "done"},
+					{Default: true, To: "done"},
+				},
+			},
+			{ID: "done", Type: "task", Subject: "tasks.done"},
+		},
+	}
+
+	err := packtrail.ValidateFlowDef(def)
+	if err == nil {
+		t.Fatal("invalid choice on_error accepted; want validation error")
+	}
+
+	if !strings.Contains(err.Error(), "unknown on_error") {
+		t.Fatalf("error = %q, want unknown-on_error rejection", err)
 	}
 }
 
@@ -169,4 +212,82 @@ func TestFlowDefConversionCopiesSlices(t *testing.T) {
 	if fanout.Branches[0] != "a" || fanin.WaitFor[0] != "a" {
 		t.Fatalf("flow graph was mutated through caller slices: fanout=%v fanin=%v", fanout.Branches, fanin.WaitFor)
 	}
+}
+
+func TestFlowDefVersionAndChoiceOnErrorFail(t *testing.T) {
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("flowdef-parity"),
+		packtrail.WithFlowDef(packtrail.FlowDef{
+			Version: "1.0",
+			Name:    "choice-onerror-def",
+			Nodes: []packtrail.NodeDef{
+				{
+					ID: "route", Type: "choice", OnError: "fail",
+					Rules: []packtrail.RuleDef{
+						{When: "input.n > input.s", To: "hi"},
+						{Default: true, To: "lo"},
+					},
+				},
+				{ID: "hi", Type: "task", Invoker: "custom", Target: "hi"},
+				{ID: "lo", Type: "task", Invoker: "custom", Target: "lo"},
+			},
+		}),
+		packtrail.WithInvoker("custom", packtrail.InvokerFunc(
+			func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
+				return packtrail.Result{Status: packtrail.StatusOK, Payload: req.Payload}, nil
+			})),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	graph, err := s.FlowGraph(ctx, "choice-onerror-def")
+	if err != nil {
+		t.Fatalf("flow graph: %v", err)
+	}
+
+	if graph.Version != "1.0" {
+		t.Fatalf("graph version = %q, want 1.0", graph.Version)
+	}
+
+	var route *packtrail.GraphNode
+
+	for i := range graph.Nodes {
+		if graph.Nodes[i].ID == "route" {
+			route = &graph.Nodes[i]
+			break
+		}
+	}
+
+	if route == nil || route.OnError != "fail" {
+		t.Fatalf("route graph node = %+v, want on_error fail", route)
+	}
+
+	go func() { _ = s.Run(ctx) }()
+
+	id, err := s.Start(ctx, "choice-onerror-def", []byte(`{"n":1,"s":"a"}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ex, getErr := s.Get(ctx, id)
+		if getErr == nil && ex.Status == packtrail.ExecFailed {
+			if !strings.Contains(ex.Error, "evaluation error") {
+				t.Fatalf("error = %q, want choice evaluation error", ex.Error)
+			}
+
+			return
+		}
+
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	t.Fatal("execution did not fail on choice evaluation error")
 }

@@ -16,6 +16,7 @@ package asyncqueue_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,6 +75,44 @@ func (f *fakeCompleter) snapshot() []completion {
 	defer f.mu.Unlock()
 
 	return append([]completion(nil), f.calls...)
+}
+
+type transientCompleter struct {
+	mu       sync.Mutex
+	failures int
+	calls    int
+	ch       chan error
+}
+
+func newTransientCompleter(failures int) *transientCompleter {
+	return &transientCompleter{failures: failures, ch: make(chan error, 8)}
+}
+
+func (t *transientCompleter) CompleteActivity(
+	context.Context, string, string, int, invoker.Result,
+) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.calls++
+
+	var err error
+
+	if t.failures > 0 {
+		t.failures--
+		err = errors.New("transient completion failure")
+	}
+
+	t.ch <- err
+
+	return err
+}
+
+func (t *transientCompleter) count() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.calls
 }
 
 func TestDispatcherPublishesPending(t *testing.T) {
@@ -274,6 +313,59 @@ func TestWorkerRunsExecAndCompletes(t *testing.T) {
 
 	if c.res.Status != invoker.StatusOK || string(c.res.Payload) != `"hello"` {
 		t.Errorf("completion result: got (%q,%s), want (ok,\"hello\")", c.res.Status, c.res.Payload)
+	}
+}
+
+func TestWorkerResultCacheAvoidsReinvokeAfterCompletionFailure(t *testing.T) {
+	srv := natstest.Start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const prefix, kind = "t", "echo-cache"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "async-worker-result-cache"})
+	if err != nil {
+		t.Fatalf("cache kv: %v", err)
+	}
+
+	var execCount atomic.Int64
+
+	delegate := invoker.Func(func(_ context.Context, req invoker.Request) (invoker.Result, error) {
+		execCount.Add(1)
+
+		return invoker.Result{Status: invoker.StatusOK, Payload: req.Payload}, nil
+	})
+	exec := invoker.NewCacheKeyed(kv, delegate, "w.")
+	completer := newTransientCompleter(1)
+	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, completer, asyncqueue.WithMaxDeliver(3))
+
+	go func() { _ = w.Run(ctx) }()
+
+	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
+	if _, err = d.Invoke(ctx, invoker.Request{
+		ExecutionID: "e1", NodeID: "n1", Generation: 2, Attempt: 0, Target: "agentA", Payload: []byte(`"hello"`),
+	}); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-completer.ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for completion call %d", i+1)
+		}
+	}
+
+	if got := completer.count(); got != 2 {
+		t.Fatalf("CompleteActivity calls = %d, want 2 (first failed, second redelivery settled)", got)
+	}
+
+	if got := execCount.Load(); got != 1 {
+		t.Fatalf("exec invocations = %d, want 1 (redelivery should serve worker cache)", got)
 	}
 }
 

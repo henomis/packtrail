@@ -24,9 +24,10 @@ import (
 // FlowDef is a programmatic flow definition. It mirrors the YAML schema and
 // can be passed to WithFlowDef instead of writing YAML.
 type FlowDef struct {
-	Name  string
-	Nodes []NodeDef
-	Edges []EdgeDef
+	Version string // "1.0"; empty is accepted for legacy parity with YAML
+	Name    string
+	Nodes   []NodeDef
+	Edges   []EdgeDef
 }
 
 // NodeDef is a single node in a FlowDef.
@@ -49,7 +50,8 @@ type NodeDef struct {
 	JoinPolicy string // "all" | "any" | "quorum:N"
 
 	// choice
-	Rules []RuleDef
+	Rules   []RuleDef
+	OnError string // "" routes eval errors to the default rule; "fail" fails the execution
 
 	// signal
 	SignalName string
@@ -120,6 +122,7 @@ func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 			WaitFor:    append([]string(nil), n.WaitFor...),
 			JoinPolicy: n.JoinPolicy,
 			Rules:      rules,
+			OnError:    n.OnError,
 			SignalName: n.SignalName,
 			OnTimeout:  n.OnTimeout,
 		}
@@ -138,9 +141,10 @@ func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 	}
 
 	df := &dsl.Flow{
-		Name:  f.Name,
-		Nodes: nodes,
-		Edges: edges,
+		Version: f.Version,
+		Name:    f.Name,
+		Nodes:   nodes,
+		Edges:   edges,
 	}
 
 	if err := df.Validate(); err != nil {

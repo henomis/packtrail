@@ -68,6 +68,7 @@ type OutboxItem struct {
 type Execution struct {
 	ID          string `json:"id"`
 	FlowName    string `json:"flow_name"`
+	InputHash   string `json:"input_hash,omitempty"`
 	CurrentNode string `json:"current_node"`
 	Status      string `json:"status"`
 	// execution-scoped visit generation for CurrentNode; increments on node entry
@@ -87,8 +88,11 @@ type Execution struct {
 	RetryAt    time.Time       `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
 	Outbox     []OutboxItem    `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
 	OutboxSeq  uint64          `json:"outbox_seq,omitempty"`
-	Revision   uint64          `json:"-"` // current KV revision, for CAS (not persisted in value)
-	UpdatedAt  time.Time       `json:"updated_at"`
+	// ArchivedRevision is persisted only in cold archive records so archived
+	// reconciliation can preserve event ordering from the original hot bucket.
+	ArchivedRevision uint64    `json:"archived_revision,omitempty"`
+	Revision         uint64    `json:"-"` // current KV revision, for CAS (not persisted in hot values)
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // AddOutput records that node's legacy output exists in the data plane. Call

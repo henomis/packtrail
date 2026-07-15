@@ -42,35 +42,40 @@ func (r *raceKV) Update(ctx context.Context, key string, value []byte, revision 
 	return r.KeyValue.Update(ctx, key, value, revision)
 }
 
-// TestAcquireLeaseExpiredRenewalLosesTakeover reproduces the split-brain
-// interleaving: instance A holds an *expired* lease and tries to renew it;
-// between A's read and A's CAS write, instance B takes the expired lease over.
-// A's write then conflicts — and because the lease A observed was expired, the
-// conflicting writer may be B, not A's own heartbeat. A must re-read and report
-// the lease lost, not shortcut to "still mine". (An unexpired self-owned lease
-// may keep the shortcut: nobody else is allowed to write a live lease.)
-func TestAcquireLeaseExpiredRenewalLosesTakeover(t *testing.T) {
+// TestAcquireLeaseRenewalLosesObservedStaleTakeover reproduces the split-brain
+// interleaving: instance A holds a lease and tries to renew it; between A's read
+// and A's CAS write, instance B (which has observed A's revision remain stable
+// for a full TTL) takes the lease over. A's write then conflicts and must re-read
+// and report the lease lost, not shortcut to "still mine".
+func TestAcquireLeaseRenewalLosesObservedStaleTakeover(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
 	const execID = "lease-race"
 
-	// Seed an expired lease owned by A.
-	expired, err := json.Marshal(Lease{Owner: "A", Expires: time.Now().Add(-time.Minute).UTC()})
+	const ttl = 20 * time.Millisecond
+
+	lease, err := json.Marshal(Lease{Owner: "A", Expires: time.Now().Add(-time.Minute).UTC()})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	if _, err = s.leases.Create(ctx, execID, expired); err != nil {
+	if _, err = s.leases.Create(ctx, execID, lease); err != nil {
 		t.Fatalf("seed lease: %v", err)
 	}
+
+	if held, acquireErr := s.AcquireLease(ctx, execID, "B", ttl); acquireErr != nil || held {
+		t.Fatalf("B first observation: held=%v err=%v, want false/nil", held, acquireErr)
+	}
+
+	time.Sleep(ttl + 10*time.Millisecond)
 
 	// Inject B's takeover into A's read→write window.
 	origKV := s.leases
 	s.leases = &raceKV{KeyValue: origKV, beforeUpdate: func() {
 		s.leases = origKV // B (and A's retry re-read) must see the real bucket
 
-		held, acquireErr := s.AcquireLease(ctx, execID, "B", time.Minute)
+		held, acquireErr := s.AcquireLease(ctx, execID, "B", ttl)
 		if acquireErr != nil || !held {
 			t.Fatalf("B takeover: held=%v err=%v", held, acquireErr)
 		}

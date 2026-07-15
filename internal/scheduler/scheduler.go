@@ -66,11 +66,11 @@ func New(js jetstream.JetStream, n names.Names) *Scheduler {
 // WorkQueue/Interest stream that would drop them on ack.
 //
 // The scheduler self-purges a one-shot definition once it fires, so the unbounded
-// growth is limited to already-consumed sched.fire.* messages. Reclaiming those
-// safely needs a dedicated maintenance pass that purges the fire.> subject only
-// below the fired consumer's ack floor (never a blanket age limit); that is left
-// as a follow-up. AllowRollup stays enabled so a cron definition can be replaced
-// by name.
+// growth is limited to already-consumed sched.fire.* messages. Those are
+// reclaimed by ReclaimFired on the server's full-reconcile maintenance cadence:
+// it purges the fire.> subject only below the fired consumer's ack floor (never a
+// blanket age limit). AllowRollup stays enabled so a cron definition can be
+// replaced by name.
 func (s *Scheduler) EnsureStream(ctx context.Context) error {
 	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              s.stream,

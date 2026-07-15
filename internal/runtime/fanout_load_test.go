@@ -105,9 +105,11 @@ func TestWideFanoutContention(t *testing.T) {
 	}
 
 	reg := invoker.NewRegistry()
-	reg.Register("mem", invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
+	if err := reg.Register("mem", invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
 		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"ok":true}`)}, nil
-	}))
+	})); err != nil {
+		t.Fatalf("register invoker: %v", err)
+	}
 
 	for _, width := range []int{50, 100, 200} {
 		t.Run(fmt.Sprintf("width=%d", width), func(t *testing.T) {

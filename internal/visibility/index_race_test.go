@@ -113,6 +113,100 @@ func TestIndexConcurrentProjectionDoesNotRegress(t *testing.T) {
 	}
 }
 
+func TestStaleSameStatusProjectionReassertsEventSummary(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	st, err := store.Open(ctx, srv.JS, names.New(""))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	ix := New(st)
+
+	current := store.Event{
+		ExecID: "same-status-race", FlowName: "f", Status: store.StatusRunning,
+		Node: "new", Error: "new", Revision: 2, Time: time.Now().UTC(),
+	}
+	if err = ix.index(ctx, current); err != nil {
+		t.Fatalf("index current: %v", err)
+	}
+
+	stale := store.Event{
+		ExecID: "same-status-race", FlowName: "f", Status: store.StatusRunning,
+		Node: "old", Error: "old", Revision: 1, Time: time.Now().UTC(),
+	}
+
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("marshal stale: %v", err)
+	}
+
+	if _, err = st.IdxStatus().Put(ctx, store.StatusRunning+sep+stale.ExecID, data); err != nil {
+		t.Fatalf("put stale status: %v", err)
+	}
+
+	if _, err = st.IdxFlow().Put(ctx, stale.FlowName+sep+stale.ExecID, data); err != nil {
+		t.Fatalf("put stale flow: %v", err)
+	}
+
+	if err = ix.index(ctx, stale); err != nil {
+		t.Fatalf("reindex stale: %v", err)
+	}
+
+	evs, err := ix.ByStatusEvents(ctx, store.StatusRunning)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	got := findEvent(t, evs, stale.ExecID)
+	if got.Revision != current.Revision || got.Node != current.Node || got.Error != current.Error {
+		t.Fatalf("event summary = %+v, want current %+v", got, current)
+	}
+}
+
+func TestStaleReassertRetriesWhenMetaAdvances(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	st, err := store.Open(ctx, srv.JS, names.New(""))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	a, b := New(st), New(st)
+
+	current := store.Event{ExecID: "stale-reassert", FlowName: "f", Status: store.StatusRunning, Revision: 2}
+	if err = a.index(ctx, current); err != nil {
+		t.Fatalf("index current: %v", err)
+	}
+
+	newer := store.Event{ExecID: "stale-reassert", FlowName: "f", Status: store.StatusWaiting, Revision: 3}
+	a.idxFlow = &hookKV{KeyValue: a.idxFlow, before: func() {
+		if idxErr := b.index(ctx, newer); idxErr != nil {
+			t.Errorf("B index: %v", idxErr)
+		}
+	}}
+
+	stale := store.Event{ExecID: "stale-reassert", FlowName: "f", Status: store.StatusRunning, Revision: 1}
+	if err = a.index(ctx, stale); err != nil {
+		t.Fatalf("A stale index: %v", err)
+	}
+
+	evs, err := a.ByStatusEvents(ctx, store.StatusWaiting)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	if got := findEvent(t, evs, stale.ExecID); got.Revision != newer.Revision {
+		t.Fatalf("winner revision = %d, want newer revision %d", got.Revision, newer.Revision)
+	}
+
+	if ids, _ := a.ByStatus(ctx, store.StatusRunning); contains(ids, stale.ExecID) {
+		t.Fatalf("stale running membership survived after retry: %v", ids)
+	}
+}
+
 // TestIndexMetaMatchesMembership: after a projection, the bookkeeping record
 // and the read-model memberships must agree — same revision, same status, and
 // the flow membership carries the same event.

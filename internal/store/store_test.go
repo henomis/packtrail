@@ -189,18 +189,56 @@ func TestLease(t *testing.T) {
 	}
 }
 
-func TestLeaseExpiry(t *testing.T) {
+func TestLeaseTakeoverAfterStableRevision(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
-	// Short TTL: B should take over once it lapses.
-	if ok, _ := s.AcquireLease(ctx, "e", "inst-A", 200*time.Millisecond); !ok {
+
+	const ttl = 20 * time.Millisecond
+
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-A", ttl); !ok {
 		t.Fatal("A acquire")
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", ttl); ok {
+		t.Fatal("B took over before observing a stable lease revision for a full TTL")
+	}
 
-	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", 30*time.Second); !ok {
-		t.Fatal("B could not take over expired lease")
+	time.Sleep(ttl + 10*time.Millisecond)
+
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", ttl); !ok {
+		t.Fatal("B could not take over stale lease revision")
+	}
+}
+
+func TestLeaseHeldUsesStableRevision(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	const ttl = 20 * time.Millisecond
+
+	if ok, _ := s.AcquireLease(ctx, "held", "inst-A", ttl); !ok {
+		t.Fatal("A acquire")
+	}
+
+	held, err := s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || !held {
+		t.Fatalf("initial LeaseHeld = %v, %v; want true/nil", held, err)
+	}
+
+	time.Sleep(ttl + 10*time.Millisecond)
+
+	held, err = s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || held {
+		t.Fatalf("stale LeaseHeld = %v, %v; want false/nil", held, err)
+	}
+
+	if ok, _ := s.AcquireLease(ctx, "held", "inst-A", ttl); !ok {
+		t.Fatal("A renewal")
+	}
+
+	held, err = s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || !held {
+		t.Fatalf("renewed LeaseHeld = %v, %v; want true/nil", held, err)
 	}
 }
 
@@ -289,6 +327,81 @@ func TestDocumentSizeGuardOnCreate(t *testing.T) {
 
 	if _, getErr := s.Get(ctx, "e-create-big"); !errors.Is(getErr, ErrNotFound) {
 		t.Fatalf("oversized Create persisted an entry: get err = %v, want ErrNotFound", getErr)
+	}
+}
+
+func TestHistoryRepairsCurrentState(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableHistory(ctx, time.Hour); err != nil {
+		t.Fatalf("enable history: %v", err)
+	}
+
+	ex := &Execution{ID: "hist-repair", FlowName: "flow", Status: StatusCompleted, CurrentNode: "", Error: "done"}
+	if _, err := s.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	trace, err := s.History(ctx, ex.ID, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(trace) != 1 {
+		t.Fatalf("history len = %d, want 1", len(trace))
+	}
+
+	got := trace[0]
+	if got.ExecID != ex.ID || got.FlowName != "flow" || got.Status != StatusCompleted ||
+		got.Error != "done" || got.Revision != ex.Revision {
+		t.Fatalf("repaired event = %+v, want current execution revision %d", got, ex.Revision)
+	}
+}
+
+func TestHistoryRepairBypassesOriginalPublishDedupe(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableHistory(ctx, time.Hour); err != nil {
+		t.Fatalf("enable history: %v", err)
+	}
+
+	ex := &Execution{ID: "hist-stale-tail", FlowName: "flow", Status: StatusRunning}
+	if _, err := s.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	stale := eventFromExecution(ex)
+
+	updated, err := s.Mutate(ctx, ex.ID, func(e *Execution) error {
+		e.Status = StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if err = s.EmitEvent(ctx, updated); err != nil {
+		t.Fatalf("emit current: %v", err)
+	}
+
+	if err = s.publishEventWithMsgID(ctx, s.names.SubjHistoryPrefix+ex.ID, stale, "manual-stale-tail"); err != nil {
+		t.Fatalf("publish stale tail: %v", err)
+	}
+
+	trace, err := s.History(ctx, ex.ID, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(trace) < 3 {
+		t.Fatalf("history len = %d, want original, stale tail, and repair events", len(trace))
+	}
+
+	if got := trace[len(trace)-1]; got.Revision != updated.Revision || got.Status != StatusCompleted {
+		t.Fatalf("history tail = %+v, want repaired current revision %d", got, updated.Revision)
 	}
 }
 

@@ -16,11 +16,15 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +41,7 @@ const (
 	defaultDLQReadCap  = 100
 	casBackoffBase     = 250 * time.Microsecond
 	casBackoffCap      = 5 * time.Millisecond
+	eventDedupWindow   = 2 * time.Minute
 	// workDedupWindow is set explicitly (rather than relying on NATS's implicit
 	// ~2m default) so the outbox's per-item msg-id dedup — which makes a
 	// re-flushed work item idempotent within the window — is self-documenting and
@@ -101,6 +106,9 @@ type Store struct {
 	deadLetters  atomic.Uint64 // cumulative dead-letters emitted by this instance
 
 	historyEnabled atomic.Bool // set by EnableHistory; EmitEvent mirrors events into the history stream
+
+	leaseObsMu sync.Mutex
+	leaseObs   map[string]leaseObservation
 }
 
 // Open ensures every bucket and stream exists, under the given namespace, and
@@ -141,11 +149,12 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 	}
 
 	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      n.StreamEvents,
-		Subjects:  []string{n.SubjEventsPrefix + ">"},
-		MaxAge:    eventsMaxAge,
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
+		Name:       n.StreamEvents,
+		Subjects:   []string{n.SubjEventsPrefix + ">"},
+		MaxAge:     eventsMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: eventDedupWindow,
 	}); err != nil {
 		return nil, fmt.Errorf("events stream: %w", err)
 	}
@@ -312,10 +321,10 @@ func (s *Store) SetMaxDocumentBytes(n int) { s.maxDocBytes = n }
 // deduped against the cold archive as well as the hot bucket: a retried
 // StartWithID whose original execution was already swept into the archive must
 // return ErrAlreadyExists, not silently re-run the whole flow under the same
-// idempotency key. (Residual race: a sweep moving the id between this check and
-// the hot create can still let a concurrent re-create through — NATS offers no
-// cross-bucket atomicity — but that requires retrying a key whose execution is
-// simultaneously being archived.)
+// idempotency key. Because the archive and hot bucket cannot be checked
+// atomically, Create checks the archive both before and after the hot Create: if
+// an archive sweep moved the id in the gap, the just-created hot key is deleted
+// at its create revision and ErrAlreadyExists is returned.
 func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 	if _, err := s.getArchived(ctx, e.ID); err == nil {
 		return 0, fmt.Errorf("%w: execution %s (archived)", ErrAlreadyExists, e.ID)
@@ -344,21 +353,74 @@ func (s *Store) Create(ctx context.Context, e *Execution) (uint64, error) {
 		return 0, err
 	}
 
+	if err = s.ensureNotArchivedAfterCreate(ctx, e.ID, rev); err != nil {
+		return 0, err
+	}
+
 	e.Revision = rev
 
 	return rev, nil
 }
 
-// Get loads an execution and populates its Revision from the KV entry. If the
-// id is not in the hot bucket and archival is enabled, it falls back to the
-// cold archive, so reads of aged-out terminal executions still succeed until the
-// archive's retention expires. The hot bucket remains the source of truth for
-// mutations; archived executions are terminal and never mutated.
-func (s *Store) Get(ctx context.Context, id string) (*Execution, error) {
-	e, err := s.getHot(ctx, id)
-	if errors.Is(err, ErrNotFound) {
-		return s.getArchived(ctx, id)
+func (s *Store) ensureNotArchivedAfterCreate(ctx context.Context, id string, rev uint64) error {
+	if _, err := s.getArchived(ctx, id); err == nil {
+		if delErr := s.deleteCreatedExecution(ctx, id, rev); delErr != nil {
+			return fmt.Errorf("discard raced archived execution %s: %w", id, delErr)
+		}
+
+		return fmt.Errorf("%w: execution %s (archived)", ErrAlreadyExists, id)
+	} else if !errors.Is(err, ErrNotFound) {
+		if delErr := s.deleteCreatedExecution(ctx, id, rev); delErr != nil {
+			return fmt.Errorf("archive recheck for %s failed: %w (cleanup failed: %v)", id, err, delErr)
+		}
+
+		return err
 	}
+
+	return nil
+}
+
+func (s *Store) deleteCreatedExecution(ctx context.Context, id string, rev uint64) error {
+	err := s.exec.Delete(ctx, id, jetstream.LastRevision(rev))
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil
+	}
+
+	return err
+}
+
+// ArchivedExecution loads id from the cold archive if it is currently retained.
+// It intentionally ignores any hot-bucket value: callers use it to avoid
+// repairing or recreating transient hot duplicates while an archived execution
+// still owns the id.
+func (s *Store) ArchivedExecution(ctx context.Context, id string) (*Execution, bool, error) {
+	ex, err := s.getArchived(ctx, id)
+	if err == nil {
+		return ex, true, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+
+	return nil, false, nil
+}
+
+// Get loads an execution and populates its Revision from the KV entry. If an
+// archive record exists, it owns the id and wins over any transient hot duplicate
+// left by an archive/Create race; otherwise Get reads the hot bucket. Reads of
+// aged-out terminal executions still succeed from the archive until retention
+// expires. The hot bucket remains the source of truth for mutations; archived
+// executions are terminal and never mutated.
+func (s *Store) Get(ctx context.Context, id string) (*Execution, error) {
+	archived, ok, err := s.ArchivedExecution(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
+		return archived, nil
+	}
+
+	e, err := s.getHot(ctx, id)
 
 	return e, err
 }
@@ -408,6 +470,9 @@ func decodeExecution(entry jetstream.KeyValueEntry) (*Execution, error) {
 	}
 
 	e.Revision = entry.Revision()
+	if e.ArchivedRevision != 0 {
+		e.Revision = e.ArchivedRevision
+	}
 
 	return &e, nil
 }
@@ -450,6 +515,12 @@ func (s *Store) update(ctx context.Context, e *Execution) (uint64, error) {
 func (s *Store) Mutate(ctx context.Context, id string, fn func(*Execution) error) (*Execution, error) {
 	const maxAttempts = 64
 	for attempt := range maxAttempts {
+		if archived, err := s.isArchived(ctx, id); err != nil {
+			return nil, err
+		} else if archived {
+			return nil, ErrNotFound
+		}
+
 		e, err := s.getHot(ctx, id)
 		if err != nil {
 			return nil, err
@@ -484,6 +555,11 @@ func (s *Store) Mutate(ctx context.Context, id string, fn func(*Execution) error
 	return nil, fmt.Errorf("%w: too many retries on %s", ErrConflict, id)
 }
 
+func (s *Store) isArchived(ctx context.Context, id string) (bool, error) {
+	_, ok, err := s.ArchivedExecution(ctx, id)
+	return ok, err
+}
+
 // casBackoff returns a small jittered delay growing with the attempt count,
 // capped at ~5ms, to de-synchronize concurrent CAS writers.
 func casBackoff(attempt int) time.Duration {
@@ -498,7 +574,25 @@ func casBackoff(attempt int) time.Duration {
 
 // EmitEvent appends a domain event for the execution to the events stream.
 func (s *Store) EmitEvent(ctx context.Context, e *Execution) error {
-	ev := Event{
+	ev := eventFromExecution(e)
+
+	if err := s.publishEvent(ctx, s.names.SubjEventsPrefix+e.ID, ev, "event."); err != nil {
+		return err
+	}
+
+	// History mirrors the event, best-effort: a lost trace record must never
+	// fail (or retry) the transition that emitted it.
+	if s.historyEnabled.Load() {
+		if histErr := s.publishEvent(ctx, s.names.SubjHistoryPrefix+e.ID, ev, "history."); histErr != nil {
+			slog.Debug("emit history", "exec", e.ID, "err", histErr)
+		}
+	}
+
+	return nil
+}
+
+func eventFromExecution(e *Execution) Event {
+	return Event{
 		ExecID:   e.ID,
 		FlowName: e.FlowName,
 		Status:   e.Status,
@@ -507,25 +601,25 @@ func (s *Store) EmitEvent(ctx context.Context, e *Execution) error {
 		Revision: e.Revision,
 		Time:     time.Now().UTC(),
 	}
+}
 
+func (s *Store) publishEvent(ctx context.Context, subject string, ev Event, prefix string) error {
+	return s.publishEventWithMsgID(ctx, subject, ev, eventMsgID(prefix, ev))
+}
+
+func (s *Store) publishEventWithMsgID(ctx context.Context, subject string, ev Event, msgID string) error {
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return err
 	}
 
-	if _, err = s.js.Publish(ctx, s.names.SubjEventsPrefix+e.ID, data); err != nil {
-		return err
-	}
+	_, err = s.js.Publish(ctx, subject, data, jetstream.WithMsgID(msgID))
 
-	// History mirrors the event, best-effort: a lost trace record must never
-	// fail (or retry) the transition that emitted it.
-	if s.historyEnabled.Load() {
-		if _, histErr := s.js.Publish(ctx, s.names.SubjHistoryPrefix+e.ID, data); histErr != nil {
-			slog.Debug("emit history", "exec", e.ID, "err", histErr)
-		}
-	}
+	return err
+}
 
-	return nil
+func eventMsgID(prefix string, ev Event) string {
+	return prefix + ev.ExecID + "." + strconv.FormatUint(ev.Revision, 10)
 }
 
 // ListExecutionKeys returns all execution ids currently stored. Used by the
@@ -581,7 +675,21 @@ func (s *Store) ForEachExecutionKey(ctx context.Context, fn func(string) error) 
 // the current set. A value that fails to unmarshal is skipped rather than
 // aborting the scan. fn must not retain the *Execution past its call.
 func (s *Store) ForEachExecution(ctx context.Context, fn func(*Execution) error) error {
-	w, err := s.exec.WatchAll(ctx, jetstream.IgnoreDeletes())
+	return forEachExecution(ctx, s.exec, fn)
+}
+
+// ForEachArchivedExecution streams every execution retained in the cold archive
+// to fn. It is a no-op when archival is disabled.
+func (s *Store) ForEachArchivedExecution(ctx context.Context, fn func(*Execution) error) error {
+	if s.archive == nil {
+		return nil
+	}
+
+	return forEachExecution(ctx, s.archive, fn)
+}
+
+func forEachExecution(ctx context.Context, kv jetstream.KeyValue, fn func(*Execution) error) error {
+	w, err := kv.WatchAll(ctx, jetstream.IgnoreDeletes())
 	if err != nil {
 		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			return nil
@@ -598,14 +706,12 @@ func (s *Store) ForEachExecution(ctx context.Context, fn func(*Execution) error)
 				return nil
 			}
 
-			var e Execution
-			if json.Unmarshal(entry.Value(), &e) != nil {
+			e, decodeErr := decodeExecution(entry)
+			if decodeErr != nil {
 				continue
 			}
 
-			e.Revision = entry.Revision()
-
-			if fnErr := fn(&e); fnErr != nil {
+			if fnErr := fn(e); fnErr != nil {
 				return fnErr
 			}
 		case <-ctx.Done():
@@ -645,59 +751,179 @@ func (s *Store) ArchiveTerminal(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	// Collect first, then move: deleting while the watch is still streaming the
-	// hot bucket would mutate what we are iterating.
-	var pending [][]byte
-
-	err := s.ForEachExecution(ctx, func(e *Execution) error {
-		if !e.Archivable() {
-			return nil
-		}
-
-		data, marshalErr := json.Marshal(e)
-		if marshalErr != nil {
-			return marshalErr
-		}
-
-		pending = append(pending, data)
-
-		return nil
-	})
+	pending, err := s.collectArchivable(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	moved := 0
 
-	for _, data := range pending {
-		var e Execution
-		if json.Unmarshal(data, &e) != nil {
-			continue
+	for _, candidate := range pending {
+		movedOne, archiveErr := s.archiveOne(ctx, candidate)
+		if archiveErr != nil {
+			return moved, archiveErr
 		}
 
-		if _, putErr := s.archive.Put(ctx, e.ID, data); putErr != nil {
-			return moved, putErr
+		if movedOne {
+			moved++
 		}
-
-		// An archivable execution is terminal and non-resumable, so a plain delete
-		// cannot race a concurrent transition; tolerate an already-deleted key.
-		if delErr := s.exec.Delete(ctx, e.ID); delErr != nil && !errors.Is(delErr, jetstream.ErrKeyNotFound) {
-			return moved, delErr
-		}
-
-		// The archive keeps the control metadata; the data plane is dropped —
-		// an archived execution's outputs are no longer readable. Best-effort:
-		// a failure leaves orphaned entries (the visibility GC re-deletes them
-		// when the archive record eventually expires) and never blocks the
-		// sweep.
-		if delErr := s.DeletePayloads(ctx, e.ID); delErr != nil {
-			slog.Debug("archive: delete payloads", "exec", e.ID, "err", delErr)
-		}
-
-		moved++
 	}
 
 	return moved, nil
+}
+
+type archiveCandidate struct {
+	id   string
+	data []byte
+	rev  uint64
+}
+
+func (s *Store) collectArchivable(ctx context.Context) ([]archiveCandidate, error) {
+	// Collect first, then move: deleting while the watch is still streaming the
+	// hot bucket would mutate what we are iterating.
+	var pending []archiveCandidate
+
+	err := s.ForEachExecution(ctx, func(e *Execution) error {
+		if !e.Archivable() {
+			return nil
+		}
+
+		data, marshalErr := s.archivedExecutionData(ctx, e)
+		if marshalErr != nil {
+			return marshalErr
+		}
+
+		pending = append(pending, archiveCandidate{id: e.ID, data: data, rev: e.Revision})
+
+		return nil
+	})
+
+	return pending, err
+}
+
+func (s *Store) archivedExecutionData(ctx context.Context, e *Execution) ([]byte, error) {
+	archived := *e
+	archived.ArchivedRevision = e.Revision
+
+	if archived.InputHash == "" {
+		input, err := s.GetPayload(ctx, InputKey(e.ID))
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+
+		if err == nil {
+			archived.InputHash = hashPayload(input)
+		}
+	}
+
+	return json.Marshal(&archived)
+}
+
+func (s *Store) archiveOne(ctx context.Context, candidate archiveCandidate) (bool, error) {
+	var e Execution
+	if json.Unmarshal(candidate.data, &e) != nil {
+		return false, nil
+	}
+
+	current, err := s.currentArchiveCandidate(ctx, candidate)
+	if err != nil || !current {
+		return false, err
+	}
+
+	if _, archiveErr := s.getArchived(ctx, e.ID); archiveErr == nil {
+		return false, s.deleteExistingArchiveDuplicate(ctx, e.ID, candidate.rev)
+	} else if !errors.Is(archiveErr, ErrNotFound) {
+		return false, archiveErr
+	}
+
+	return s.createArchiveAndDeleteHot(ctx, e.ID, candidate)
+}
+
+func (s *Store) currentArchiveCandidate(ctx context.Context, candidate archiveCandidate) (bool, error) {
+	current, err := s.getHot(ctx, candidate.id)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return current.Revision == candidate.rev && current.Archivable(), nil
+}
+
+func (s *Store) deleteExistingArchiveDuplicate(ctx context.Context, execID string, rev uint64) error {
+	err := s.deleteHotArchived(ctx, execID, rev)
+	if errors.Is(err, ErrConflict) {
+		return nil
+	}
+
+	return err
+}
+
+func (s *Store) createArchiveAndDeleteHot(
+	ctx context.Context, execID string, candidate archiveCandidate,
+) (bool, error) {
+	archiveRev, err := s.archive.Create(ctx, execID, candidate.data)
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return false, s.deleteExistingArchiveDuplicate(ctx, execID, candidate.rev)
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	if err = s.deleteHotArchived(ctx, execID, candidate.rev); errors.Is(err, ErrConflict) {
+		return false, s.rollbackArchiveCreate(ctx, execID, archiveRev)
+	} else if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (s *Store) rollbackArchiveCreate(ctx context.Context, execID string, archiveRev uint64) error {
+	err := s.archive.Delete(ctx, execID, jetstream.LastRevision(archiveRev))
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil
+	}
+
+	return err
+}
+
+func (s *Store) deleteHotArchived(ctx context.Context, execID string, rev uint64) error {
+	// An archivable execution is terminal and non-resumable, so only delete the
+	// exact revision collected by the sweep. A conflict means a concurrent writer
+	// changed the hot key after collection; the caller must not install archive
+	// ownership for this stale candidate.
+	err := s.exec.Delete(ctx, execID, jetstream.LastRevision(rev))
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil
+	}
+
+	if errors.Is(err, jetstream.ErrKeyExists) || isWrongLastSeq(err) {
+		return ErrConflict
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// The archive keeps the control metadata; the data plane is dropped — an
+	// archived execution's outputs are no longer readable. Best-effort: a failure
+	// leaves orphaned entries (visibility GC re-deletes them when the archive
+	// record expires) and never blocks the sweep.
+	if deleteErr := s.DeletePayloads(ctx, execID); deleteErr != nil {
+		slog.Debug("archive: delete payloads", "exec", execID, "err", deleteErr)
+	}
+
+	return nil
+}
+
+func hashPayload(payload json.RawMessage) string {
+	sum := sha256.Sum256(payload)
+
+	return hex.EncodeToString(sum[:])
 }
 
 // isWrongLastSeq reports whether err is the server's CAS rejection for KV

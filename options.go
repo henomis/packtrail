@@ -33,6 +33,11 @@ type asyncInvoker struct {
 	opts []asyncqueue.Option
 }
 
+type syncInvoker struct {
+	kind string
+	exec invoker.Invoker
+}
+
 type config struct {
 	prefix   string
 	flowsDir string
@@ -46,7 +51,7 @@ type config struct {
 	signalRetention     time.Duration // 0 = default (7d); < 0 disables the age limit
 	stallRedrive        time.Duration // 0 = engine default (5×AckWait); < 0 disables the watchdog
 
-	invokers       map[string]invoker.Invoker
+	invokers       []syncInvoker
 	asyncInvokers  []asyncInvoker
 	resultCache    bool
 	resultCacheTTL time.Duration
@@ -83,14 +88,11 @@ func WithFlowDef(f FlowDef) Option {
 
 // WithInvoker registers an Invoker under kind, the value a flow node selects via
 // its `invoker:` field. The built-in "nats-task" kind is always registered and
-// may be overridden by passing WithInvoker("nats-task", ...).
+// may be overridden by passing WithInvoker("nats-task", ...). It may be passed
+// multiple times for distinct kinds; duplicate kinds are rejected by New.
 func WithInvoker(kind string, inv invoker.Invoker) Option {
 	return func(c *config) {
-		if c.invokers == nil {
-			c.invokers = map[string]invoker.Invoker{}
-		}
-
-		c.invokers[kind] = inv
+		c.invokers = append(c.invokers, syncInvoker{kind: kind, exec: inv})
 	}
 }
 
@@ -181,9 +183,10 @@ func WithReconcileActive(cronExpr string) Option {
 // WithReconcileFull installs the recurring full reconcile: an authoritative scan
 // of every execution on the given 6-field cron expression, e.g. "0 0 * * * *"
 // for hourly. It is the deep backstop that recovers index entries the active
-// pass cannot see; its cost grows with total execution volume, so schedule it
-// well below the active cadence. Without either option the indexer still runs
-// but no periodic reconcile is scheduled.
+// pass cannot see, and it also runs low-frequency maintenance such as reclaiming
+// consumed scheduler firings; its cost grows with total execution volume, so
+// schedule it well below the active cadence. Without either option the indexer
+// still runs but no periodic reconcile is scheduled.
 func WithReconcileFull(cronExpr string) Option {
 	return func(c *config) { c.reconcileFullCron = cronExpr }
 }

@@ -23,6 +23,8 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -459,43 +461,38 @@ func requireObjectPayload(payload json.RawMessage) error {
 // (store.ErrAlreadyExists) is treated as idempotent success: the existing
 // execution's id is returned without re-creating or re-enqueueing it.
 func (e *Engine) start(ctx context.Context, id, flowName string, payload json.RawMessage) (string, error) {
-	flow, ok := e.flows[flowName]
-	if !ok {
+	flow, flowOK := e.flows[flowName]
+	if !flowOK {
 		return "", fmt.Errorf("unknown flow %q", flowName)
 	}
 
-	if len(payload) == 0 {
-		payload = json.RawMessage("{}")
-	}
-
-	if err := requireObjectPayload(payload); err != nil {
-		return "", err
-	}
-
-	// Data before control: the input is written to the data plane first, so
-	// the execution can never exist without its input being readable. The
-	// write is create-if-absent — first write wins — so an idempotent Start
-	// retry carrying a different payload cannot overwrite the input the
-	// original execution runs on. A crash before Create leaves a tiny orphaned
-	// entry the retry reuses. A pre-existing input that differs from this
-	// call's payload is a contract violation (the id was reused with different
-	// arguments) and errors out here: without the check, two concurrent
-	// StartWithID calls racing the two planes could bind one caller's document
-	// to the other caller's payload — with both callers told success.
-	existing, err := e.store.CreatePayload(ctx, store.InputKey(id), payload)
+	payload, payloadHash, err := prepareStartPayload(payload)
 	if err != nil {
 		return "", err
 	}
 
-	if existing != nil && !bytes.Equal(existing, payload) {
-		return "", fmt.Errorf(
-			"execution id %q is already bound to a different input payload: "+
-				"an idempotency key must be retried with byte-identical arguments", id)
+	archived, archivedOK, err := e.store.ArchivedExecution(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	if archivedOK {
+		if archiveErr := validateArchivedStart(id, flowName, payloadHash, archived); archiveErr != nil {
+			return "", archiveErr
+		}
+
+		return id, nil
+	}
+
+	inputCreated, err := e.createStartInput(ctx, id, payload)
+	if err != nil {
+		return "", err
 	}
 
 	exec := &store.Execution{
 		ID:             id,
 		FlowName:       flowName,
+		InputHash:      payloadHash,
 		CurrentNode:    flow.StartNode(),
 		Status:         store.StatusRunning,
 		NodeGeneration: 1,
@@ -513,10 +510,8 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 
 	if _, err = e.store.Create(ctx, exec); err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
-			// Idempotent: this id already started. Re-flush anything the
-			// original commit left unpublished before returning it.
-			if repairErr := e.repairStart(ctx, id, flowName); repairErr != nil {
-				return "", repairErr
+			if existsErr := e.handleExistingStart(ctx, id, flowName, payloadHash, inputCreated); existsErr != nil {
+				return "", existsErr
 			}
 
 			return id, nil
@@ -537,6 +532,87 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 	return id, nil
 }
 
+func prepareStartPayload(payload json.RawMessage) (json.RawMessage, string, error) {
+	if len(payload) == 0 {
+		payload = json.RawMessage("{}")
+	}
+
+	if err := requireObjectPayload(payload); err != nil {
+		return nil, "", err
+	}
+
+	return payload, hashPayload(payload), nil
+}
+
+func (e *Engine) createStartInput(ctx context.Context, id string, payload json.RawMessage) (bool, error) {
+	// Data before control: the input is written to the data plane first, so
+	// the execution can never exist without its input being readable. The
+	// write is create-if-absent — first write wins — so an idempotent Start
+	// retry carrying a different payload cannot overwrite the input the
+	// original execution runs on. A crash before Create leaves a tiny orphaned
+	// entry the retry reuses. A pre-existing input that differs from this
+	// call's payload is a contract violation (the id was reused with different
+	// arguments) and errors out here: without the check, two concurrent
+	// StartWithID calls racing the two planes could bind one caller's document
+	// to the other caller's payload — with both callers told success.
+	existing, err := e.store.CreatePayload(ctx, store.InputKey(id), payload)
+	if err != nil {
+		return false, err
+	}
+
+	if existing != nil && !bytes.Equal(existing, payload) {
+		return false, fmt.Errorf(
+			"execution id %q is already bound to a different input payload: "+
+				"an idempotency key must be retried with byte-identical arguments", id)
+	}
+
+	return existing == nil, nil
+}
+
+func (e *Engine) handleExistingStart(
+	ctx context.Context, id, flowName, payloadHash string, inputCreated bool,
+) error {
+	archived, archivedOK, err := e.store.ArchivedExecution(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if archivedOK {
+		if inputCreated {
+			if deleteErr := e.store.DeletePayloads(ctx, id); deleteErr != nil {
+				return deleteErr
+			}
+		}
+
+		return validateArchivedStart(id, flowName, payloadHash, archived)
+	}
+
+	// Idempotent: this id already started. Re-flush anything the original commit
+	// left unpublished before returning it.
+	return e.repairStart(ctx, id, flowName)
+}
+
+func hashPayload(payload json.RawMessage) string {
+	sum := sha256.Sum256(payload)
+
+	return hex.EncodeToString(sum[:])
+}
+
+func validateArchivedStart(id, flowName, payloadHash string, archived *store.Execution) error {
+	if archived.FlowName != flowName {
+		return fmt.Errorf("execution id %q is bound to flow %q, not %q: "+
+			"an idempotency key must be retried with the same arguments", id, archived.FlowName, flowName)
+	}
+
+	if payloadHash != "" && archived.InputHash != "" && archived.InputHash != payloadHash {
+		return fmt.Errorf(
+			"execution id %q is already bound to a different input payload: "+
+				"an idempotency key must be retried with byte-identical arguments", id)
+	}
+
+	return nil
+}
+
 // repairStart heals the crash window between the create and the first outbox
 // flush: a retried Start/StartWithID re-flushes whatever the original commit
 // left unpublished. The flush is msg-id-deduped, so nudging an id whose first
@@ -544,6 +620,15 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 // different flow than the one the id is bound to is a contract violation and
 // errors instead of masquerading as idempotent success.
 func (e *Engine) repairStart(ctx context.Context, id, flowName string) error {
+	archived, ok, err := e.store.ArchivedExecution(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if ok {
+		return validateArchivedStart(id, flowName, "", archived)
+	}
+
 	ex, err := e.store.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -676,7 +761,7 @@ func (e *Engine) RedriveStalled(ctx context.Context, execID string, olderThan ti
 		return false, nil
 	}
 
-	held, err := e.store.LeaseHeld(ctx, execID)
+	held, err := e.store.LeaseHeld(ctx, execID, e.cfg.LeaseTTL)
 	if err != nil || held {
 		return false, err // in-flight work heartbeats its lease: not stalled
 	}

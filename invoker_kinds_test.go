@@ -18,6 +18,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/internal/natstest"
@@ -69,9 +70,8 @@ nodes:
 	}
 }
 
-// TestNewRejectsInvokerKindCollisions: the registry silently overwrites on
-// re-register, so an ambiguous kind would drop an invoker without a trace —
-// New must reject it up front.
+// TestNewRejectsInvokerKindCollisions verifies ambiguous kinds are rejected up
+// front instead of silently dropping an invoker or dispatcher.
 func TestNewRejectsInvokerKindCollisions(t *testing.T) {
 	srv := natstest.Start(t)
 
@@ -80,6 +80,13 @@ func TestNewRejectsInvokerKindCollisions(t *testing.T) {
 	})
 
 	flow := packtrail.WithFlow([]byte(ghostKindFlow))
+
+	if _, err := packtrail.New(srv.NC, flow,
+		packtrail.WithInvoker("ghost", noop),
+		packtrail.WithInvoker("ghost", noop)); err == nil ||
+		!strings.Contains(err.Error(), "registered twice") {
+		t.Errorf("duplicate sync kind: err = %v, want rejection", err)
+	}
 
 	if _, err := packtrail.New(srv.NC, flow,
 		packtrail.WithAsyncInvoker("ghost", noop),
@@ -114,5 +121,43 @@ func TestNewRejectsNilInvokers(t *testing.T) {
 	if _, err := packtrail.New(srv.NC, flow, packtrail.WithAsyncInvoker("ghost", nil)); err == nil ||
 		!strings.Contains(err.Error(), "nil Invoker") {
 		t.Fatalf("New(WithAsyncInvoker nil) err = %v, want nil-invoker rejection", err)
+	}
+}
+
+func TestWithInvokerOverridesBuiltinNATSTask(t *testing.T) {
+	srv := natstest.Start(t)
+
+	custom := packtrail.InvokerFunc(func(_ context.Context, req packtrail.Request) (packtrail.Result, error) {
+		return packtrail.Result{Status: packtrail.StatusOK, Payload: req.Payload}, nil
+	})
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithFlow([]byte(`
+version: "1.0"
+name: override-nats-task
+nodes:
+  - {id: a, type: task, invoker: nats-task, target: ignored}
+`)),
+		packtrail.WithInvoker(packtrail.NATSTaskKind, custom),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	id, err := s.Start(ctx, "override-nats-task", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	if ok := poll(t, 10*time.Second, func() bool {
+		ex, getErr := s.Get(ctx, id)
+		return getErr == nil && ex.Status == packtrail.ExecCompleted
+	}); !ok {
+		t.Fatal("execution did not complete through overridden nats-task invoker")
 	}
 }

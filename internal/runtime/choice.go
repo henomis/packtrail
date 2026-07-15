@@ -51,7 +51,7 @@ func (e *Engine) stepChoice(ctx context.Context, _ *dsl.Flow, node *dsl.Node, ex
 			return terminal("choice %q: expression not compiled: %q", node.ID, r.When)
 		}
 
-		match, matchErr := prog.Match(contextDoc)
+		match, matchErr := prog.MatchContext(ctx, contextDoc)
 		if matchErr != nil {
 			if node.OnError == dsl.OnErrorFail {
 				return e.failNode(ctx, exec.ID, node.ID,

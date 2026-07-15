@@ -59,9 +59,11 @@ func TestSyncInvokerPanicFailsExecution(t *testing.T) {
 	}
 
 	reg := invoker.NewRegistry()
-	reg.Register("boom", invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+	if err = reg.Register("boom", invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
 		panic("boom in sync invoker")
-	}))
+	})); err != nil {
+		t.Fatalf("register invoker: %v", err)
+	}
 
 	eng, err := New(reg, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, Config{})
 	if err != nil {

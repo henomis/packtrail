@@ -33,9 +33,10 @@ import (
 // published to a KV registry at startup so observability tools can render a flow
 // without its source YAML.
 type FlowGraph struct {
-	Name  string      `json:"name"`
-	Nodes []GraphNode `json:"nodes"`
-	Edges []GraphEdge `json:"edges"`
+	Version string      `json:"version,omitempty"`
+	Name    string      `json:"name"`
+	Nodes   []GraphNode `json:"nodes"`
+	Edges   []GraphEdge `json:"edges"`
 }
 
 // GraphNode is one node of a FlowGraph. Fields are type-specific; empty ones are
@@ -49,6 +50,7 @@ type GraphNode struct {
 	WaitFor    []string    `json:"wait_for,omitempty"`
 	JoinPolicy string      `json:"join_policy,omitempty"`
 	Rules      []GraphRule `json:"rules,omitempty"`
+	OnError    string      `json:"on_error,omitempty"`
 	SignalName string      `json:"signal_name,omitempty"`
 	OnTimeout  string      `json:"on_timeout,omitempty"`
 }
@@ -107,7 +109,7 @@ func (s *Server) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 
 // buildFlowGraph projects a parsed flow into its public, serialisable graph.
 func buildFlowGraph(f *dsl.Flow) FlowGraph {
-	g := FlowGraph{Name: f.Name}
+	g := FlowGraph{Version: f.Version, Name: f.Name}
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 
@@ -119,6 +121,7 @@ func buildFlowGraph(f *dsl.Flow) FlowGraph {
 			Branches:   n.Branches,
 			WaitFor:    n.WaitFor,
 			JoinPolicy: n.JoinPolicy,
+			OnError:    n.OnError,
 			SignalName: n.SignalName,
 			OnTimeout:  n.OnTimeout,
 		}

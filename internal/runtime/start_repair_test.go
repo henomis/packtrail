@@ -17,6 +17,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +78,103 @@ func TestStartWithIDRepairsMissingEnqueue(t *testing.T) {
 
 	if got := parseCtx(t, r.Payload); string(got.Input) != `{"orig":true}` {
 		t.Fatalf("input = %s, want the original (first-write wins)", got.Input)
+	}
+}
+
+func TestRepairStartSkipsArchivedIDWithTransientHotDuplicate(t *testing.T) {
+	h := newAsyncHarness(t, asyncLinearFlow)
+	ctx := context.Background()
+
+	if err := h.store.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	archived := &store.Execution{ID: "arch-start", FlowName: "async-linear", Status: store.StatusCompleted}
+	if _, err := h.store.Create(ctx, archived); err != nil {
+		t.Fatalf("create archived source: %v", err)
+	}
+
+	moved, err := h.store.ArchiveTerminal(ctx)
+	if err != nil || moved != 1 {
+		t.Fatalf("archive: moved=%d err=%v, want 1/nil", moved, err)
+	}
+
+	dup := &store.Execution{
+		ID: "arch-start", FlowName: "async-linear",
+		CurrentNode: "a", Status: store.StatusRunning, NodeGeneration: 1,
+	}
+
+	item, err := advanceWorkItem(dup.ID, dup.CurrentNode, dup.NodeGeneration, dup.Attempt, time.Time{})
+	if err != nil {
+		t.Fatalf("advance item: %v", err)
+	}
+
+	dup.AppendWork(item)
+
+	data, err := json.Marshal(dup)
+	if err != nil {
+		t.Fatalf("marshal duplicate: %v", err)
+	}
+
+	kv, err := h.store.JS().KeyValue(ctx, h.store.Names().BucketExecutions)
+	if err != nil {
+		t.Fatalf("exec bucket: %v", err)
+	}
+
+	if _, err = kv.Put(ctx, dup.ID, data); err != nil {
+		t.Fatalf("put transient duplicate: %v", err)
+	}
+
+	if err = h.engine.repairStart(ctx, dup.ID, "async-linear"); err != nil {
+		t.Fatalf("repair start: %v", err)
+	}
+
+	select {
+	case req := <-h.inv.reqs:
+		t.Fatalf("repairStart flushed archived duplicate work: %+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestStartWithIDArchivedValidatesBeforePayloadWrite(t *testing.T) {
+	h := newAsyncHarness(t, asyncLinearFlow, sigGuardFlow)
+	ctx := context.Background()
+
+	if err := h.store.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	payload := json.RawMessage(`{"orig":true}`)
+
+	archived := &store.Execution{
+		ID: "arch-idempotent", FlowName: "async-linear", InputHash: hashPayload(payload), Status: store.StatusCompleted,
+	}
+	if _, err := h.store.Create(ctx, archived); err != nil {
+		t.Fatalf("create archived source: %v", err)
+	}
+
+	moved, err := h.store.ArchiveTerminal(ctx)
+	if err != nil || moved != 1 {
+		t.Fatalf("archive: moved=%d err=%v, want 1/nil", moved, err)
+	}
+
+	id, err := h.engine.StartWithID(ctx, archived.ID, "async-linear", payload)
+	if err != nil || id != archived.ID {
+		t.Fatalf("archived same-args retry: id=%q err=%v", id, err)
+	}
+
+	if _, err = h.store.GetPayload(ctx, store.InputKey(archived.ID)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("archived retry wrote input payload: err=%v, want ErrNotFound", err)
+	}
+
+	id, err = h.engine.StartWithID(ctx, archived.ID, "sig-guard", payload)
+	if err == nil || !strings.Contains(err.Error(), "bound to flow") || id != "" {
+		t.Fatalf("archived different-flow retry id=%q err=%v, want empty id and bound-to-flow error", id, err)
+	}
+
+	id, err = h.engine.StartWithID(ctx, archived.ID, "async-linear", json.RawMessage(`{"other":true}`))
+	if err == nil || !strings.Contains(err.Error(), "different input payload") || id != "" {
+		t.Fatalf("archived different-payload retry id=%q err=%v, want empty id and payload mismatch", id, err)
 	}
 }
 

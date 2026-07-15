@@ -17,6 +17,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -35,12 +36,18 @@ const (
 // The trace is observability, not operational truth — the execution document
 // and the events stream stay authoritative.
 func (s *Store) EnableHistory(ctx context.Context, retention time.Duration) error {
+	duplicates := eventDedupWindow
+	if retention > 0 && retention < duplicates {
+		duplicates = retention
+	}
+
 	if _, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      s.names.StreamHistory,
-		Subjects:  []string{s.names.SubjHistoryPrefix + ">"},
-		MaxAge:    retention,
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
+		Name:       s.names.StreamHistory,
+		Subjects:   []string{s.names.SubjHistoryPrefix + ">"},
+		MaxAge:     retention,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: duplicates,
 	}); err != nil {
 		return fmt.Errorf("history stream: %w", err)
 	}
@@ -67,6 +74,10 @@ func (s *Store) History(ctx context.Context, execID string, limit int) ([]Event,
 		return nil, err
 	}
 
+	if err = s.repairHistoryTail(ctx, stream, execID); err != nil {
+		return nil, err
+	}
+
 	cons, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
 		DeliverPolicy:  jetstream.DeliverAllPolicy,
 		FilterSubjects: []string{s.names.SubjHistoryPrefix + execID},
@@ -90,4 +101,32 @@ func (s *Store) History(ctx context.Context, execID string, limit int) ([]Event,
 	}
 
 	return out, batch.Error()
+}
+
+func (s *Store) repairHistoryTail(ctx context.Context, stream jetstream.Stream, execID string) error {
+	ex, err := s.Get(ctx, execID)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	current := eventFromExecution(ex)
+	msgID := fmt.Sprintf("history-repair.%s.%d.missing", execID, current.Revision)
+
+	msg, err := stream.GetLastMsgForSubject(ctx, s.names.SubjHistoryPrefix+execID)
+	if err == nil {
+		var last Event
+		if json.Unmarshal(msg.Data, &last) == nil && last.Revision >= current.Revision {
+			return nil
+		}
+
+		msgID = fmt.Sprintf("history-repair.%s.%d.%d", execID, current.Revision, msg.Sequence)
+	} else if !errors.Is(err, jetstream.ErrMsgNotFound) {
+		return err
+	}
+
+	return s.publishEventWithMsgID(ctx, s.names.SubjHistoryPrefix+execID, current, msgID)
 }

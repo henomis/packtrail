@@ -45,13 +45,19 @@ func wideFanFlow(n int) string {
 		branches[i] = fmt.Sprintf("b%d", i)
 	}
 
-	b.WriteString("  - {id: fo, type: fanout, branches: [" + strings.Join(branches, ",") + "]}\n")
+	b.WriteString("  - {id: fo, type: fanout, branches: [")
+	b.WriteString(strings.Join(branches, ","))
+	b.WriteString("]}\n")
 
 	for _, id := range branches {
-		b.WriteString("  - {id: " + id + ", type: task, invoker: mem, target: t}\n")
+		b.WriteString("  - {id: ")
+		b.WriteString(id)
+		b.WriteString(", type: task, invoker: mem, target: t}\n")
 	}
 
-	b.WriteString("  - {id: join, type: fanin, wait_for: [" + strings.Join(branches, ",") + "], join_policy: all}\n")
+	b.WriteString("  - {id: join, type: fanin, wait_for: [")
+	b.WriteString(strings.Join(branches, ","))
+	b.WriteString("], join_policy: all}\n")
 	b.WriteString("edges:\n  - {from: fo, to: join}\n")
 
 	return b.String()

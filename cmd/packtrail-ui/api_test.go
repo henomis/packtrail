@@ -123,6 +123,14 @@ func TestAPIFlowsAndExecutions(t *testing.T) {
 		t.Errorf("detail flow = %v, want api-flow", ex["flow"])
 	}
 
+	if ex["node_generation"] == nil {
+		t.Errorf("detail missing node_generation: %v", ex)
+	}
+
+	if versions, ok := ex["output_versions"].(map[string]any); !ok || versions["a"] == nil || versions["b"] == nil {
+		t.Errorf("detail output_versions = %v, want committed versions for a and b", ex["output_versions"])
+	}
+
 	// /api/executions/{id}/results — the assembled data-plane context
 	var res map[string]any
 	mustJSON(t, h, "/api/executions/"+id+"/results", &res)
@@ -133,6 +141,14 @@ func TestAPIFlowsAndExecutions(t *testing.T) {
 
 	if outs, ok := res["results"].(map[string]any); !ok || outs["a"] == nil || outs["b"] == nil {
 		t.Errorf("results.results = %v, want outputs for a and b", res["results"])
+	}
+
+	if _, ok := res["branches"]; !ok {
+		t.Errorf("results missing branches: %v", res)
+	}
+
+	if res["last_node"] != "b" {
+		t.Errorf("results.last_node = %v, want b", res["last_node"])
 	}
 
 	// /api/executions/{id}/history — history is emitted best-effort, so poll

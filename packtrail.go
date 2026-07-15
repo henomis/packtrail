@@ -1081,40 +1081,50 @@ func flowNames(flows map[string]*dsl.Flow) []string {
 
 // Execution is a read-only snapshot of a flow instance's control state.
 // Payloads live in the data plane and are not carried on the snapshot — read
-// them with Server.Results, which assembles {input, results, signals}.
+// them with Server.Results, which assembles {input, results, signals, branches,
+// last_node}.
 type Execution struct {
-	ID          string            `json:"id"`
-	Flow        string            `json:"flow"`
-	Status      string            `json:"status"`
-	CurrentNode string            `json:"current_node"`
-	Attempt     int               `json:"attempt"`
-	Outputs     []string          `json:"outputs,omitempty"` // node ids with a stored output, in settle order
-	Branches    map[string]Branch `json:"branches,omitempty"`
-	Signals     []string          `json:"signals,omitempty"` // received-but-unconsumed signal names
-	WaitSignal  string            `json:"wait_signal,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+	ID             string            `json:"id"`
+	Flow           string            `json:"flow"`
+	Status         string            `json:"status"`
+	CurrentNode    string            `json:"current_node"`
+	NodeGeneration uint64            `json:"node_generation,omitempty"`
+	Attempt        int               `json:"attempt"`
+	Outputs        []string          `json:"outputs,omitempty"`         // node ids with a stored output, in settle order
+	OutputVersions map[string]string `json:"output_versions,omitempty"` // committed versioned output keys, per node
+	Branches       map[string]Branch `json:"branches,omitempty"`
+	Signals        []string          `json:"signals,omitempty"` // received-but-unconsumed signal names
+	WaitSignal     string            `json:"wait_signal,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	UpdatedAt      time.Time         `json:"updated_at"`
 }
 
 // Branch is the control state of a single fan-out branch; a completed branch's
 // result appears under results.<branch> in Server.Results.
 type Branch struct {
-	Node   string `json:"node"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Node       string `json:"node"`
+	Status     string `json:"status"`
+	Generation uint64 `json:"generation,omitempty"`
+	Attempt    int    `json:"attempt"`
+	Error      string `json:"error,omitempty"`
 }
 
 func fromStore(ex *store.Execution) Execution {
 	e := Execution{
-		ID:          ex.ID,
-		Flow:        ex.FlowName,
-		Status:      ex.Status,
-		CurrentNode: ex.CurrentNode,
-		Attempt:     ex.Attempt,
-		Outputs:     append([]string(nil), ex.Outputs...),
-		WaitSignal:  ex.WaitSignal,
-		Error:       ex.Error,
-		UpdatedAt:   ex.UpdatedAt,
+		ID:             ex.ID,
+		Flow:           ex.FlowName,
+		Status:         ex.Status,
+		CurrentNode:    ex.CurrentNode,
+		NodeGeneration: ex.NodeGeneration,
+		Attempt:        ex.Attempt,
+		Outputs:        append([]string(nil), ex.Outputs...),
+		WaitSignal:     ex.WaitSignal,
+		Error:          ex.Error,
+		UpdatedAt:      ex.UpdatedAt,
+	}
+
+	if len(ex.OutputVersions) > 0 {
+		e.OutputVersions = maps.Clone(ex.OutputVersions)
 	}
 
 	for name := range ex.Signals {
@@ -1124,7 +1134,13 @@ func fromStore(ex *store.Execution) Execution {
 	if len(ex.Branches) > 0 {
 		e.Branches = make(map[string]Branch, len(ex.Branches))
 		for k, b := range ex.Branches {
-			e.Branches[k] = Branch{Node: b.NodeID, Status: b.Status, Error: b.Error}
+			e.Branches[k] = Branch{
+				Node:       b.NodeID,
+				Status:     b.Status,
+				Generation: b.Generation,
+				Attempt:    b.Attempt,
+				Error:      b.Error,
+			}
 		}
 	}
 

@@ -71,20 +71,31 @@ async function renderDetail(id) {
   const d = $("#detail");
   d.innerHTML = `
     <h2>${esc(ex.flow)} <span class="badge ${ex.status}">${ex.status}</span></h2>
-    <div class="meta">${esc(ex.id)} · node: ${esc(ex.current_node || "—")} · attempt ${ex.attempt || 0}
+    <div class="meta">${esc(ex.id)} · node: ${esc(ex.current_node || "—")}${generationSuffix(ex.node_generation)} · attempt ${ex.attempt || 0}
       ${ex.wait_signal ? `· waiting on signal <b>${esc(ex.wait_signal)}</b>` : ""}
       · updated ${new Date(ex.updated_at).toLocaleString()}</div>
     ${ex.error ? `<div class="err">⚠ ${esc(ex.error)}</div>` : ""}
     ${(ex.signals || []).length ? `<div class="chips">received signals: ${ex.signals.map((s) => `<span class="chip">${esc(s)}</span>`).join(" ")}</div>` : ""}
     <section><h3>flow</h3><div id="graph-wrap"></div></section>
-    <section><h3>context <span class="hint">input · results · signals</span></h3>
+    <section><h3>context <span class="hint">input · results · signals · branches · last_node</span></h3>
       ${results ? `<pre>${esc(pretty(results))}</pre>` : `<p class="empty">No context available (payloads archived or expired).</p>`}
     </section>
+    ${outputsSection(ex.outputs, ex.output_versions)}
     ${branchSection(ex.branches)}
     ${historySection(history)}
   `;
   const g = await loadFlow(ex.flow);
   if (g) $("#graph-wrap").appendChild(renderGraph(g, ex));
+}
+
+function outputsSection(outputs, versions) {
+  if (!outputs || !outputs.length) return "";
+  const rows = outputs
+    .map((node) => `<tr><td class="id">${esc(node)}</td><td class="id">${esc((versions || {})[node] || "legacy")}</td></tr>`)
+    .join("");
+  return `<section><h3>outputs <span class="hint">committed data-plane versions</span></h3>
+    <table class="data-table"><thead><tr><th>node</th><th>version</th></tr></thead>
+    <tbody>${rows}</tbody></table></section>`;
 }
 
 // branchSection renders the control state of fan-out branches (results live
@@ -97,11 +108,13 @@ function branchSection(branches) {
       const b = branches[node];
       return `<tr><td class="id">${esc(node)}</td>
         <td><span class="badge ${esc(b.status)}">${esc(b.status)}</span></td>
+        <td>${esc(b.generation || "—")}</td>
+        <td>${esc(b.attempt ?? "—")}</td>
         <td>${esc(b.error || "")}</td></tr>`;
     })
     .join("");
   return `<section><h3>branches</h3>
-    <table class="data-table"><thead><tr><th>branch</th><th>status</th><th>error</th></tr></thead>
+    <table class="data-table"><thead><tr><th>branch</th><th>status</th><th>generation</th><th>attempt</th><th>error</th></tr></thead>
     <tbody>${rows}</tbody></table></section>`;
 }
 
@@ -288,6 +301,7 @@ function arrowDefs() {
 }
 function pretty(v) { try { return JSON.stringify(v, null, 2); } catch { return String(v); } }
 function esc(s) { return String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function generationSuffix(g) { return g ? ` · gen ${esc(g)}` : ""; }
 
 // ---- boot -------------------------------------------------------------------
 

@@ -217,11 +217,11 @@ func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, ex)
 }
 
-// getResults returns the execution's assembled {input, results, signals}
-// context document — the data-plane view invokers and choice rules see. The
-// control-state snapshot (getExecution) does not carry payloads; this is where
-// they live. An archived execution's entries may be gone: what remains is
-// returned.
+// getResults returns the execution's assembled
+// {input, results, signals, branches, last_node} context document — the
+// data-plane view invokers and choice rules see. The control-state snapshot
+// (getExecution) does not carry payloads; this is where they live. An archived
+// execution's entries may be gone: what remains is returned.
 func (a *api) getResults(w http.ResponseWriter, r *http.Request) {
 	res, err := a.srv.Results(r.Context(), r.PathValue("id"))
 	if errors.Is(err, packtrail.ErrNotFound) {

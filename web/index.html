@@ -150,7 +150,7 @@
     <article class="card reveal">
       <div class="card__num">04</div>
       <h3>Idempotent everywhere</h3>
-      <p>Signals dedupe by JetStream sequence. The optional result cache memoises invocations by <code>(execution, node, attempt)</code> so reruns never re-invoke a side effect.</p>
+      <p>Signals dedupe by JetStream sequence. The optional result cache memoises invocations by <code>(execution, node, visit, attempt)</code> so reruns never re-invoke a side effect.</p>
     </article>
   </div>
 </section>
@@ -400,9 +400,11 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, &a
         <button class="copy" data-copy="#cache-src">Copy</button>
       </div>
 <pre class="codecard__body" id="cache-src"><code><span class="cm">// WithResultCache() wraps the registry in a KV-backed cache keyed by</span>
-<span class="cm">// (execution, node, attempt).  A redelivery after a crash returns the</span>
-<span class="cm">// stored result instead of re-invoking.  A genuine retry (new attempt)</span>
-<span class="cm">// still calls the Invoker.  Enable whenever invocations have side effects.</span>
+<span class="cm">// (execution, node, visit generation, attempt).  A redelivery after a</span>
+<span class="cm">// crash returns the stored result instead of re-invoking.  A genuine</span>
+<span class="cm">// retry (new attempt) or a re-visit via a legal cycle / Resume (new</span>
+<span class="cm">// generation) still calls the Invoker.  Enable whenever invocations</span>
+<span class="cm">// have side effects.</span>
 
 srv, _ := packtrail.<span class="fn">New</span>(nc,
     packtrail.<span class="fn">WithFlowsDir</span>(<span class="s">"flows"</span>),
@@ -636,7 +638,7 @@ srv.<span class="fn">CompleteActivity</span>(ctx,
       </article>
       <article class="choice-card reveal">
         <h4>Idempotent settlement</h4>
-        <p><code>CompleteActivity</code> is keyed by <code>(execution, node, attempt)</code>. A duplicate completion from an at-least-once worker is a silent no-op. A completion that races ahead of the parking step is stashed and consumed on arrival.</p>
+        <p><code>CompleteActivity</code> is keyed by <code>(execution, node, attempt)</code> — and <code>CompleteActivityWithGeneration</code> also fences the node-visit generation, for flows with legal cycles or <code>Resume</code>. A duplicate or stale completion from an at-least-once worker is a silent no-op. A completion that races ahead of the parking step is stashed and consumed on arrival.</p>
       </article>
       <article class="choice-card reveal">
         <h4>Works for fan-out branches</h4>
@@ -714,7 +716,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
         <div class="optlist__row"><code>WithMaxDeliver(n)</code><span>Deliveries before a poisoned message is dead-lettered instead of retried forever (default 10)</span></div>
         <div class="optlist__row"><code>WithDrainTimeout(d)</code><span>Graceful-shutdown window for in-flight work to settle (default 30 s)</span></div>
         <div class="optlist__row"><code>WithMaxPayloadBytes(n)</code><span>Cap per data-plane entry — start input, node output, signal payload (default 512 KiB)</span></div>
-        <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Ownership lease duration; failed instances release within this window</span></div>
+        <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Ownership lease duration; a crashed instance's work frees after roughly this</span></div>
         <div class="optlist__row"><code>WithOwnerID(id)</code><span>Stable owner identity for the lease; defaults to a random id per instance</span></div>
       </div>
 

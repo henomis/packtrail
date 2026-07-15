@@ -189,8 +189,11 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
       <p>
         A durable pull consumer distributes work across all engine instances; a per-execution lease
         (TTL, see <a href="#options"><code>WithLeaseTTL</code></a>) is heartbeat-renewed while an
-        instance processes a work item. A crashed instance's lease simply expires and another instance
-        acquires it on the next redelivery — no coordinator, no lock to leak. The lease is not a hard
+        instance processes a work item. When an instance crashes, its heartbeats stop and another
+        instance takes the lease over on the next redelivery — no coordinator, no lock to leak.
+        Takeover is clock-skew-immune: a contender must observe the lease unchanged for a full TTL
+        on its <em>own monotonic clock</em> before treating it as stale, so a skewed wall clock can
+        never seize a lease that is still being heartbeat-renewed. The lease is not a hard
         mutual-exclusion lock: the execution-doc CAS fences <em>state</em>, but it cannot un-fire an
         external side effect, so node invocation is <strong>at-least-once</strong>. For non-idempotent
         targets, enable <a href="#options"><code>WithResultCache</code></a> or make the target idempotent.
@@ -373,6 +376,7 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         <thead><tr><th>Field</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td>rules</td><td>Ordered list of <code>{when, to}</code> rules plus exactly one <code>{default: true, to}</code>. At least one rule and a default are required.</td></tr>
+          <tr><td>on_error</td><td>What a rule expression that errors at evaluation time does: omit (the default) to treat it as no match, or <code>fail</code> to fail the execution — see below.</td></tr>
         </tbody>
       </table>
       <p>
@@ -384,15 +388,22 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         <code>branches</code> (the current fan's outputs) and <code>last_node</code> (the id of the most
         recently settled output — "the previous step's result" is <code>results[last_node]</code>).
         Reach into them with dotted paths (<code>results.triage.risk_score</code>,
-        <code>input.user.tier</code>, <code>signals.approval.granted</code>) and the full expr-lang
-        operator set (<code>==</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>in</code>, …).
+        <code>input.user.tier</code>, <code>signals.approval.granted</code>) and expr-lang's
+        comparison, boolean and membership operators (<code>==</code>, <code>&amp;&amp;</code>,
+        <code>||</code>, <code>in</code>, …). Rules are <strong>bounded routing predicates</strong>,
+        not general programs: range expressions, iteration constructs (<code>filter</code>,
+        <code>map</code>, …) and function calls other than <code>len()</code> are rejected at load
+        time, and evaluation runs under a fixed memory budget — a rule can never loop or blow up
+        over an attacker-sized payload.
       </p>
       <p>
         A <code>when</code> that errors at evaluation time — most commonly because it references a
         field the payload doesn't have — is treated as <strong>no match</strong> (logged at warn
         level), and evaluation continues to the next rule, ultimately reaching <code>default</code>.
         An expression that returns a non-boolean is likewise an error and counts as no match. Order
-        rules from most to least specific, since the first match wins.
+        rules from most to least specific, since the first match wins. For safety-relevant routing
+        where silently falling through to <code>default</code> would be wrong, set
+        <code>on_error: fail</code> on the node — an erroring rule then fails the execution instead.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -428,8 +439,9 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         </tbody>
       </table>
       <p>
-        Signal consumption is durable and idempotent — signals dedupe by JetStream sequence, so an
-        at-least-once publisher is safe. The timeout is scheduled through the Message Scheduler and
+        Signal consumption is durable and idempotent — signals dedupe by JetStream sequence, so
+        redeliveries are safe; a publisher that <em>retries the publish itself</em> should use
+        <code>SignalWithID</code> (below) so retries dedupe too. The timeout is scheduled through the Message Scheduler and
         survives restarts. Ordering is forgiving: a signal sent before the execution reaches its signal
         node is stored and consumed on arrival, and one sent just before the execution is created is
         redelivered until the execution exists. A genuinely orphaned signal (e.g. a typo'd execution id)
@@ -443,8 +455,18 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
           <span class="codecard__name">delivering a signal</span>
           <button class="copy" data-copy="#sig-src">Copy</button>
         </div>
-<pre class="codecard__body" id="sig-src"><code>srv.<span class="fn">Signal</span>(ctx, execID, <span class="s">"approval"</span>, []<span class="kw">byte</span>(<span class="s">`{"by":"alice"}`</span>))</code></pre>
+<pre class="codecard__body" id="sig-src"><code>srv.<span class="fn">Signal</span>(ctx, execID, <span class="s">"approval"</span>, []<span class="kw">byte</span>(<span class="s">`{"by":"alice"}`</span>))
+
+<span class="cm">// retry-safe publish: reusing the idempotency key collapses</span>
+<span class="cm">// ambiguous publish retries into a single stream entry.</span>
+srv.<span class="fn">SignalWithID</span>(ctx, execID, <span class="s">"approval"</span>, <span class="s">"req-42"</span>, []<span class="kw">byte</span>(<span class="s">`{"by":"alice"}`</span>))</code></pre>
       </div>
+      <p>
+        If your publisher retries on ambiguous errors (a timeout where the publish may or may not
+        have landed), use <code>SignalWithID</code> with a caller-supplied idempotency key —
+        retries within the stream's duplicate window collapse into one entry instead of creating
+        duplicate signals.
+      </p>
     </section>
 
     <hr class="docs__hr" />
@@ -513,6 +535,7 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
           <tr><td>NodeID</td><td>The node being executed.</td></tr>
           <tr><td>Payload</td><td>The assembled execution context as raw JSON: <code>{"input": …, "results": {…}, "signals": {…}}</code>.</td></tr>
           <tr><td>Attempt</td><td>0-based attempt counter for retries.</td></tr>
+          <tr><td>Generation</td><td>Execution-scoped visit generation for this node — distinguishes re-visits from legal cycles or <code>Resume</code> from retries of the same visit.</td></tr>
           <tr><td>Deadline</td><td>Hard deadline for this attempt.</td></tr>
         </tbody>
       </table>
@@ -539,9 +562,12 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
       <h3>Idempotent invocations</h3>
       <p>
         Enable <a href="#options"><code>WithResultCache()</code></a> to memoise results by
-        <code>(execution, node, attempt)</code> in a KV bucket. A work item redelivered after a crash
-        returns the cached result instead of re-invoking; a genuine retry (a new attempt) still calls the
-        Invoker. Turn it on whenever an invocation has side effects that must not run twice. The cache
+        <code>(execution, node, visit generation, attempt)</code> in a KV bucket. A work item redelivered
+        after a crash returns the cached result instead of re-invoking; a genuine retry (a new attempt)
+        still calls the Invoker, and a legal cycle or <code>Resume</code> that revisits the node (a new
+        generation) never replays a stale cached result. Concurrent redeliveries of the same attempt are
+        collapsed too: the first caller claims the invocation and the others wait for its result. Turn it
+        on whenever an invocation has side effects that must not run twice. The cache
         covers both invocation paths — the engine-side dispatch and the async worker's execution of your
         Invoker — and entries expire after a TTL (default 24h, tunable via
         <code>WithResultCacheTTL</code>).
@@ -596,8 +622,13 @@ srv.<span class="fn">Handle</span>(ctx, <span class="s">"tasks.notify.*"</span>,
         You rarely wire that by hand. The built-in <code>invoker/asyncqueue</code> package turns any
         <em>ordinary synchronous</em> Invoker into a durable async one: register it with
         <code>WithAsyncInvoker</code> and packtrail dispatches matching nodes to a JetStream work-queue,
-        runs your Invoker on a hosted worker pool, and settles via <code>CompleteActivity</code> — with
-        at-least-once delivery, dispatch dedup and ack-extending heartbeats handled for you.
+        runs your Invoker on a hosted worker pool, and settles the activity for you — with
+        at-least-once delivery, dispatch dedup, generation-aware completion and ack-extending
+        heartbeats handled automatically. The work-queue itself is bounded (job-count and byte
+        limits, tunable with <code>asyncqueue.WithMaxQueuedJobs</code> /
+        <code>WithMaxQueuedBytes</code>): when workers fall behind past the limit, new dispatches
+        are shed with an error and retried per the node's policy instead of growing the stream
+        until the cluster hurts.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -640,7 +671,10 @@ srv.<span class="fn">CompleteActivity</span>(ctx, execID, nodeID, attempt,
         <code>(execution, node, attempt)</code>. A duplicate completion, or one for the wrong attempt, is
         a silent no-op — so an at-least-once worker can call it freely. Use <code>Request.NodeID</code>
         and <code>Request.Attempt</code> to identify the dispatched work. This works for plain task nodes
-        and fan-out branches alike.
+        and fan-out branches alike. When the flow can revisit the node — a legal cycle, or
+        <code>Resume</code> after a failure — prefer <code>CompleteActivityWithGeneration</code> with
+        <code>Request.Generation</code> from the original dispatch, so a stale completion from an
+        earlier visit can never settle a later one that reuses the same node and attempt.
       </div>
     </section>
 
@@ -652,7 +686,8 @@ srv.<span class="fn">CompleteActivity</span>(ctx, execID, nodeID, attempt,
       <h2>Signals &amp; resuming</h2>
       <p>
         A <a href="#node-signal"><code>signal</code></a> node waits for an external event. Deliver one
-        with <code>Server.Signal(ctx, execID, name, payload)</code>; delivery is idempotent. Received
+        with <code>Server.Signal(ctx, execID, name, payload)</code>; consumption is idempotent, and
+        <code>SignalWithID</code> makes the publish itself retry-safe via an idempotency key. Received
         signal payloads are visible on the execution snapshot under <code>Signals</code>, and the name a
         node is currently waiting on appears as <code>WaitSignal</code>.
       </p>
@@ -747,7 +782,9 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>StartWithID(ctx, execID, flow, payload)</td><td>Idempotent start with a caller-supplied id (idempotency key, <code>[A-Za-z0-9_-]{1,128}</code>); a retry returns the existing id.</td></tr>
           <tr><td>ScheduleFlow(ctx, name, flow, cron, payload)</td><td>Install/replace a recurring schedule that starts a flow.</td></tr>
           <tr><td>Signal(ctx, execID, name, payload)</td><td>Deliver an external signal to an execution.</td></tr>
+          <tr><td>SignalWithID(ctx, execID, name, key, payload)</td><td>Deliver a signal with a caller-supplied idempotency key — ambiguous publish retries collapse into one stream entry.</td></tr>
           <tr><td>CompleteActivity(ctx, execID, node, attempt, res)</td><td>Settle an async activity previously reported as <code>StatusPending</code>. Idempotent.</td></tr>
+          <tr><td>CompleteActivityWithGeneration(ctx, execID, node, gen, attempt, res)</td><td>Generation-fenced settlement using <code>Request.Generation</code> — preferred when flows have legal cycles or use <code>Resume</code>.</td></tr>
           <tr><td>Resume(ctx, execID)</td><td>Revive a failed execution with a fresh retry budget.</td></tr>
           <tr><td>Cancel(ctx, execID, reason)</td><td>Transition a running/waiting execution to the terminal <code>cancelled</code> status. Abandon, not interrupt; idempotent.</td></tr>
           <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> control-state snapshot, or <code>ErrNotFound</code>.</td></tr>
@@ -784,18 +821,20 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         <div class="optlist__row"><code>WithFlowDef(f)</code><span>Register a single flow from a <code>FlowDef</code> Go struct; repeatable, combinable with the options above.</span></div>
         <div class="optlist__row"><code>WithInvoker(kind, inv)</code><span>Register a custom Invoker under a kind; the built-in nats-task is always present and may be overridden.</span></div>
         <div class="optlist__row"><code>WithAsyncInvoker(kind, exec, opts…)</code><span>Register an async Invoker: nodes of this kind dispatch to a durable work-queue and <code>exec</code> runs on a hosted worker pool (see <a href="#async">async activities</a>).</span></div>
-        <div class="optlist__row"><code>WithResultCache()</code><span>Cache invocation results by (execution, node, attempt) for idempotent retries — engine dispatch and async worker execution alike.</span></div>
+        <div class="optlist__row"><code>WithResultCache()</code><span>Cache invocation results by (execution, node, visit generation, attempt) for idempotent redeliveries — engine dispatch and async worker execution alike.</span></div>
         <div class="optlist__row"><code>WithResultCacheTTL(d)</code><span>Result-cache entry TTL (default 24h; implies <code>WithResultCache</code>); a negative value disables expiry.</span></div>
         <div class="optlist__row"><code>WithHistory(retention)</code><span>Durable per-execution transition trace in a <code>&lt;ns&gt;-history</code> stream, queryable via <code>Server.History</code> for <code>retention</code>.</span></div>
         <div class="optlist__row"><code>WithReconcileActive(cron)</code><span>Schedule the cheap active-set reconcile over in-flight executions (6-field cron); each pass also runs the stall watchdog.</span></div>
         <div class="optlist__row"><code>WithStallRedrive(d)</code><span>Stall-watchdog quiet-time threshold (default 5× ack wait): an active execution quiet past <code>d</code> — outside any retry backoff and not lease-held — gets its work re-driven. Negative disables.</span></div>
-        <div class="optlist__row"><code>WithReconcileFull(cron)</code><span>Schedule the authoritative full reconcile; also runs the archive sweep and index GC. Keep it well below the active cadence.</span></div>
+        <div class="optlist__row"><code>WithReconcileFull(cron)</code><span>Schedule the authoritative full reconcile; also runs the archive sweep, index GC and low-frequency maintenance such as reclaiming consumed scheduler firings. Keep it well below the active cadence.</span></div>
         <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep terminal non-resumable executions into a cold archive bucket retained for <code>retention</code>, bounding the hot store. Failed executions stay hot so they remain resumable. Runs on the full-reconcile schedule.</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64).</span></div>
         <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Invocation timeout for nodes that omit one (default 30s).</span></div>
         <div class="optlist__row"><code>WithMaxDeliver(n)</code><span>Deliveries of a work item, fired schedule or signal before it is dead-lettered instead of retried forever (default 10; the cap cannot be disabled).</span></div>
         <div class="optlist__row"><code>WithDrainTimeout(d)</code><span>Graceful-shutdown window for in-flight work to settle before stragglers are abandoned to redelivery (default 30s).</span></div>
         <div class="optlist__row"><code>WithMaxPayloadBytes(n)</code><span>Cap on a single data-plane entry — the start input, one node's output, one signal payload (default 512 KiB; negative disables). An over-limit output fails its node with a clear reason.</span></div>
+        <div class="optlist__row"><code>WithMaxDocumentBytes(n)</code><span>Cap on an execution's serialized control document (default 768 KiB) — guards very wide fanouts against NATS's 1 MiB ceiling with a typed error instead of an opaque publish failure. Negative disables.</span></div>
+        <div class="optlist__row"><code>WithSignalRetention(d)</code><span>How long the signals stream retains messages (default 7 days) — the window an undelivered signal survives an engine outage. Negative disables the age limit.</span></div>
         <div class="optlist__row"><code>WithLeaseTTL(d)</code><span>Per-execution ownership lease TTL (default 30s); a crashed instance's work frees after roughly this.</span></div>
         <div class="optlist__row"><code>WithOwnerID(id)</code><span>Stable ownership-lease owner id; defaults to a random id per instance.</span></div>
       </div>

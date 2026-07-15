@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -40,9 +41,10 @@ const (
 	// StatusRetry means the node asks to be retried per its node retry policy.
 	StatusRetry Status = "retry"
 	// StatusPending means the node was dispatched asynchronously and will be
-	// settled later via Engine.CompleteActivity. The engine parks the execution
-	// (waiting) and frees its work slot; Result.Payload is ignored. Use this for
-	// long-running activities (e.g. an agent call) so the engine does not block.
+	// settled later via Engine.CompleteActivityWithGeneration. The engine parks
+	// the execution (waiting) and frees its work slot; Result.Payload is ignored.
+	// Use this for long-running activities (e.g. an agent call) so the engine does
+	// not block.
 	StatusPending Status = "pending"
 )
 
@@ -55,6 +57,7 @@ type Request struct {
 	ExecutionID string          `json:"execution_id"` // owning execution
 	NodeID      string          `json:"node_id"`      // node being executed
 	Payload     json.RawMessage `json:"payload"`      // shared execution context
+	Generation  uint64          `json:"generation"`   // execution-scoped visit generation for this node
 	Attempt     int             `json:"attempt"`      // 0-based attempt number
 	Deadline    time.Time       `json:"deadline"`     // hard deadline for this attempt
 }
@@ -82,6 +85,11 @@ func (f Func) Invoke(ctx context.Context, req Request) (Result, error) { return 
 // Registry dispatches an invocation to a registered Invoker by kind
 // (Request.Invoker). It is itself an Invoker, so the engine holds exactly one
 // Invoker regardless of how many kinds are configured.
+//
+// The kind map is not synchronized: all Register calls must complete during
+// setup (before Server.Run starts concurrent Invoke dispatch). Registering a
+// kind while invocations are in flight is a data race — the Registry is
+// build-once, read-only-thereafter.
 type Registry struct {
 	m map[string]Invoker
 }
@@ -89,8 +97,49 @@ type Registry struct {
 // NewRegistry returns an empty Registry.
 func NewRegistry() *Registry { return &Registry{m: map[string]Invoker{}} }
 
-// Register binds kind to inv, replacing any previous binding for kind.
-func (r *Registry) Register(kind string, inv Invoker) { r.m[kind] = inv }
+// Register binds kind to inv. It rejects nil invokers and duplicate kinds so a
+// registration mistake cannot silently replace the invoker that will execute
+// later work. Use Replace when replacement is intentional.
+func (r *Registry) Register(kind string, inv Invoker) error {
+	if isNilInvoker(inv) {
+		return fmt.Errorf("invoker: kind %q registered with nil Invoker", kind)
+	}
+
+	if _, ok := r.m[kind]; ok {
+		return fmt.Errorf("invoker: kind %q already registered", kind)
+	}
+
+	r.m[kind] = inv
+
+	return nil
+}
+
+// Replace binds kind to inv, replacing any previous binding for kind.
+func (r *Registry) Replace(kind string, inv Invoker) error {
+	if isNilInvoker(inv) {
+		return fmt.Errorf("invoker: kind %q registered with nil Invoker", kind)
+	}
+
+	r.m[kind] = inv
+
+	return nil
+}
+
+func isNilInvoker(inv Invoker) bool {
+	if inv == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(inv)
+	kind := v.Kind()
+
+	return (kind == reflect.Chan ||
+		kind == reflect.Func ||
+		kind == reflect.Interface ||
+		kind == reflect.Map ||
+		kind == reflect.Pointer ||
+		kind == reflect.Slice) && v.IsNil()
+}
 
 // Has reports whether kind is registered.
 func (r *Registry) Has(kind string) bool { _, ok := r.m[kind]; return ok }

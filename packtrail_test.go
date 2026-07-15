@@ -17,6 +17,7 @@ package packtrail_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,8 +102,13 @@ func TestWithFlowDefEndToEnd(t *testing.T) {
 	for time.Now().Before(deadline) {
 		ex, getErr := s.Get(ctx, id)
 		if getErr == nil && ex.Status == packtrail.ExecCompleted {
-			if string(ex.Payload) != `{"last":"agent-b"}` {
-				t.Fatalf("final payload = %s, want last=agent-b", ex.Payload)
+			doc, resErr := s.Results(ctx, id)
+			if resErr != nil {
+				t.Fatalf("results: %v", resErr)
+			}
+
+			if !strings.Contains(string(doc), `"b":{"last":"agent-b"}`) {
+				t.Fatalf("results = %s, want results.b = {\"last\":\"agent-b\"}", doc)
 			}
 
 			mu.Lock()
@@ -166,8 +172,13 @@ func TestCustomInvokerEndToEnd(t *testing.T) {
 	for time.Now().Before(deadline) {
 		ex, getErr := s.Get(ctx, id)
 		if getErr == nil && ex.Status == packtrail.ExecCompleted {
-			if string(ex.Payload) != `{"last":"agent-b"}` {
-				t.Fatalf("final payload = %s, want last=agent-b", ex.Payload)
+			doc, resErr := s.Results(ctx, id)
+			if resErr != nil {
+				t.Fatalf("results: %v", resErr)
+			}
+
+			if !strings.Contains(string(doc), `"b":{"last":"agent-b"}`) {
+				t.Fatalf("results = %s, want results.b = {\"last\":\"agent-b\"}", doc)
 			}
 
 			mu.Lock()
@@ -198,8 +209,8 @@ nodes:
 edges: []
 `
 
-// waitCompleted polls until the execution completes (returning its payload) or
-// the deadline passes.
+// waitCompleted polls until the execution completes (returning its assembled
+// results document) or the deadline passes.
 func waitCompleted(ctx context.Context, t *testing.T, s *packtrail.Server, id string) json.RawMessage {
 	t.Helper()
 
@@ -207,7 +218,12 @@ func waitCompleted(ctx context.Context, t *testing.T, s *packtrail.Server, id st
 	for time.Now().Before(deadline) {
 		ex, err := s.Get(ctx, id)
 		if err == nil && ex.Status == packtrail.ExecCompleted {
-			return ex.Payload
+			doc, resErr := s.Results(ctx, id)
+			if resErr != nil {
+				t.Fatalf("results: %v", resErr)
+			}
+
+			return doc
 		}
 
 		if err == nil && ex.Status == packtrail.ExecFailed {
@@ -239,7 +255,7 @@ func TestNATSTaskHandleNamespaced(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 
-	if handleErr := s.Handle("tasks.x.*", func(_ context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, error) {
+	if handleErr := s.Handle(context.Background(), "tasks.x.*", func(_ context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, error) {
 		out, _ := json.Marshal(map[string]string{"handled": req.NodeID})
 		return packtrail.TaskResponse{Status: packtrail.TaskOK, Payload: out}, nil
 	}); handleErr != nil {
@@ -256,8 +272,8 @@ func TestNATSTaskHandleNamespaced(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	if got := string(waitCompleted(ctx, t, s, id)); got != `{"handled":"x"}` {
-		t.Fatalf("final payload = %s, want {\"handled\":\"x\"}", got)
+	if got := string(waitCompleted(ctx, t, s, id)); !strings.Contains(got, `"x":{"handled":"x"}`) {
+		t.Fatalf("results = %s, want results.x = {\"handled\":\"x\"}", got)
 	}
 }
 
@@ -277,7 +293,7 @@ func TestNATSTaskNamespaceIsolation(t *testing.T) {
 			t.Fatalf("new %s: %v", ns, err)
 		}
 
-		if handleErr := s.Handle("tasks.x.*", func(_ context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, error) {
+		if handleErr := s.Handle(context.Background(), "tasks.x.*", func(_ context.Context, req packtrail.TaskRequest) (packtrail.TaskResponse, error) {
 			atomic.AddInt32(hits, 1)
 			return packtrail.TaskResponse{Status: packtrail.TaskOK, Payload: req.Payload}, nil
 		}); handleErr != nil {

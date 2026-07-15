@@ -48,6 +48,7 @@ func newTestServer(t *testing.T) *packtrail.Server {
 		packtrail.WithNamespace("uitest"),
 		packtrail.WithFlow([]byte(apiFlow)),
 		packtrail.WithInvoker("custom", custom),
+		packtrail.WithHistory(time.Hour),
 	)
 	if err != nil {
 		t.Fatalf("packtrail.New: %v", err)
@@ -122,9 +123,63 @@ func TestAPIFlowsAndExecutions(t *testing.T) {
 		t.Errorf("detail flow = %v, want api-flow", ex["flow"])
 	}
 
-	// missing flow → 404
+	if ex["node_generation"] == nil {
+		t.Errorf("detail missing node_generation: %v", ex)
+	}
+
+	if versions, ok := ex["output_versions"].(map[string]any); !ok || versions["a"] == nil || versions["b"] == nil {
+		t.Errorf("detail output_versions = %v, want committed versions for a and b", ex["output_versions"])
+	}
+
+	// /api/executions/{id}/results — the assembled data-plane context
+	var res map[string]any
+	mustJSON(t, h, "/api/executions/"+id+"/results", &res)
+
+	if _, ok := res["input"]; !ok {
+		t.Errorf("results missing input: %v", res)
+	}
+
+	if outs, ok := res["results"].(map[string]any); !ok || outs["a"] == nil || outs["b"] == nil {
+		t.Errorf("results.results = %v, want outputs for a and b", res["results"])
+	}
+
+	if _, ok := res["branches"]; !ok {
+		t.Errorf("results missing branches: %v", res)
+	}
+
+	if res["last_node"] != "b" {
+		t.Errorf("results.last_node = %v, want b", res["last_node"])
+	}
+
+	// /api/executions/{id}/history — history is emitted best-effort, so poll
+	// briefly for the trace to land.
+	var hist []map[string]any
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		hist = nil
+		mustJSON(t, h, "/api/executions/"+id+"/history?limit=50", &hist)
+
+		if len(hist) > 0 && hist[len(hist)-1]["status"] == string(packtrail.ExecCompleted) {
+			break
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if len(hist) == 0 {
+		t.Error("history is empty, want the execution's transition trace")
+	} else if last := hist[len(hist)-1]; last["status"] != string(packtrail.ExecCompleted) {
+		t.Errorf("last history status = %v, want completed", last["status"])
+	}
+
+	// missing flow / execution → 404
 	if code := doGetCode(t, h, "/api/flows/nope"); code != http.StatusNotFound {
 		t.Errorf("missing flow code = %d, want 404", code)
+	}
+
+	if code := doGetCode(t, h, "/api/executions/nope/results"); code != http.StatusNotFound {
+		t.Errorf("missing execution results code = %d, want 404", code)
 	}
 }
 

@@ -23,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/henomis/packtrail"
+	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
 )
 
@@ -67,7 +70,8 @@ func TestWithFlowsDir(t *testing.T) {
 		t.Fatalf("write flow: %v", err)
 	}
 
-	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("fdir"), packtrail.WithFlowsDir(dir))
+	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("fdir"), packtrail.WithFlowsDir(dir),
+		packtrail.WithInvoker("custom", okInvoker()))
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -75,6 +79,46 @@ func TestWithFlowsDir(t *testing.T) {
 	flows := s.Flows()
 	if len(flows) != 1 || flows[0] != "one" {
 		t.Fatalf("Flows() = %v, want [one]", flows)
+	}
+}
+
+func TestFlowsSorted(t *testing.T) {
+	srv := natstest.Start(t)
+
+	zFlow := []byte(`
+version: "1.0"
+name: zed
+nodes:
+  - {id: a, type: task, invoker: custom, target: agent-a}
+`)
+	aFlow := []byte(`
+version: "1.0"
+name: alpha
+nodes:
+  - {id: a, type: task, invoker: custom, target: agent-a}
+`)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("flow-sort"),
+		packtrail.WithFlow(zFlow),
+		packtrail.WithFlow(aFlow),
+		packtrail.WithInvoker("custom", okInvoker()),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	if flows := s.Flows(); len(flows) != 2 || flows[0] != "alpha" || flows[1] != "zed" {
+		t.Fatalf("Flows() = %v, want [alpha zed]", flows)
+	}
+
+	listed, err := s.ListFlows(context.Background())
+	if err != nil {
+		t.Fatalf("ListFlows: %v", err)
+	}
+
+	if len(listed) != 2 || listed[0] != "alpha" || listed[1] != "zed" {
+		t.Fatalf("ListFlows() = %v, want [alpha zed]", listed)
 	}
 }
 
@@ -91,7 +135,8 @@ func TestObservabilityMethods(t *testing.T) {
 		packtrail.WithLeaseTTL(15*time.Second),
 		packtrail.WithMaxConcurrency(8),
 		packtrail.WithDefaultTimeout(5*time.Second),
-		packtrail.WithReconcile("* * * * * *"),
+		packtrail.WithReconcileActive("* * * * * *"),
+		packtrail.WithReconcileFull("* * * * * *"),
 	)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -153,7 +198,8 @@ func TestObservabilityMethods(t *testing.T) {
 func TestGetNotFound(t *testing.T) {
 	srv := natstest.Start(t)
 
-	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("gnf"), packtrail.WithFlow([]byte(oneTaskFlow)))
+	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("gnf"), packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()))
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -247,6 +293,133 @@ edges:
 		return getErr == nil && ex.Status == packtrail.ExecCompleted
 	}); !ok {
 		t.Fatal("execution did not complete after signal")
+	}
+}
+
+// TestServerStartWithID verifies the public idempotent Start: a retry with the
+// same id returns the same id and leaves exactly one execution.
+func TestServerStartWithID(t *testing.T) {
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("idem"),
+		packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	const key = "invoice-987"
+
+	id1, err := s.StartWithID(ctx, key, "one", nil)
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+
+	id2, err := s.StartWithID(ctx, key, "one", nil)
+	if err != nil {
+		t.Fatalf("retry start: %v", err)
+	}
+
+	if id1 != key || id2 != key {
+		t.Fatalf("ids = %q, %q; want both %q", id1, id2, key)
+	}
+
+	if ok := poll(t, 10*time.Second, func() bool {
+		ex, getErr := s.Get(ctx, key)
+		return getErr == nil && ex.Status == packtrail.ExecCompleted
+	}); !ok {
+		t.Fatal("execution did not complete")
+	}
+
+	// Exactly one execution exists despite the duplicate Start.
+	ids, err := s.List(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != key {
+		t.Fatalf("List = %v, %v; want exactly [%s]", ids, err, key)
+	}
+
+	// An invalid id is rejected.
+	if _, badErr := s.StartWithID(ctx, "bad id.with*chars", "one", nil); badErr == nil {
+		t.Fatal("StartWithID with invalid id: got nil error, want rejection")
+	}
+}
+
+// TestServerCancel cancels an execution parked on a signal via Server.Cancel and
+// verifies it settles to cancelled, the visibility index reflects the cancelled
+// status, and a later signal does not revive it.
+func TestServerCancel(t *testing.T) {
+	const sigFlow = `
+version: "1.0"
+name: cancelflow
+nodes:
+  - {id: gate, type: signal, signal_name: approval, timeout: 24h}
+  - {id: done, type: task, invoker: custom, target: t}
+edges:
+  - {from: gate, to: done}
+`
+
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("cancel"),
+		packtrail.WithFlow([]byte(sigFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+		packtrail.WithReconcileActive("* * * * * *"),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	id, err := s.Start(ctx, "cancelflow", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	if ok := poll(t, 10*time.Second, func() bool {
+		ex, getErr := s.Get(ctx, id)
+		return getErr == nil && ex.Status == packtrail.ExecWaiting
+	}); !ok {
+		t.Fatal("execution did not reach waiting state")
+	}
+
+	if cancelErr := s.Cancel(ctx, id, "operator abort"); cancelErr != nil {
+		t.Fatalf("cancel: %v", cancelErr)
+	}
+
+	ex, err := s.Get(ctx, id)
+	if err != nil || ex.Status != packtrail.ExecCancelled || ex.Error != "operator abort" {
+		t.Fatalf("after cancel: status=%q reason=%q err=%v, want cancelled/operator abort", ex.Status, ex.Error, err)
+	}
+
+	// The visibility index (eventually consistent) reflects the cancelled status.
+	if ok := poll(t, 10*time.Second, func() bool {
+		byStatus, _ := s.ByStatus(ctx, packtrail.ExecCancelled)
+		return len(byStatus) == 1 && byStatus[0] == id
+	}); !ok {
+		t.Fatal("ByStatus did not index the cancelled execution")
+	}
+
+	// A late signal must not revive a cancelled execution.
+	if signalErr := s.Signal(ctx, id, "approval", json.RawMessage(`{"approved":true}`)); signalErr != nil {
+		t.Fatalf("signal: %v", signalErr)
+	}
+
+	if ok := poll(t, 2*time.Second, func() bool {
+		cur, getErr := s.Get(ctx, id)
+		return getErr == nil && cur.Status != packtrail.ExecCancelled
+	}); ok {
+		t.Fatal("cancelled execution was revived by a late signal")
 	}
 }
 
@@ -380,4 +553,97 @@ func TestServerScheduleFlow(t *testing.T) {
 	}); !ok {
 		t.Fatal("scheduled flow did not start any execution")
 	}
+}
+
+// TestFullReconcileReclaimsFiredSchedules verifies the scheduled full-reconcile
+// maintenance path bounds retained sched.fire.* messages instead of leaving
+// cleanup to callers.
+func TestFullReconcileReclaimsFiredSchedules(t *testing.T) {
+	srv := natstest.Start(t)
+
+	const namespace = "full-reclaim"
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace(namespace),
+		packtrail.WithFlow([]byte(oneTaskFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+		packtrail.WithReconcileFull("* * * * * *"),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = s.Run(ctx) }()
+
+	n := names.New(namespace)
+
+	var ackFloor uint64
+
+	if ok := poll(t, 20*time.Second, func() bool {
+		floor, floorErr := firedAckFloor(ctx, srv, n)
+		if floorErr != nil {
+			return false
+		}
+
+		ackFloor = floor
+
+		return floor >= 5
+	}); !ok {
+		t.Fatalf("full reconcile consumed too few fired schedules; ack floor stream sequence = %d", ackFloor)
+	}
+
+	var retained uint64
+	if ok := poll(t, 5*time.Second, func() bool {
+		count, countErr := firedScheduleMessages(ctx, srv, n)
+		if countErr != nil {
+			return false
+		}
+
+		retained = count
+
+		return count <= 2
+	}); !ok {
+		t.Fatalf("retained fired schedule messages = %d, want <= 2 after full-reconcile reclaim", retained)
+	}
+}
+
+func firedAckFloor(ctx context.Context, srv *natstest.Server, n names.Names) (uint64, error) {
+	stream, err := srv.JS.Stream(ctx, n.StreamSchedule)
+	if err != nil {
+		return 0, err
+	}
+
+	consumer, err := stream.Consumer(ctx, n.DurFired)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := consumer.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.AckFloor.Stream, nil
+}
+
+func firedScheduleMessages(ctx context.Context, srv *natstest.Server, n names.Names) (uint64, error) {
+	stream, err := srv.JS.Stream(ctx, n.StreamSchedule)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(n.SubjSchedFirePrefix+">"))
+	if err != nil {
+		return 0, err
+	}
+
+	var total uint64
+	for _, count := range info.State.Subjects {
+		total += count
+	}
+
+	return total, nil
 }

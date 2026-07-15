@@ -14,23 +14,47 @@
 
 package dsl
 
-import "testing"
+import (
+	"io/fs"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
-// TestExampleFlowsValidate ensures every flow shipped under examples/ parses and
-// passes validation, so the CLI's default flows directory always works.
+// TestExampleFlowsValidate ensures every flow YAML shipped under examples/
+// (each example keeps its own flows/ directory) parses and passes validation,
+// so the examples always work as documented.
 func TestExampleFlowsValidate(t *testing.T) {
-	flows, err := LoadDir("../../examples")
-	if err != nil {
-		t.Fatalf("load example flows: %v", err)
-	}
+	found := 0
 
-	if len(flows) == 0 {
-		t.Fatal("no example flows found")
-	}
-
-	for name, f := range flows {
-		if f.StartNode() == "" {
-			t.Errorf("flow %q has no start node", name)
+	err := filepath.WalkDir("../../examples", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+
+		if d.IsDir() || (!strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml")) {
+			return nil
+		}
+
+		found++
+
+		f, pErr := ParseFile(path)
+		if pErr != nil {
+			t.Errorf("parse %s: %v", path, pErr)
+			return nil
+		}
+
+		if f.StartNode() == "" {
+			t.Errorf("flow %q (%s) has no start node", f.Name, path)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk examples: %v", err)
+	}
+
+	if found == 0 {
+		t.Fatal("no example flow YAMLs found")
 	}
 }

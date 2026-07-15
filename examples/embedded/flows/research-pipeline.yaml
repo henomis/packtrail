@@ -1,9 +1,10 @@
 version: "1.0"
 name: research-pipeline
 
-# A fan-out research pipeline (spec §4.1): triage, three parallel research
-# branches joined with an "all" policy, a risk-based choice, synthesis, then a
-# human approval signal that falls back to escalation on timeout.
+# A fan-out research pipeline: triage, three parallel research branches joined
+# with an "all" policy, a risk-based choice, synthesis, then a human approval
+# signal that falls back to escalation on timeout. Choice rules evaluate the
+# assembled context: input (start payload), results.<node>, signals.<name>.
 nodes:
   - id: triage
     type: task
@@ -37,7 +38,7 @@ nodes:
   - id: route
     type: choice
     rules:
-      - when: "payload.risk_score > 80"
+      - when: "input.risk_score > 80"
         to: escalation
       - default: true
         to: synthesis

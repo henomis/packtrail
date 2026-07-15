@@ -17,6 +17,9 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/henomis/packtrail/internal/dsl"
@@ -34,10 +37,19 @@ const (
 // invoke executes a single task/branch node through the configured Invoker. It
 // applies the node timeout as the call deadline (both as a ctx deadline and in
 // the request), so individual Invokers do not have to.
+//
+// A panic from the Invoker is recovered and converted into a StatusError result:
+// this runs on the work-consumer goroutine, which has no recovery above it, so an
+// unrecovered panic would crash the whole engine process (every other in-flight
+// item with it). A panic is treated as a permanent failure rather than a retry —
+// a redelivery would likely re-panic — with a logged stack; the dead-letter cap
+// bounds any retry regardless. This is the synchronous counterpart to the async
+// worker's guard (invoker/asyncqueue Worker.invoke); together they contain a
+// buggy Invoker — sync or async — to its own execution.
 func (e *Engine) invoke(
 	ctx context.Context, node *dsl.Node, execID string,
-	payload json.RawMessage, attempt int,
-) (invoker.Result, error) {
+	payload json.RawMessage, generation uint64, attempt int,
+) (res invoker.Result, err error) {
 	timeout := node.Timeout.D()
 	if timeout <= 0 {
 		timeout = e.cfg.DefaultTimeout
@@ -46,12 +58,27 @@ func (e *Engine) invoke(
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("invoker panic",
+				"exec", execID, "node", node.ID, "attempt", attempt,
+				"panic", r, "stack", string(debug.Stack()))
+
+			res = invoker.Result{
+				Status: invoker.StatusError,
+				Error:  fmt.Sprintf("invoker panic: %v", r),
+			}
+			err = nil
+		}
+	}()
+
 	return e.invoker.Invoke(reqCtx, invoker.Request{
 		Invoker:     node.InvokerKind(),
 		Target:      dsl.ResolvePlaceholders(node.InvokeTarget(), execID),
 		ExecutionID: execID,
 		NodeID:      node.ID,
 		Payload:     payload,
+		Generation:  generation,
 		Attempt:     attempt,
 		Deadline:    time.Now().Add(timeout),
 	})
@@ -62,7 +89,12 @@ func (e *Engine) invoke(
 // execution is parked (waiting) and freed from the engine, to be settled later
 // via CompleteActivity.
 func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution) error {
-	res, callErr := e.invoke(ctx, node, exec.ID, exec.Payload, exec.Attempt)
+	contextDoc, err := e.assembleContext(ctx, exec)
+	if err != nil {
+		return err
+	}
+
+	res, callErr := e.invoke(ctx, node, exec.ID, contextDoc, exec.NodeGeneration, exec.Attempt)
 
 	// Async dispatch: park until CompleteActivity is called. The work item is
 	// acked, freeing the engine slot for the agent's whole runtime. If a
@@ -71,8 +103,19 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 	if callErr == nil && res.Status == invoker.StatusPending {
 		var early *store.ActivityResult
 
-		updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-			if a := ex.Activity; a != nil && a.Node == node.ID && a.Attempt == exec.Attempt {
+		updated, mutErr := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+			// Park only if the execution is still active at this node/attempt: a
+			// Cancel (or a competing instance's transition) that landed while the
+			// dispatch was in flight must not be overwritten back to waiting. The
+			// outstanding CompleteActivity then no-ops against the terminal state.
+			if !taskSettleMatches(ex, exec, node.ID) {
+				return errSkip
+			}
+
+			if a := ex.Activity; a != nil &&
+				a.Node == node.ID &&
+				(a.Generation == 0 || a.Generation == ex.NodeGeneration) &&
+				a.Attempt == exec.Attempt {
 				early = a
 				ex.Activity = nil
 				ex.Status = store.StatusRunning // claim for settling
@@ -84,8 +127,12 @@ func (e *Engine) stepTask(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 
 			return nil
 		})
-		if err != nil {
-			return err
+		if mutErr != nil {
+			if errors.Is(mutErr, errSkip) {
+				return nil // cancelled or moved on while dispatching: drop
+			}
+
+			return mutErr
 		}
 
 		e.emitEvent(ctx, updated)
@@ -109,47 +156,119 @@ func (e *Engine) settleTask(
 	ctx context.Context, flow *dsl.Flow, node *dsl.Node,
 	exec *store.Execution, res invoker.Result, callErr error,
 ) error {
-	// Success: merge the response payload into the shared context and advance.
 	if callErr == nil && res.Status == invoker.StatusOK {
-		next := flow.Successor(node.ID)
-
-		return e.advanceTo(ctx, exec.ID, next, func(ex *store.Execution) {
-			if len(res.Payload) > 0 {
-				ex.Payload = res.Payload
-			}
-		})
+		return e.settleTaskSuccess(ctx, flow, node, exec, res)
 	}
 
 	// Permanent error from the task: fail immediately, no retry.
 	if callErr == nil && res.Status == invoker.StatusError {
-		return e.fail(ctx, exec.ID, "task "+node.ID+": "+res.Error)
+		return e.failTaskNode(ctx, exec, node.ID, "task "+node.ID+": "+res.Error)
 	}
 
-	// Transient failure (transport error, timeout, or explicit retry). Retry if
-	// attempts remain, scheduling the next attempt via the Message Scheduler.
+	// Transient: a transport error (callErr != nil), an explicit retry request,
+	// or a re-pending settle. These are re-driven per the node's retry policy.
+	if callErr != nil || res.Status == invoker.StatusRetry || res.Status == invoker.StatusPending {
+		return e.settleTaskRetry(ctx, node, exec, res, callErr)
+	}
+
+	// callErr == nil but the status is none of the known values (e.g. an empty or
+	// misspelled status from a buggy worker). Retrying re-hits the same bug and
+	// burns the whole retry budget, so fail fast with an actionable reason.
+	return e.failTaskNode(ctx, exec, node.ID,
+		fmt.Sprintf("task %s: unknown result status %q", node.ID, res.Status))
+}
+
+// settleTaskSuccess records a versioned output candidate in the data plane and
+// advances. The guarded control-plane CAS commits the selected candidate version;
+// a stale/lost-lease attempt can leave an orphan payload, but it cannot overwrite
+// the output version that Results reads.
+func (e *Engine) settleTaskSuccess(
+	ctx context.Context, flow *dsl.Flow, node *dsl.Node, exec *store.Execution, res invoker.Result,
+) error {
+	outputVersion := ""
+
+	if len(res.Payload) > 0 {
+		version, putErr := e.writeOutputCandidate(ctx, exec.ID, node.ID, res.Payload)
+		if putErr != nil {
+			if errors.Is(putErr, store.ErrPayloadTooLarge) {
+				return e.failTaskNode(ctx, exec, node.ID, putErr.Error())
+			}
+
+			return putErr
+		}
+
+		outputVersion = version
+	}
+
+	next := flow.Successor(node.ID)
+
+	return e.advanceToGenerationAttempt(
+		ctx, exec.ID, node.ID, exec.NodeGeneration, exec.Attempt, next,
+		func(ex *store.Execution) {
+			if outputVersion != "" {
+				ex.SetOutput(node.ID, outputVersion)
+			}
+		},
+	)
+}
+
+// settleTaskRetry handles a transient failure (transport error, timeout, or
+// explicit retry): retries if attempts remain, scheduling the next attempt via
+// the Message Scheduler, or fails the node once retries are exhausted.
+func (e *Engine) settleTaskRetry(
+	ctx context.Context, node *dsl.Node, exec *store.Execution, res invoker.Result, callErr error,
+) error {
 	reason := retryReason(res, callErr)
 	if exec.Attempt+1 >= maxAttempts(node) {
-		return e.fail(ctx, exec.ID, "task "+node.ID+" exhausted retries: "+reason)
+		return e.failTaskNode(ctx, exec, node.ID, "task "+node.ID+" exhausted retries: "+reason)
 	}
 
-	if _, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
-		ex.Status = store.StatusRunning
-		ex.Attempt++
-		ex.Error = reason
-
-		return nil
-	}); err != nil {
-		return err
-	}
-	// exec.Attempt is the pre-increment value; the attempt just scheduled is +1.
+	// exec.Attempt is the pre-increment value; the attempt being scheduled is +1.
 	delay := backoff(node, exec.Attempt+1, e.cfg.RetryBaseDelay, e.cfg.RetryMaxDelay)
 
-	item, marshalErr := json.Marshal(workItem{ExecID: exec.ID, Kind: kindAdvance})
+	retryAt := time.Now().Add(delay).UTC()
+
+	item, marshalErr := advanceWorkItem(exec.ID, node.ID, exec.NodeGeneration, exec.Attempt+1, retryAt)
 	if marshalErr != nil {
 		return marshalErr
 	}
 
-	return e.sched.After(ctx, exec.ID, delay, item)
+	updated, err := e.store.Mutate(ctx, exec.ID, func(ex *store.Execution) error {
+		// Bump the attempt only while the execution is still active at this
+		// node/attempt: a cancelled execution must stay cancelled, and a stale or
+		// duplicate settlement must not double-bump (and double-schedule) a retry.
+		if !taskSettleMatches(ex, exec, node.ID) {
+			return errSkip
+		}
+
+		ex.Status = store.StatusRunning
+		ex.Attempt++
+		ex.Error = reason
+		// RetryAt tells the stall watchdog this quiet period is a scheduled
+		// backoff, not a lost work item. The retry's scheduled delivery is
+		// committed in this same write (transactional outbox), so a crash can
+		// never bump the attempt yet lose its timer.
+		ex.RetryAt = retryAt
+		ex.AppendSched(item, ex.RetryAt)
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errSkip) {
+			return nil // cancelled or moved on: drop the retry
+		}
+
+		return err
+	}
+
+	return e.flushOutbox(ctx, updated)
+}
+
+func taskSettleMatches(ex, expected *store.Execution, nodeID string) bool {
+	return ex.Active() &&
+		ex.CurrentNode == nodeID &&
+		ex.NodeGeneration == expected.NodeGeneration &&
+		ex.Attempt == expected.Attempt
 }
 
 func maxAttempts(node *dsl.Node) int {
@@ -172,6 +291,15 @@ func retryReason(res invoker.Result, callErr error) string {
 	return retryRequestedMessage
 }
 
+// maxBackoffShift caps the exponential-backoff shift. base << shift overflows
+// int64 for a large enough shift, and an overflow can wrap to a small positive
+// value that slips past the maxDelay clamp below — turning the intended long
+// backoff into a spuriously short one. Past this many doublings the delay is
+// already far beyond any sane maxDelay, so we saturate to maxDelay instead of
+// shifting. (dsl validation also caps max_attempts; this is the arithmetic
+// backstop.)
+const maxBackoffShift = 62
+
 // backoff returns the delay before the next attempt. attempt is the number of
 // attempts already made (1-based after the first failure).
 func backoff(node *dsl.Node, attempt int, base, maxDelay time.Duration) time.Duration {
@@ -184,7 +312,13 @@ func backoff(node *dsl.Node, attempt int, base, maxDelay time.Duration) time.Dur
 
 	switch kind {
 	case backoffKindExponential:
-		d = base << (attempt - 1) // attempt>=1
+		// Saturate rather than shift once the doublings would overflow int64; an
+		// overflow could wrap into (0, maxDelay] and escape the clamp below.
+		if shift := attempt - 1; shift >= maxBackoffShift {
+			d = maxDelay
+		} else {
+			d = base << shift // attempt>=1
+		}
 	case backoffKindLinear:
 		d = base * time.Duration(attempt)
 	default: // fixed

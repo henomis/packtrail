@@ -31,7 +31,7 @@ nodes:
   - id: route
     type: choice
     rules:
-      - {when: 'payload.x == 1', to: b}
+      - {when: 'input.x == 1', to: b}
       - {default: true, to: c}
   - {id: b, type: task, invoker: custom, target: agent-b}
   - {id: c, type: task, invoker: custom, target: agent-c}
@@ -42,7 +42,8 @@ edges:
 func TestFlowRegistry(t *testing.T) {
 	srv := natstest.Start(t)
 
-	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("obs"), packtrail.WithFlow([]byte(observeFlow)))
+	s, err := packtrail.New(srv.NC, packtrail.WithNamespace("obs"), packtrail.WithFlow([]byte(observeFlow)),
+		packtrail.WithInvoker("custom", okInvoker()))
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -121,6 +122,65 @@ func TestWatchEvents(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatal("did not observe completion event")
+		}
+	}
+}
+
+// TestWatchEventsCancelUnderLoad cancels a watch while events are still being
+// produced and the subscriber is NOT draining the channel — the shape that
+// used to race a late consume callback into a send on the just-closed channel
+// (cc.Stop does not wait for an executing callback). A panic there kills the
+// process, so the test failing to complete IS the regression signal; the
+// closed channel must also be observed.
+func TestWatchEventsCancelUnderLoad(t *testing.T) {
+	srv := natstest.Start(t)
+	custom := packtrail.InvokerFunc(func(_ context.Context, _ packtrail.Request) (packtrail.Result, error) {
+		return packtrail.Result{Status: packtrail.StatusOK, Payload: []byte(`{"x":1}`)}, nil
+	})
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("obs4"),
+		packtrail.WithFlow([]byte(observeFlow)),
+		packtrail.WithInvoker("custom", custom),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
+
+	go func() { _ = s.Run(runCtx) }()
+
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+
+	events, err := s.WatchEvents(watchCtx)
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+
+	// Produce a steady stream of transitions (3 events per execution) while
+	// nobody reads: the channel buffer fills and callbacks block in their send.
+	for range 30 {
+		if _, startErr := s.Start(runCtx, "observe-me", []byte(`{"x":1}`)); startErr != nil {
+			t.Fatalf("start: %v", startErr)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond) // let events pile up mid-flight
+	cancelWatch()
+
+	// The channel must close; draining whatever was buffered must not hang.
+	deadline := time.After(5 * time.Second)
+
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("event channel never closed after cancel")
 		}
 	}
 }

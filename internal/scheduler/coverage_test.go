@@ -54,8 +54,8 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 	ctx := context.Background()
 	srv := natstest.Start(t)
 
-	sched, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sched := scheduler.New(srv.JS, names.New(""))
+	if err := sched.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 		done  = make(chan struct{})
 	)
 
-	cc, err := sched.ConsumeFired(ctx, "test-fired-err", func(string, []byte) error {
+	cc, err := sched.ConsumeFired(ctx, "test-fired-err", 10, nil, func(string, []byte, string) error {
 		// Fail the first delivery (Nak), succeed on redelivery (Ack).
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded
@@ -94,14 +94,68 @@ func TestConsumeFiredHandlerErrorRedelivers(t *testing.T) {
 	}
 }
 
-// TestNewContextError drives New's error-wrapping path with a cancelled context.
-func TestNewContextError(t *testing.T) {
+// terminalError is a non-retryable handler error. ConsumeFired detects it
+// structurally (interface{ Terminal() bool }) — mirroring the runtime engine's
+// terminalError for a cron start of a removed flow — and Terms it.
+type terminalError struct{}
+
+func (terminalError) Error() string  { return "terminal" }
+func (terminalError) Terminal() bool { return true }
+
+// TestConsumeFiredTerminalDeadLetters verifies a terminal handler error is Term'd
+// on the first delivery (not redelivered): the handler is invoked exactly once.
+func TestConsumeFiredTerminalDeadLetters(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	sched := scheduler.New(srv.JS, names.New(""))
+	if err := sched.EnsureStream(ctx); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	cc, err := sched.ConsumeFired(ctx, "test-fired-terminal", 10, nil, func(string, []byte, string) error {
+		calls.Add(1)
+
+		return terminalError{}
+	})
+	if err != nil {
+		t.Fatalf("consume fired: %v", err)
+	}
+
+	t.Cleanup(cc.Stop)
+
+	if afterErr := sched.After(ctx, "exec-term", time.Second, []byte("x")); afterErr != nil {
+		t.Fatalf("after: %v", afterErr)
+	}
+
+	deadline := time.After(5 * time.Second)
+
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("fired schedule never reached the handler")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	time.Sleep(2 * time.Second) // longer than firedNakDelay; a Nak would redeliver
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler called %d times, want 1 (terminal error dead-lettered, not redelivered)", got)
+	}
+}
+
+// TestEnsureStreamContextError drives EnsureStream's error-wrapping path with a
+// cancelled context (New itself performs no I/O and cannot fail).
+func TestEnsureStreamContextError(t *testing.T) {
 	srv := natstest.Start(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := scheduler.New(ctx, srv.JS, names.New("")); err == nil {
-		t.Fatal("New with cancelled context succeeded, want error")
+	if err := scheduler.New(srv.JS, names.New("")).EnsureStream(ctx); err == nil {
+		t.Fatal("EnsureStream with cancelled context succeeded, want error")
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestServeRoundTrip(t *testing.T) {
 
 	var gotReq protocol.TaskRequest
 
-	sub, err := protocol.Serve(srv.NC, "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
 		gotReq = req
 		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: req.Payload}, nil
 	})
@@ -92,7 +93,7 @@ func TestServeRoundTrip(t *testing.T) {
 func TestServeHandlerErrorIsRetry(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.Serve(srv.NC, "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{}, errors.New("transient boom")
 	})
 	if err != nil {
@@ -111,12 +112,34 @@ func TestServeHandlerErrorIsRetry(t *testing.T) {
 	}
 }
 
+func TestServeRejectsInvalidStatus(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.invalid.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: "pending"}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	resp := request(t, srv, "tasks.invalid.x", protocol.TaskRequest{ExecutionID: "exec-invalid"})
+	if resp.Status != protocol.StatusError {
+		t.Fatalf("status = %q, want error", resp.Status)
+	}
+
+	if !strings.Contains(resp.Error, "invalid task status") {
+		t.Fatalf("error = %q, want invalid-status explanation", resp.Error)
+	}
+}
+
 // TestServeBadRequest verifies malformed JSON is answered with StatusError
 // rather than dropped.
 func TestServeBadRequest(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.Serve(srv.NC, "tasks.bad.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.bad.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		t.Fatal("handler should not be called for a malformed request")
 		return protocol.TaskResponse{}, nil
 	})
@@ -146,7 +169,7 @@ func TestServeBadRequest(t *testing.T) {
 func TestServeNamespaced(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(srv.NC, "acme", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "acme", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
 	})
 	if err != nil {

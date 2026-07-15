@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,12 +85,18 @@ func TestFanoutFaninAll(t *testing.T) {
 	if !doneCalled.Load() {
 		t.Error("done task was not reached")
 	}
-	// Branch results were merged into the shared payload.
-	var root map[string]json.RawMessage
 
-	_ = json.Unmarshal(ex.Payload, &root)
-	if _, ok := root["branches"]; !ok {
-		t.Errorf("merged branch results missing from payload: %s", ex.Payload)
+	// Branch outputs live in the data plane under results.<branch>.
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	got := parseCtx(t, doc)
+	for _, b := range []string{"x", "y", "z"} {
+		if len(got.Results[b]) == 0 {
+			t.Errorf("results.%s missing from the assembled context: %s", b, doc)
+		}
 	}
 }
 
@@ -123,6 +130,38 @@ func TestFanoutQuorum(t *testing.T) {
 
 	if !doneCalled.Load() {
 		t.Error("done not reached despite quorum met")
+	}
+}
+
+// TestFanoutBranchOversizedOutputFailsExecution: a fanout branch whose output
+// exceeds the per-entry payload limit must fail the execution fast — mirroring
+// the task path (TestPayloadLimitFailsExecution) — rather than leaving the
+// branch BranchPending and stranding an all-join forever. Regression test for
+// the sync-fanout persistence-failure stranding bug.
+func TestFanoutBranchOversizedOutputFailsExecution(t *testing.T) {
+	h := newHarness(t, fanFlow("all"), Config{})
+	h.store.SetMaxPayloadBytes(128)
+
+	big := setField(json.RawMessage(`{}`), "blob", strings.Repeat("x", 256))
+
+	h.serve(t, "tasks.start.*", passthrough)
+	// x produces an over-limit output; y and z settle small and ok.
+	h.serve(t, "tasks.x.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: big}, nil
+	})
+	h.serve(t, "tasks.y.*", okBranch("y"))
+	h.serve(t, "tasks.z.*", okBranch("z"))
+	h.serve(t, "tasks.done.*", passthrough)
+
+	id, err := h.engine.Start(context.Background(), "fan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Must reach a terminal failure, not hang at the fanin waiting on x forever.
+	ex := h.waitStatus(t, id, store.StatusFailed, 3*time.Second)
+	if !strings.Contains(ex.Error, "exceeds max size") {
+		t.Fatalf("failure reason = %q, want it to mention the oversized branch output", ex.Error)
 	}
 }
 

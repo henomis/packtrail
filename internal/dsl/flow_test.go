@@ -46,7 +46,7 @@ nodes:
   - id: route
     type: choice
     rules:
-      - when: "payload.risk_score > 80"
+      - when: "results.triage.risk_score > 80"
         to: escalation
       - default: true
         to: synthesis

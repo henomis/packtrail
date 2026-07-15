@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,21 +26,21 @@ import (
 	"github.com/henomis/packtrail/invoker"
 )
 
-// waitBranch polls until branch b of execution id reaches status, or fails.
-func waitBranch(t *testing.T, h *asyncHarness, id, b, status string) {
+// waitBranchXFailed polls until branch x of execution id fails, or fails.
+func waitBranchXFailed(t *testing.T, h *asyncHarness, id string) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		ex := h.get(t, id)
-		if ex.Branches[b].Status == status {
+		if ex.Branches["x"].Status == store.BranchFailed {
 			return
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	t.Fatalf("branch %s of %s never reached %q (have %q)", b, id, status, h.get(t, id).Branches[b].Status)
+	t.Fatalf("branch x of %s never reached failed (have %q)", id, h.get(t, id).Branches["x"].Status)
 }
 
 // TestScheduleFlowUnknown verifies ScheduleFlow rejects an unknown flow name.
@@ -51,30 +52,45 @@ func TestScheduleFlowUnknown(t *testing.T) {
 	}
 }
 
-// TestScheduleReconcileFires verifies a reconcile schedule fires the registered
-// OnReconcile callback.
+// TestScheduleReconcileFires verifies each reconcile schedule fires its own
+// registered callback (active and full are independent).
 func TestScheduleReconcileFires(t *testing.T) {
 	h := newHarness(t, linearFlow, Config{})
 
-	fired := make(chan struct{}, 1)
+	active := make(chan struct{}, 1)
+	full := make(chan struct{}, 1)
 
-	h.engine.OnReconcile(func(context.Context) error {
-		select {
-		case fired <- struct{}{}:
-		default:
+	signal := func(ch chan struct{}) func(context.Context) error {
+		return func(context.Context) error {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+
+			return nil
 		}
-
-		return nil
-	})
-
-	if err := h.engine.ScheduleReconcile(context.Background(), "* * * * * *"); err != nil {
-		t.Fatalf("schedule reconcile: %v", err)
 	}
 
-	select {
-	case <-fired:
-	case <-time.After(15 * time.Second):
-		t.Fatal("reconcile callback did not fire")
+	h.engine.OnReconcileActive(signal(active))
+	h.engine.OnReconcileFull(signal(full))
+
+	if err := h.engine.ScheduleReconcileActive(context.Background(), "* * * * * *"); err != nil {
+		t.Fatalf("schedule active reconcile: %v", err)
+	}
+
+	if err := h.engine.ScheduleReconcileFull(context.Background(), "* * * * * *"); err != nil {
+		t.Fatalf("schedule full reconcile: %v", err)
+	}
+
+	for _, c := range []struct {
+		name string
+		ch   chan struct{}
+	}{{"active", active}, {"full", full}} {
+		select {
+		case <-c.ch:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%s reconcile callback did not fire", c.name)
+		}
 	}
 }
 
@@ -135,6 +151,60 @@ func TestSignalTimeoutNoFallbackFails(t *testing.T) {
 	}
 }
 
+func TestSignalTimeoutFailRejectsStaleGeneration(t *testing.T) {
+	h := newHarness(t, signalTimeoutFlow, Config{})
+	ctx := context.Background()
+
+	exec := &store.Execution{
+		ID:             "sig-timeout-stale-generation",
+		FlowName:       "sigfail",
+		Status:         store.StatusWaiting,
+		CurrentNode:    "wait",
+		NodeGeneration: 2,
+		WaitSignal:     "approval",
+	}
+	if _, err := h.store.Create(ctx, exec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	staleSnapshot := *exec
+	staleSnapshot.NodeGeneration = 1
+
+	flow := h.engine.flows["sigfail"]
+	if err := h.engine.onWaitTimeout(ctx, flow, &staleSnapshot, workItem{
+		Kind: kindWaitTimeout, Node: "wait", Generation: 1, Signal: "approval",
+	}); err != nil {
+		t.Fatalf("stale timeout: %v", err)
+	}
+
+	afterStale, err := h.store.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+
+	if afterStale.Status != store.StatusWaiting ||
+		afterStale.CurrentNode != "wait" ||
+		afterStale.NodeGeneration != 2 ||
+		afterStale.WaitSignal != "approval" {
+		t.Fatalf("after stale timeout = %+v, want unchanged signal wait", afterStale)
+	}
+
+	if err = h.engine.onWaitTimeout(ctx, flow, afterStale, workItem{
+		Kind: kindWaitTimeout, Node: "wait", Generation: 2, Signal: "approval",
+	}); err != nil {
+		t.Fatalf("fresh timeout: %v", err)
+	}
+
+	afterFresh, err := h.store.Get(ctx, exec.ID)
+	if err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+
+	if afterFresh.Status != store.StatusFailed || afterFresh.Error == "" {
+		t.Fatalf("after fresh timeout = %+v, want failed with error", afterFresh)
+	}
+}
+
 // drainBranchDispatches reads the two initial fanout branch dispatches.
 func drainBranchDispatches(t *testing.T, h *asyncHarness) {
 	t.Helper()
@@ -164,7 +234,7 @@ func TestAsyncBranchError(t *testing.T) {
 		t.Fatalf("complete x: %v", completeErr)
 	}
 
-	waitBranch(t, h, id, "x", store.BranchFailed)
+	waitBranchXFailed(t, h, id)
 
 	// Settle the other branch OK; the "all" join is unmet → execution fails.
 	if completeErr := h.engine.CompleteActivity(ctx, id, "y", 0,
@@ -195,7 +265,69 @@ func TestAsyncBranchRetryExhausted(t *testing.T) {
 	}
 
 	// No attempts remain for branch x, so retry settles it as failed.
-	waitBranch(t, h, id, "x", store.BranchFailed)
+	waitBranchXFailed(t, h, id)
+}
+
+func TestAsyncBranchUnknownStatusFailsBranch(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanFlow)
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	drainBranchDispatches(t, h)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	if err = h.engine.CompleteActivity(ctx, id, "x", 0, invoker.Result{Status: invoker.Status("bogus")}); err != nil {
+		t.Fatalf("complete x: %v", err)
+	}
+
+	waitBranchXFailed(t, h, id)
+
+	if err = h.engine.CompleteActivity(ctx, id, "y", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"y"}`)}); err != nil {
+		t.Fatalf("complete y: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed)
+	if !strings.Contains(ex.Branches["x"].Error, "unknown result status") {
+		t.Fatalf("branch error = %q, want unknown-status failure", ex.Branches["x"].Error)
+	}
+}
+
+func TestAsyncBranchOversizedOutputFailsBranch(t *testing.T) {
+	h := newAsyncHarness(t, asyncFanFlow)
+	h.store.SetMaxPayloadBytes(128)
+
+	ctx := context.Background()
+
+	id, err := h.engine.Start(ctx, "async-fan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	drainBranchDispatches(t, h)
+	h.waitStatus(t, id, store.StatusWaiting)
+
+	big := setField(json.RawMessage(`{}`), "blob", strings.Repeat("x", 256))
+	if err = h.engine.CompleteActivity(ctx, id, "x", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: big}); err != nil {
+		t.Fatalf("complete x: %v", err)
+	}
+
+	waitBranchXFailed(t, h, id)
+
+	if err = h.engine.CompleteActivity(ctx, id, "y", 0,
+		invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"branch":"y"}`)}); err != nil {
+		t.Fatalf("complete y: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed)
+	if !strings.Contains(ex.Branches["x"].Error, "exceeds max size") {
+		t.Fatalf("branch error = %q, want payload-size failure", ex.Branches["x"].Error)
+	}
 }
 
 const asyncFanRetryFlow = `

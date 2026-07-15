@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -40,6 +41,9 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("GET /api/flows/{name}", a.flowGraph)
 	mux.HandleFunc("GET /api/executions", a.listExecutions)
 	mux.HandleFunc("GET /api/executions/{id}", a.getExecution)
+	mux.HandleFunc("GET /api/executions/{id}/results", a.getResults)
+	mux.HandleFunc("GET /api/executions/{id}/history", a.getHistory)
+	mux.HandleFunc("GET /api/deadletters", a.deadLetters)
 	mux.HandleFunc("GET /api/events", a.events)
 	mux.Handle("/", staticHandler())
 
@@ -129,12 +133,30 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	result, err := a.fetchSummaries(ctx, ids)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	writeJSON(w, result)
+}
+
+// fetchSummaries fetches a summary for each id concurrently. An id archived or
+// pruned between List and Get (ErrNotFound) is an expected skip; any other Get
+// error is returned (first one wins) so the caller surfaces the fault rather than
+// returning a silently-truncated list.
+func (a *api) fetchSummaries(ctx context.Context, ids []string) ([]execSummary, error) {
 	const maxParallel = 32
 
 	out := make([]execSummary, len(ids))
 	sem := make(chan struct{}, maxParallel)
 
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		errMu  sync.Mutex
+		getErr error
+	)
 
 	for i, id := range ids {
 		wg.Add(1)
@@ -145,17 +167,30 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			ex, getErr := a.srv.Get(ctx, id)
-			if getErr == nil {
+			ex, gerr := a.srv.Get(ctx, id)
+			switch {
+			case gerr == nil:
 				out[i] = execSummary{
 					ID: ex.ID, Flow: ex.Flow, Status: ex.Status,
 					CurrentNode: ex.CurrentNode, Error: ex.Error, UpdatedAt: ex.UpdatedAt,
 				}
+			case errors.Is(gerr, packtrail.ErrNotFound):
+				// Expected: gone between List and Get. Skip.
+			default:
+				errMu.Lock()
+				if getErr == nil {
+					getErr = gerr
+				}
+				errMu.Unlock()
 			}
 		}(i, id)
 	}
 
 	wg.Wait()
+
+	if getErr != nil {
+		return nil, getErr
+	}
 
 	result := make([]execSummary, 0, len(out))
 	for _, e := range out {
@@ -164,7 +199,7 @@ func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, result)
+	return result, nil
 }
 
 func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +215,84 @@ func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, ex)
+}
+
+// getResults returns the execution's assembled
+// {input, results, signals, branches, last_node} context document — the
+// data-plane view invokers and choice rules see. The control-state snapshot
+// (getExecution) does not carry payloads; this is where they live. An archived
+// execution's entries may be gone: what remains is returned.
+func (a *api) getResults(w http.ResponseWriter, r *http.Request) {
+	res, err := a.srv.Results(r.Context(), r.PathValue("id"))
+	if errors.Is(err, packtrail.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if _, err = w.Write(data); err != nil {
+		slog.Error("write results", "err", err)
+	}
+}
+
+// getHistory returns the execution's ordered transition trace (oldest first,
+// capped by ?limit=). It is empty unless the observed deployment runs with
+// WithHistory, so the dashboard treats an empty trace as "feature off".
+func (a *api) getHistory(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			limit = n
+		}
+	}
+
+	evs, err := a.srv.History(r.Context(), r.PathValue("id"), limit)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	if evs == nil {
+		evs = []packtrail.Event{}
+	}
+
+	writeJSON(w, evs)
+}
+
+// deadLetters returns the dead-letter count and the most recent records, so the
+// dashboard can surface dropped poison work (a non-zero count warrants attention).
+func (a *api) deadLetters(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	count, err := a.srv.DeadLetterCount(ctx)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	const recentCap = 50
+
+	recent, err := a.srv.RecentDeadLetters(ctx, recentCap)
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	writeJSON(w, map[string]any{"count": count, "recent": recent})
 }
 
 // events streams live execution transitions as Server-Sent Events.

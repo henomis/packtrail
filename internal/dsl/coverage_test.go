@@ -216,6 +216,10 @@ nodes:
 name: f
 nodes:
   - {id: a, type: task, subject: s, retry: {max_attempts: -1}}`,
+		"task retry over cap": `
+name: f
+nodes:
+  - {id: a, type: task, subject: s, retry: {max_attempts: 65}}`,
 		"fanout missing branches": `
 name: f
 nodes:

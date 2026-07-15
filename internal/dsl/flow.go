@@ -34,11 +34,24 @@ const (
 // It selects packtrail's built-in NATS request/reply transport (pkg/protocol).
 const DefaultInvoker = "nats-task"
 
+// SupportedVersion is the flow-definition schema version this build accepts. A
+// flow that omits version is still accepted for now (with a warning) but will be
+// required at v1.0; any other value is rejected at parse.
+const SupportedVersion = "1.0"
+
 // Join policy kinds for a fanin node.
 const (
 	JoinAll    = "all"
 	JoinAny    = "any"
 	JoinQuorum = "quorum" // requires Quorum > 0
+)
+
+// Retry backoff kinds for a task node's retry policy (RetryPolicy.Backoff). An
+// empty value defaults to BackoffFixed.
+const (
+	BackoffFixed       = "fixed"
+	BackoffLinear      = "linear"
+	BackoffExponential = "exponential"
 )
 
 // Flow is a parsed, validated Flow Definition.
@@ -74,12 +87,23 @@ type Node struct {
 	JoinPolicy string   `yaml:"join_policy"`
 
 	// choice
-	Rules []Rule `yaml:"rules"`
+	Rules   []Rule `yaml:"rules"`
+	OnError string `yaml:"on_error"` // "" (route to default on eval error) | "fail"
 
 	// signal
 	SignalName string `yaml:"signal_name"`
 	OnTimeout  string `yaml:"on_timeout"`
 }
+
+// Choice on_error modes: how a choice node reacts to a rule expression that
+// errors at runtime (e.g. a type error). OnErrorDefault (the default, empty)
+// treats an eval error as no-match and routes to the default rule — matching
+// "missing optional field = no match". OnErrorFail instead fails the execution,
+// for flows where routing is safety-relevant and silently defaulting is wrong.
+const (
+	OnErrorDefault = ""
+	OnErrorFail    = "fail"
+)
 
 // RetryPolicy controls task retries.
 type RetryPolicy struct {

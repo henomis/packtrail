@@ -63,15 +63,15 @@ func TestReconcileListError(t *testing.T) {
 	}
 }
 
-// TestListByPrefixContextError exercises the Watch error path of listByPrefix.
+// TestListByPrefixContextError exercises the Watch error path of collectIDs.
 func TestListByPrefixContextError(t *testing.T) {
 	_, st, _ := setup(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := listByPrefix(ctx, st.IdxStatus(), store.StatusRunning+sep); err == nil {
-		t.Fatal("listByPrefix with cancelled context succeeded, want error")
+	if _, err := collectIDs(ctx, st.IdxStatus(), store.StatusRunning+sep, 0); err == nil {
+		t.Fatal("collectIDs with cancelled context succeeded, want error")
 	}
 }
 
@@ -96,14 +96,14 @@ func TestListEventsByPrefixSkipsCorrupt(t *testing.T) {
 }
 
 // TestListEventsByPrefixContextError exercises the Watch error path of
-// listEventsByPrefix.
+// collectEvents.
 func TestListEventsByPrefixContextError(t *testing.T) {
 	_, st, _ := setup(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := listEventsByPrefix(ctx, st.IdxFlow(), "anyflow"+sep); err == nil {
-		t.Fatal("listEventsByPrefix with cancelled context succeeded, want error")
+	if _, err := collectEvents(ctx, st.IdxFlow(), "anyflow"+sep, 0); err == nil {
+		t.Fatal("collectEvents with cancelled context succeeded, want error")
 	}
 }

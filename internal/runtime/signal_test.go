@@ -80,11 +80,15 @@ func TestSignalResume(t *testing.T) {
 		t.Fatal("after not reached")
 	}
 
-	var root map[string]json.RawMessage
+	_ = ex
 
-	_ = json.Unmarshal(ex.Payload, &root)
-	if _, ok := root["approval"]; !ok {
-		t.Errorf("signal payload not merged: %s", ex.Payload)
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	if got := parseCtx(t, doc); string(got.Signals["approval"]) != `{"approved":true}` {
+		t.Errorf("signal payload missing from the assembled context: %s", doc)
 	}
 }
 

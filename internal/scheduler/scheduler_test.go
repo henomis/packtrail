@@ -37,14 +37,14 @@ func setup(t *testing.T) (context.Context, *scheduler.Scheduler, <-chan fired) {
 	ctx := context.Background()
 	srv := natstest.Start(t)
 
-	sched, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sched := scheduler.New(srv.JS, names.New(""))
+	if err := sched.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
 	ch := make(chan fired, 4)
 
-	cc, err := sched.ConsumeFired(ctx, "test-fired", func(key string, payload []byte) error {
+	cc, err := sched.ConsumeFired(ctx, "test-fired", 10, nil, func(key string, payload []byte, _ string) error {
 		ch <- fired{key: key, payload: append([]byte(nil), payload...)}
 		return nil
 	})
@@ -107,5 +107,60 @@ func TestFireSubject(t *testing.T) {
 	subj := sched.FireSubject("exec-9")
 	if subj == "" || subj == "exec-9" {
 		t.Fatalf("FireSubject returned %q, want a prefixed subject", subj)
+	}
+}
+
+// TestReclaimFiredPurgesAcked verifies ReclaimFired removes fired-schedule
+// messages below the consumer's ack floor once they are delivered and acked, and
+// leaves the stream able to schedule afterwards (F-001/F-013).
+func TestReclaimFiredPurgesAcked(t *testing.T) {
+	ctx, sched, ch := setup(t)
+
+	const n = 3
+	for range n {
+		if err := sched.After(ctx, "k", 10*time.Millisecond, []byte(`{}`)); err != nil {
+			t.Fatalf("after: %v", err)
+		}
+	}
+
+	for i := range n {
+		select {
+		case <-ch:
+		case <-time.After(fireTimeout):
+			t.Fatalf("firing %d not delivered", i)
+		}
+	}
+
+	// Poll: the ack floor advances shortly after each firing's handler acks.
+	var purged uint64
+
+	deadline := time.Now().Add(fireTimeout)
+	for time.Now().Before(deadline) {
+		p, err := sched.ReclaimFired(ctx, "test-fired")
+		if err != nil {
+			t.Fatalf("reclaim: %v", err)
+		}
+
+		purged += p
+		if purged > 0 {
+			break
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if purged == 0 {
+		t.Fatal("ReclaimFired purged nothing after acked firings")
+	}
+
+	// Scheduling still works after a reclaim (definitions/pending timers untouched).
+	if err := sched.After(ctx, "k", 10*time.Millisecond, []byte(`{}`)); err != nil {
+		t.Fatalf("after (post-reclaim): %v", err)
+	}
+
+	select {
+	case <-ch:
+	case <-time.After(fireTimeout):
+		t.Fatal("scheduling broken after reclaim")
 	}
 }

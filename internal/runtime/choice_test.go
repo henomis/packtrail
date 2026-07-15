@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ nodes:
   - id: route
     type: choice
     rules:
-      - when: "payload.risk_score > 80"
+      - when: "results.triage.risk_score > 80"
         to: escalation
       - default: true
         to: synthesis
@@ -44,8 +45,8 @@ edges:
 func runChoice(t *testing.T, riskScore int) string {
 	t.Helper()
 	h := newHarness(t, choiceFlow, Config{})
-	h.serve(t, "tasks.triage.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
-		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(req.Payload, "risk_score", riskScore)}, nil
+	h.serve(t, "tasks.triage.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(json.RawMessage(`{}`), "risk_score", riskScore)}, nil
 	})
 
 	reached := make(chan string, 2)
@@ -82,5 +83,95 @@ func TestChoiceRouting(t *testing.T) {
 
 	if got := runChoice(t, 10); got != "synthesis" {
 		t.Errorf("risk 10 routed to %q, want synthesis", got)
+	}
+}
+
+// A choice rule that errors at runtime: input.n is a number and input.s a
+// string, so the comparison is a type mismatch that expr evaluates to an error.
+const choiceErrOnErrorFailFlow = `
+name: choice-onerror-fail
+nodes:
+  - {id: seed, type: task, subject: "tasks.seed.{execution_id}"}
+  - id: route
+    type: choice
+    on_error: fail
+    rules:
+      - when: "input.n > input.s"
+        to: hi
+      - default: true
+        to: lo
+  - {id: hi, type: task, subject: "tasks.hi.{execution_id}"}
+  - {id: lo, type: task, subject: "tasks.lo.{execution_id}"}
+edges:
+  - {from: seed, to: route}
+`
+
+const choiceErrDefaultFlow = `
+name: choice-onerror-default
+nodes:
+  - {id: seed, type: task, subject: "tasks.seed.{execution_id}"}
+  - id: route
+    type: choice
+    rules:
+      - when: "input.n > input.s"
+        to: hi
+      - default: true
+        to: lo
+  - {id: hi, type: task, subject: "tasks.hi.{execution_id}"}
+  - {id: lo, type: task, subject: "tasks.lo.{execution_id}"}
+edges:
+  - {from: seed, to: route}
+`
+
+// TestChoiceOnErrorFailsExecution: with on_error: fail, a choice rule that errors
+// at runtime fails the execution instead of routing to the default (F-033).
+func TestChoiceOnErrorFailsExecution(t *testing.T) {
+	h := newHarness(t, choiceErrOnErrorFailFlow, Config{})
+	h.serve(t, "tasks.seed.*", passthrough)
+	h.serve(t, "tasks.hi.*", passthrough)
+	h.serve(t, "tasks.lo.*", passthrough)
+
+	id, err := h.engine.Start(context.Background(), "choice-onerror-fail", json.RawMessage(`{"n":1,"s":"a"}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed, 5*time.Second)
+	if !strings.Contains(ex.Error, "evaluation error") {
+		t.Fatalf("error = %q, want choice evaluation error", ex.Error)
+	}
+}
+
+// TestChoiceEvalErrorFallsToDefault: without on_error, the same erring rule is
+// treated as no-match and the default route is taken (unchanged behavior) (F-033).
+func TestChoiceEvalErrorFallsToDefault(t *testing.T) {
+	h := newHarness(t, choiceErrDefaultFlow, Config{})
+	h.serve(t, "tasks.seed.*", passthrough)
+
+	reached := make(chan string, 2)
+
+	h.serve(t, "tasks.hi.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
+		reached <- "hi"
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: req.Payload}, nil
+	})
+	h.serve(t, "tasks.lo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
+		reached <- "lo"
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: req.Payload}, nil
+	})
+
+	id, err := h.engine.Start(context.Background(), "choice-onerror-default", json.RawMessage(`{"n":1,"s":"a"}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	h.waitStatus(t, id, store.StatusCompleted, 5*time.Second)
+
+	select {
+	case got := <-reached:
+		if got != "lo" {
+			t.Fatalf("routed to %q, want lo (default on eval error)", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no terminal task reached")
 	}
 }

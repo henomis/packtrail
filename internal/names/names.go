@@ -28,24 +28,30 @@ type Names struct {
 
 	// KV buckets
 	BucketExecutions  string
+	BucketExecArchive string
 	BucketLeases      string
 	BucketIdxStatus   string
 	BucketIdxFlow     string
 	BucketResultCache string
 	BucketFlows       string
+	BucketPayloads    string
 
 	// streams
-	StreamEvents   string
-	StreamWork     string
-	StreamSignals  string
-	StreamSchedule string
+	StreamEvents     string
+	StreamWork       string
+	StreamSignals    string
+	StreamSchedule   string
+	StreamDeadLetter string
+	StreamHistory    string
 
 	// subject prefixes (each followed by an execution id or routing token)
-	SubjEventsPrefix    string
-	SubjWorkPrefix      string
-	SubjSignalPrefix    string
-	SubjSchedPrefix     string
-	SubjSchedFirePrefix string
+	SubjEventsPrefix     string
+	SubjWorkPrefix       string
+	SubjSignalPrefix     string
+	SubjSchedPrefix      string
+	SubjSchedFirePrefix  string
+	SubjDeadLetterPrefix string
+	SubjHistoryPrefix    string
 
 	// durable consumer names
 	DurEngine  string
@@ -65,22 +71,28 @@ func New(prefix string) Names {
 		Prefix: prefix,
 
 		BucketExecutions:  prefix + "-executions",
+		BucketExecArchive: prefix + "-executions-archive",
 		BucketLeases:      prefix + "-leases",
 		BucketIdxStatus:   prefix + "-idx-status",
 		BucketIdxFlow:     prefix + "-idx-flow",
 		BucketResultCache: prefix + "-result-cache",
 		BucketFlows:       prefix + "-flows",
+		BucketPayloads:    prefix + "-payloads",
 
-		StreamEvents:   prefix + "-events",
-		StreamWork:     prefix + "-work",
-		StreamSignals:  prefix + "-signals",
-		StreamSchedule: prefix + "-schedule",
+		StreamEvents:     prefix + "-events",
+		StreamWork:       prefix + "-work",
+		StreamSignals:    prefix + "-signals",
+		StreamSchedule:   prefix + "-schedule",
+		StreamDeadLetter: prefix + "-deadletter",
+		StreamHistory:    prefix + "-history",
 
-		SubjEventsPrefix:    prefix + ".events.",
-		SubjWorkPrefix:      prefix + ".work.",
-		SubjSignalPrefix:    prefix + ".signal.",
-		SubjSchedPrefix:     prefix + ".sched.",
-		SubjSchedFirePrefix: prefix + ".sched.fire.",
+		SubjEventsPrefix:     prefix + ".events.",
+		SubjWorkPrefix:       prefix + ".work.",
+		SubjSignalPrefix:     prefix + ".signal.",
+		SubjSchedPrefix:      prefix + ".sched.",
+		SubjSchedFirePrefix:  prefix + ".sched.fire.",
+		SubjDeadLetterPrefix: prefix + ".deadletter.",
+		SubjHistoryPrefix:    prefix + ".history.",
 
 		DurEngine:  prefix + "-engine",
 		DurFired:   prefix + "-engine-fired",

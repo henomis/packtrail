@@ -15,6 +15,7 @@
 package packtrail
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/henomis/packtrail/internal/dsl"
@@ -23,9 +24,10 @@ import (
 // FlowDef is a programmatic flow definition. It mirrors the YAML schema and
 // can be passed to WithFlowDef instead of writing YAML.
 type FlowDef struct {
-	Name  string
-	Nodes []NodeDef
-	Edges []EdgeDef
+	Version string // "1.0"; empty is accepted for legacy parity with YAML
+	Name    string
+	Nodes   []NodeDef
+	Edges   []EdgeDef
 }
 
 // NodeDef is a single node in a FlowDef.
@@ -48,7 +50,8 @@ type NodeDef struct {
 	JoinPolicy string // "all" | "any" | "quorum:N"
 
 	// choice
-	Rules []RuleDef
+	Rules   []RuleDef
+	OnError string // "" routes eval errors to the default rule; "fail" fails the execution
 
 	// signal
 	SignalName string
@@ -74,6 +77,31 @@ type RetryPolicy struct {
 	Backoff     string // "exponential" | "linear" | "fixed"
 }
 
+// ValidateFlowDef validates one or more FlowDefs against the full flow-graph
+// rules — node/edge structure, a unique start node, choice defaults, fan-in join
+// policy, retry bounds, etc. — without a NATS connection, so a builder can verify
+// programmatic flows offline (e.g. in a `validate` command) and catch the same
+// errors New would raise at startup. It returns the first validation error (which
+// already names the offending flow).
+func ValidateFlowDef(defs ...FlowDef) error {
+	flows := make(map[string]*dsl.Flow, len(defs))
+
+	for _, d := range defs {
+		f, err := flowDefToDSL(d)
+		if err != nil {
+			return err
+		}
+
+		if _, dup := flows[f.Name]; dup {
+			return fmt.Errorf("duplicate flow %q", f.Name)
+		}
+
+		flows[f.Name] = f
+	}
+
+	return compileChoiceRules(flows)
+}
+
 // flowDefToDSL converts a FlowDef into a validated *dsl.Flow.
 func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 	nodes := make([]dsl.Node, len(f.Nodes))
@@ -90,10 +118,11 @@ func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 			Target:     n.Target,
 			Subject:    n.Subject,
 			Timeout:    dsl.Duration(n.Timeout),
-			Branches:   n.Branches,
-			WaitFor:    n.WaitFor,
+			Branches:   append([]string(nil), n.Branches...),
+			WaitFor:    append([]string(nil), n.WaitFor...),
 			JoinPolicy: n.JoinPolicy,
 			Rules:      rules,
+			OnError:    n.OnError,
 			SignalName: n.SignalName,
 			OnTimeout:  n.OnTimeout,
 		}
@@ -112,9 +141,10 @@ func flowDefToDSL(f FlowDef) (*dsl.Flow, error) {
 	}
 
 	df := &dsl.Flow{
-		Name:  f.Name,
-		Nodes: nodes,
-		Edges: edges,
+		Version: f.Version,
+		Name:    f.Name,
+		Nodes:   nodes,
+		Edges:   edges,
 	}
 
 	if err := df.Validate(); err != nil {

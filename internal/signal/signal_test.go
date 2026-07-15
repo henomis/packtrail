@@ -48,7 +48,7 @@ func consume(ctx context.Context, t *testing.T, sigs *signal.Signals, durable st
 
 	ch := make(chan signal.Delivery, 8)
 
-	cc, err := sigs.Consume(ctx, durable, func(_ context.Context, d signal.Delivery) error {
+	cc, err := sigs.Consume(ctx, durable, 10, nil, func(_ context.Context, d signal.Delivery) error {
 		ch <- d
 		return nil
 	})
@@ -86,6 +86,30 @@ func TestPublishConsumeRoundTrip(t *testing.T) {
 		}
 	case <-time.After(deliverTimeout):
 		t.Fatal("signal not delivered within timeout")
+	}
+}
+
+func TestPublishWithIDDeduplicatesRetry(t *testing.T) {
+	ctx, sigs := setup(t)
+	ch := consume(ctx, t, sigs, "test-idempotent")
+
+	if err := sigs.PublishWithID(ctx, "exec-d", "go", "publish-1", []byte("first")); err != nil {
+		t.Fatalf("publish 1: %v", err)
+	}
+
+	if err := sigs.PublishWithID(ctx, "exec-d", "go", "publish-1", []byte("second")); err != nil {
+		t.Fatalf("publish duplicate: %v", err)
+	}
+
+	d := recv(t, ch)
+	if string(d.Payload) != "first" {
+		t.Fatalf("payload = %q, want first publish to win", d.Payload)
+	}
+
+	select {
+	case dup := <-ch:
+		t.Fatalf("duplicate signal delivered: %+v", dup)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
@@ -129,5 +153,66 @@ func recv(t *testing.T, ch <-chan signal.Delivery) signal.Delivery {
 	case <-time.After(deliverTimeout):
 		t.Fatal("signal not delivered within timeout")
 		return signal.Delivery{}
+	}
+}
+
+// TestSetRetentionAppliesToStream verifies SetRetention changes the signals-stream
+// MaxAge that EnsureStream applies, so WithSignalRetention can tune how long an
+// undelivered signal survives an outage (F-023).
+func TestSetRetentionAppliesToStream(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+	n := names.New("")
+
+	sigs := signal.New(srv.JS, n)
+	sigs.SetRetention(48 * time.Hour)
+
+	if err := sigs.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	stream, err := srv.JS.Stream(ctx, n.StreamSignals)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.Config.MaxAge != 48*time.Hour {
+		t.Fatalf("MaxAge = %v, want 48h", info.Config.MaxAge)
+	}
+}
+
+func TestSetRetentionCapsDedupWindow(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+	n := names.New("")
+
+	sigs := signal.New(srv.JS, n)
+	sigs.SetRetention(time.Second)
+
+	if err := sigs.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	stream, err := srv.JS.Stream(ctx, n.StreamSignals)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.Config.MaxAge != time.Second {
+		t.Fatalf("MaxAge = %v, want 1s", info.Config.MaxAge)
+	}
+
+	if info.Config.Duplicates != time.Second {
+		t.Fatalf("Duplicates = %v, want capped 1s", info.Config.Duplicates)
 	}
 }

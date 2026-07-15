@@ -57,6 +57,7 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 		ExecutionID: req.ExecutionID,
 		NodeID:      req.NodeID,
 		Payload:     req.Payload,
+		Generation:  req.Generation,
 		Attempt:     req.Attempt,
 		Deadline:    req.Deadline,
 	}
@@ -66,7 +67,18 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 		return invoker.Result{}, err
 	}
 
-	msg, err := i.nc.RequestWithContext(ctx, i.prefix+"."+req.Target, data)
+	callCtx := ctx
+
+	if !req.Deadline.IsZero() {
+		if ctxDeadline, ok := ctx.Deadline(); !ok || req.Deadline.Before(ctxDeadline) {
+			var cancel context.CancelFunc
+
+			callCtx, cancel = context.WithDeadline(ctx, req.Deadline)
+			defer cancel()
+		}
+	}
+
+	msg, err := i.nc.RequestWithContext(callCtx, i.prefix+"."+req.Target, data)
 	if err != nil {
 		return invoker.Result{}, err
 	}
@@ -76,6 +88,20 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 	err = json.Unmarshal(msg.Data, &tresp)
 	if err != nil {
 		return invoker.Result{}, err
+	}
+
+	// The request/reply protocol defines only ok/error/retry. "pending" is the
+	// engine's async-park sentinel: passed through, it would park the execution
+	// waiting for a CompleteActivity that no request/reply worker ever sends —
+	// a permanent, watchdog-excluded stall. Fail the node with an actionable
+	// reason instead; any other out-of-contract status flows through to the
+	// engine's unknown-status fail-fast.
+	if tresp.Status == string(invoker.StatusPending) {
+		return invoker.Result{
+			Status: invoker.StatusError,
+			Error: "nats-task worker replied status \"pending\", which the request/reply protocol " +
+				"does not support; use an asynchronous Invoker (StatusPending + CompleteActivity) for async work",
+		}, nil
 	}
 
 	return invoker.Result{

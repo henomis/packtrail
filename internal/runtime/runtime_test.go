@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,8 +53,8 @@ func newHarness(t *testing.T, flowYAML string, cfg Config) *harness {
 		t.Fatalf("store: %v", err)
 	}
 
-	sch, err := scheduler.New(ctx, srv.JS, n)
-	if err != nil {
+	sch := scheduler.New(srv.JS, n)
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
@@ -62,7 +63,7 @@ func newHarness(t *testing.T, flowYAML string, cfg Config) *harness {
 		t.Fatalf("flow: %v", err)
 	}
 
-	eng, err := New(natstask.New(srv.NC, n.Prefix), st, sch, map[string]*dsl.Flow{flow.Name: flow}, cfg)
+	eng, err := New(natstask.New(srv.NC, n.Prefix), st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, cfg)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
@@ -80,9 +81,36 @@ func newHarness(t *testing.T, flowYAML string, cfg Config) *harness {
 func (h *harness) serve(t *testing.T, subject string, fn protocol.Handler) {
 	t.Helper()
 
-	sub, err := protocol.ServeNamespaced(h.nc, h.prefix, subject, fn)
+	sub, err := protocol.ServeNamespaced(context.Background(), h.nc, h.prefix, subject, fn)
 	if err != nil {
 		t.Fatalf("serve %s: %v", subject, err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+func (h *harness) serveRawResponse(
+	t *testing.T,
+	subject string,
+	resp protocol.TaskResponse,
+	onCall func(),
+) {
+	t.Helper()
+
+	sub, err := h.nc.QueueSubscribe(h.prefix+"."+subject, "packtrail-workers", func(msg *nats.Msg) {
+		if onCall != nil {
+			onCall()
+		}
+
+		data, _ := json.Marshal(resp)
+		_ = msg.Respond(data)
+	})
+	if err != nil {
+		t.Fatalf("serve raw %s: %v", subject, err)
+	}
+
+	if err = h.nc.Flush(); err != nil {
+		t.Fatalf("flush raw %s: %v", subject, err)
 	}
 
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
@@ -132,11 +160,25 @@ edges:
 
 func TestLinearExecution(t *testing.T) {
 	h := newHarness(t, linearFlow, Config{})
-	h.serve(t, "tasks.a.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
-		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(req.Payload, "a", true)}, nil
+	h.serve(t, "tasks.a.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage(`{"a":true}`)}, nil
 	})
+
+	// b sees the assembled context: the start input and a's output.
+	var bSawUpstream atomic.Bool
+
 	h.serve(t, "tasks.b.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
-		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: setField(req.Payload, "b", true)}, nil
+		var c struct {
+			Input   map[string]any             `json:"input"`
+			Results map[string]json.RawMessage `json:"results"`
+		}
+
+		if json.Unmarshal(req.Payload, &c) == nil &&
+			c.Input["start"] == true && string(c.Results["a"]) == `{"a":true}` {
+			bSawUpstream.Store(true)
+		}
+
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage(`{"b":true}`)}, nil
 	})
 
 	id, err := h.engine.Start(context.Background(), "linear", json.RawMessage(`{"start":true}`))
@@ -144,13 +186,20 @@ func TestLinearExecution(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	ex := h.waitStatus(t, id, store.StatusCompleted, 5*time.Second)
+	h.waitStatus(t, id, store.StatusCompleted, 5*time.Second)
 
-	var got map[string]any
+	if !bSawUpstream.Load() {
+		t.Fatal("task b did not receive the start input and a's output in its context")
+	}
 
-	_ = json.Unmarshal(ex.Payload, &got)
-	if got["a"] != true || got["b"] != true || got["start"] != true {
-		t.Fatalf("payload not threaded through both tasks: %v", got)
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	got := parseCtx(t, doc)
+	if string(got.Results["a"]) != `{"a":true}` || string(got.Results["b"]) != `{"b":true}` || string(got.Input) != `{"start":true}` {
+		t.Fatalf("assembled context incomplete: %s", doc)
 	}
 }
 
@@ -209,5 +258,70 @@ func TestTaskPermanentError(t *testing.T) {
 	ex := h.waitStatus(t, id, store.StatusFailed, 5*time.Second)
 	if ex.Error == "" {
 		t.Fatal("expected error message on failed execution")
+	}
+}
+
+// A task worker that returns an unrecognized status (e.g. empty or misspelled)
+// fails the execution fast with an actionable reason, rather than being treated
+// as a transient failure and burning the whole retry budget.
+func TestUnknownTaskStatusFailsFast(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{RetryBaseDelay: 50 * time.Millisecond})
+
+	var calls atomic.Int32
+
+	h.serveRawResponse(t, "tasks.a.*", protocol.TaskResponse{Status: "bogus"}, func() {
+		calls.Add(1)
+	})
+	h.serve(t, "tasks.b.*", passthrough)
+
+	id, err := h.engine.Start(context.Background(), "linear", json.RawMessage(`{"start":true}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed, 3*time.Second)
+	if !strings.Contains(ex.Error, "unknown result status") {
+		t.Fatalf("failure reason = %q, want it to mention the unknown status", ex.Error)
+	}
+
+	// Fail-fast: it was invoked once, not retried through the whole budget.
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("task invoked %d times, want 1 (fail fast, no retry loop)", got)
+	}
+}
+
+// A task whose output exceeds the per-entry limit fails the execution fast
+// with an actionable reason, rather than producing an opaque KV error or
+// looping. Nothing oversized is persisted to the data plane.
+func TestPayloadLimitFailsExecution(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	h.store.SetMaxPayloadBytes(128)
+
+	big := setField(json.RawMessage(`{}`), "blob", strings.Repeat("x", 256))
+
+	h.serve(t, "tasks.a.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: big}, nil
+	})
+
+	id, err := h.engine.Start(context.Background(), "linear", json.RawMessage(`{"start":true}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	ex := h.waitStatus(t, id, store.StatusFailed, 3*time.Second)
+	if !strings.Contains(ex.Error, "payload") {
+		t.Fatalf("failure reason = %q, want it to mention the payload limit", ex.Error)
+	}
+
+	// The oversized output was rejected before reaching the data plane; the
+	// input is still readable for diagnosis.
+	doc, err := h.engine.Results(context.Background(), id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	got := parseCtx(t, doc)
+	if len(got.Results["a"]) != 0 || string(got.Input) != `{"start":true}` {
+		t.Fatalf("oversized output persisted or input lost: %s", doc)
 	}
 }

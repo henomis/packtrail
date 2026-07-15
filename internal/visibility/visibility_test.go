@@ -75,12 +75,31 @@ func waitIndex(t *testing.T, ix *Indexer, status, id string, want bool) {
 	t.Fatalf("ByStatus(%q) membership of %s = %v, want %v (have %v)", status, id, !want, want, ids)
 }
 
+func waitFlow(t *testing.T, ix *Indexer, flow, id string, want bool) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	deadline := time.Now().Add(waitIndexTimeout)
+	for time.Now().Before(deadline) {
+		ids, err := ix.ByFlow(ctx, flow)
+		if err == nil && contains(ids, id) == want {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	ids, _ := ix.ByFlow(ctx, flow)
+	t.Fatalf("ByFlow(%q) membership of %s = %v, want %v (have %v)", flow, id, !want, want, ids)
+}
+
 func mkExec(t *testing.T, st *store.Store, flow string) *store.Execution {
 	t.Helper()
 
 	id := "exec-" + flow + "-" + time.Now().Format("150405.000000")
 
-	ex := &store.Execution{ID: id, FlowName: flow, CurrentNode: "start", Status: store.StatusRunning, Payload: json.RawMessage("{}")}
+	ex := &store.Execution{ID: id, FlowName: flow, Status: store.StatusRunning, CurrentNode: "start"}
 	if _, err := st.Create(context.Background(), ex); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -137,6 +156,47 @@ func TestByFlow(t *testing.T) {
 	if !contains(beta, a.ID) || !contains(beta, b.ID) || contains(beta, c.ID) {
 		t.Fatalf("ByFlow(beta) = %v, want {%s,%s} only", beta, a.ID, b.ID)
 	}
+}
+
+func TestIndexCleansPreviousFlowMembership(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "oldflow")
+	waitFlow(t, ix, "oldflow", ex.ID, true)
+
+	updated, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.FlowName = "newflow"
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	_ = st.EmitEvent(ctx, updated)
+
+	waitFlow(t, ix, "newflow", ex.ID, true)
+	waitFlow(t, ix, "oldflow", ex.ID, false)
+}
+
+func TestReconcileCleansPreviousFlowMembership(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "reconcile-old")
+	waitFlow(t, ix, "reconcile-old", ex.ID, true)
+
+	if _, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.FlowName = "reconcile-new"
+
+		return nil
+	}); err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
+	}
+
+	waitFlow(t, ix, "reconcile-new", ex.ID, true)
+	waitFlow(t, ix, "reconcile-old", ex.ID, false)
 }
 
 // TestStaleEventIgnored verifies an out-of-order (lower-revision) event does not
@@ -261,8 +321,9 @@ func TestByStatusEventsCarryError(t *testing.T) {
 	}
 
 	// Corrupt and rebuild from the source of truth: the error must survive.
+	// Delete the status membership and the flow bookkeeping entry.
 	_ = st.IdxStatus().Delete(ctx, store.StatusFailed+sep+ex.ID)
-	_ = st.IdxStatus().Delete(ctx, metaPrefix+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "iota"+sep+ex.ID)
 
 	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
 		t.Fatalf("reconcile: %v", reconcileErr)
@@ -285,19 +346,181 @@ func TestReconcileRepairsDrift(t *testing.T) {
 	ex := mkExec(t, st, "epsilon")
 	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
 
-	// Corrupt the index: delete the membership and meta entries.
+	// Corrupt the index: delete the status membership and flow bookkeeping entries.
 	_ = st.IdxStatus().Delete(ctx, store.StatusRunning+sep+ex.ID)
 
-	_ = st.IdxStatus().Delete(ctx, metaPrefix+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "epsilon"+sep+ex.ID)
 	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); contains(ids, ex.ID) {
 		t.Fatalf("expected corrupted index to drop %s", ex.ID)
 	}
 
-	if err := ix.Reconcile(ctx); err != nil {
-		t.Fatalf("reconcile: %v", err)
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
 	}
 
 	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); !contains(ids, ex.ID) {
 		t.Fatalf("reconcile did not restore %s: %v", ex.ID, ids)
+	}
+}
+
+func TestReconcileRestoresArchivedExecution(t *testing.T) {
+	ctx, st, ix := setup(t)
+
+	if err := st.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	ex := &store.Execution{ID: "archived-visible", FlowName: "archflow", Status: store.StatusRunning}
+	if _, err := st.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	ex, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate completed: %v", err)
+	}
+
+	if emitErr := st.EmitEvent(ctx, ex); emitErr != nil {
+		t.Fatalf("emit: %v", emitErr)
+	}
+
+	waitIndex(t, ix, store.StatusCompleted, ex.ID, true)
+
+	moved, err := st.ArchiveTerminal(ctx)
+	if err != nil || moved != 1 {
+		t.Fatalf("archive: moved=%d err=%v, want 1/nil", moved, err)
+	}
+
+	_ = st.IdxStatus().Delete(ctx, store.StatusCompleted+sep+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, "archflow"+sep+ex.ID)
+	_ = st.IdxFlow().Delete(ctx, metaKey(ex.ID))
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, ex.ID) {
+		t.Fatalf("precondition: corrupted index still contains %s", ex.ID)
+	}
+
+	if reconcileErr := ix.Reconcile(ctx); reconcileErr != nil {
+		t.Fatalf("reconcile: %v", reconcileErr)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, ex.ID) {
+		t.Fatalf("reconcile did not restore archived %s by status: %v", ex.ID, ids)
+	}
+
+	if ids, _ := ix.ByFlow(ctx, "archflow"); !contains(ids, ex.ID) {
+		t.Fatalf("reconcile did not restore archived %s by flow: %v", ex.ID, ids)
+	}
+
+	evs, err := ix.ByStatusEvents(ctx, store.StatusCompleted)
+	if err != nil {
+		t.Fatalf("by status events: %v", err)
+	}
+
+	if got := findEvent(t, evs, ex.ID); got.Revision != ex.Revision {
+		t.Fatalf("reconciled archived revision = %d, want final hot revision %d", got.Revision, ex.Revision)
+	}
+}
+
+// TestGCPrunesOrphans verifies GC deletes index entries whose execution is gone
+// from both the hot bucket and the archive, and leaves live entries intact.
+func TestGCPrunesOrphans(t *testing.T) {
+	ctx, st, ix := setup(t)
+
+	// A live completed execution: indexed and still present in the store.
+	live := mkExec(t, st, "kappa")
+
+	updated, err := st.Mutate(ctx, live.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	_ = st.EmitEvent(ctx, updated)
+
+	waitIndex(t, ix, store.StatusCompleted, live.ID, true)
+
+	// An orphan: index entries pointing at an execution that no longer exists
+	// (as if its archive entry expired). Write the membership and bookkeeping
+	// directly, with an old timestamp so the staleAfter filter selects it.
+	orphan := store.Event{
+		ExecID: "ghost", FlowName: "kappa", Status: store.StatusCompleted,
+		Revision: 1, Time: time.Now().Add(-48 * time.Hour),
+	}
+
+	val, err := json.Marshal(orphan)
+	if err != nil {
+		t.Fatalf("marshal orphan: %v", err)
+	}
+
+	if _, err = st.IdxStatus().Put(ctx, store.StatusCompleted+sep+"ghost", val); err != nil {
+		t.Fatalf("put orphan status: %v", err)
+	}
+
+	if _, err = st.IdxFlow().Put(ctx, "kappa"+sep+"ghost", val); err != nil {
+		t.Fatalf("put orphan flow: %v", err)
+	}
+
+	if _, err = st.IdxFlow().Put(ctx, metaKey("ghost"), val); err != nil {
+		t.Fatalf("put orphan meta: %v", err)
+	}
+
+	pruned, err := ix.GC(ctx, 24*time.Hour)
+	if err != nil || pruned != 1 {
+		t.Fatalf("GC = %d, %v; want 1, nil", pruned, err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, "ghost") {
+		t.Error("GC did not prune the orphan")
+	}
+
+	if _, err = st.IdxFlow().Get(ctx, metaKey("ghost")); err == nil {
+		t.Error("GC did not prune the orphan's bookkeeping record")
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, live.ID) {
+		t.Errorf("GC pruned a live entry: %v", ids)
+	}
+}
+
+// TestReconcileActiveFixesStaleStatus verifies the cheap active-set pass moves
+// an execution whose terminal transition was never projected (the event was
+// dropped, so the index still lists it as running) to its real status.
+func TestReconcileActiveFixesStaleStatus(t *testing.T) {
+	ctx, st, ix := setup(t)
+	ex := mkExec(t, st, "zeta")
+	waitIndex(t, ix, store.StatusRunning, ex.ID, true)
+
+	// Advance the source of truth to completed but drop the event, so the index
+	// is left stale (still running).
+	if _, err := st.Mutate(ctx, ex.ID, func(e *store.Execution) error {
+		e.Status = store.StatusCompleted
+		e.CurrentNode = ""
+
+		return nil
+	}); err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); contains(ids, ex.ID) {
+		t.Fatalf("precondition: %s already indexed completed", ex.ID)
+	}
+
+	if err := ix.ReconcileActive(ctx); err != nil {
+		t.Fatalf("reconcile active: %v", err)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusCompleted); !contains(ids, ex.ID) {
+		t.Fatalf("active reconcile did not move %s to completed: %v", ex.ID, ids)
+	}
+
+	if ids, _ := ix.ByStatus(ctx, store.StatusRunning); contains(ids, ex.ID) {
+		t.Fatalf("active reconcile left stale running entry for %s: %v", ex.ID, ids)
 	}
 }

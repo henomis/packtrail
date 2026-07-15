@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,5 +45,42 @@ func TestScheduleFlowCron(t *testing.T) {
 		// An execution was auto-started by the cron schedule.
 	case <-time.After(5 * time.Second):
 		t.Fatal("cron did not start an execution within 5s")
+	}
+}
+
+// TestCronFiredIdempotent verifies a redelivered cron tick (same fired id) starts
+// exactly one execution, while a distinct firing (different fired id) starts its
+// own — so a fired-schedule redelivery cannot duplicate the scheduled work.
+func TestCronFiredIdempotent(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	h.serve(t, "tasks.a.*", passthrough)
+	h.serve(t, "tasks.b.*", passthrough)
+
+	ctx := context.Background()
+	handle := h.engine.handleFired(ctx)
+
+	// Two deliveries of the SAME firing (same fired id) must collapse to one
+	// execution; a distinct firing (different fired id) starts a second.
+	for _, firedID := range []string{"42", "42", "43"} {
+		if err := handle("start.linear", json.RawMessage(`{}`), firedID); err != nil {
+			t.Fatalf("handle fired %q: %v", firedID, err)
+		}
+	}
+
+	keys, err := h.store.ListExecutionKeys(ctx)
+	if err != nil {
+		t.Fatalf("list executions: %v", err)
+	}
+
+	got := 0
+
+	for _, k := range keys {
+		if strings.HasPrefix(k, "cron-") {
+			got++
+		}
+	}
+
+	if got != 2 {
+		t.Fatalf("cron-started executions = %d, want 2 (one per distinct firing)", got)
 	}
 }

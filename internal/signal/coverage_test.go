@@ -16,6 +16,7 @@ package signal_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func TestConsumeHandlerErrorRedelivers(t *testing.T) {
 		done  = make(chan struct{})
 	)
 
-	cc, err := sigs.Consume(ctx, "redeliver", func(_ context.Context, _ signal.Delivery) error {
+	cc, err := sigs.Consume(ctx, "redeliver", 10, nil, func(_ context.Context, _ signal.Delivery) error {
 		if calls.Add(1) == 1 {
 			return context.DeadlineExceeded // fail first delivery
 		}
@@ -61,6 +62,47 @@ func TestConsumeHandlerErrorRedelivers(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("signal was not redelivered after handler error")
+	}
+}
+
+func TestConsumeHandlerPanicDeadLetters(t *testing.T) {
+	ctx, sigs := setup(t)
+	done := make(chan struct{})
+
+	var gotReason string
+
+	cc, err := sigs.Consume(ctx, "panic", 10, func(execID, name, reason string, deliveries uint64) {
+		if execID != "exec-p" || name != "go" {
+			t.Errorf("dead-letter id = %q/%q, want exec-p/go", execID, name)
+		}
+
+		if deliveries == 0 {
+			t.Error("dead-letter deliveries = 0, want metadata delivery count")
+		}
+
+		gotReason = reason
+
+		close(done)
+	}, func(_ context.Context, _ signal.Delivery) error {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	t.Cleanup(cc.Stop)
+
+	if err = sigs.Publish(ctx, "exec-p", "go", []byte("1")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	select {
+	case <-done:
+		if !strings.Contains(gotReason, "boom") {
+			t.Fatalf("dead-letter reason = %q, want it to mention the panic", gotReason)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("panic was not dead-lettered")
 	}
 }
 

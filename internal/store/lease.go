@@ -29,13 +29,24 @@ type Lease struct {
 	Expires time.Time `json:"expires"`
 }
 
-func (l Lease) expired() bool { return time.Now().After(l.Expires) }
+type leaseObservation struct {
+	revision uint64
+	at       time.Time
+}
 
 // AcquireLease attempts to take or renew ownership of execID for owner with the
 // given TTL. It succeeds if the key is absent, already owned by owner, or held
-// by an expired lease. The CAS guarantees that at most one *distinct* owner wins
-// a race; a write that loses to our own concurrent renewal still counts as held.
-// It returns true if the lease is now held by owner.
+// by another owner whose lease revision has remained unchanged for a full TTL as
+// measured by this process's monotonic clock. The CAS guarantees that at most
+// one distinct owner wins a single acquisition race. It returns true if the
+// lease is now held by owner.
+//
+// This bounds concurrency but is not a hard lock across time: once a lease
+// revision stops advancing for a TTL (its holder paused or crashed) another
+// instance can acquire it while the original is still mid-invocation. Callers
+// must therefore treat node invocation as at-least-once (the engine renews via
+// heartbeat and aborts on a detected loss to narrow, not eliminate, the overlap
+// window).
 //
 //nolint:gocognit,funlen
 func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time.Duration) (bool, error) {
@@ -57,6 +68,8 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 				return false, createErr
 			}
 
+			s.clearLeaseObservation(execID)
+
 			return true, nil
 		}
 
@@ -69,21 +82,21 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 			return false, unmarshalErr
 		}
 
-		if cur.Owner != owner && !cur.expired() {
-			return false, nil // held by someone else
+		if cur.Owner != owner && !s.leaseRevisionStale(execID, entry.Revision(), ttl) {
+			return false, nil // held by someone else that is still heartbeating, or not yet proven stale
 		}
-		// We own it, or it expired: take/renew via CAS at the observed revision.
+
+		// We own it, or the observed foreign lease revision has stayed unchanged
+		// for a full TTL: take/renew via CAS at the observed revision.
 		if _, updateErr := s.leases.Update(ctx, execID, val, entry.Revision()); updateErr != nil {
 			if errors.Is(updateErr, jetstream.ErrKeyExists) || isWrongLastSeq(updateErr) {
-				if cur.Owner == owner {
-					return true, nil // our own renewal won the race; we still own it
-				}
-
-				continue // expired-takeover race: re-read to see who won
+				continue // renewal/takeover race: re-read to see who won
 			}
 
 			return false, updateErr
 		}
+
+		s.clearLeaseObservation(execID)
 
 		return true, nil
 	}
@@ -91,8 +104,39 @@ func (s *Store) AcquireLease(ctx context.Context, execID, owner string, ttl time
 	return false, nil
 }
 
+// LeaseHeld reports whether execID's ownership lease should be treated as held
+// by a live owner — i.e. the lease key exists and its revision has not remained
+// unchanged for a full TTL as observed by this process. Used by the stall
+// watchdog to avoid re-driving an execution whose work is legitimately in flight.
+func (s *Store) LeaseHeld(ctx context.Context, execID string, ttl time.Duration) (bool, error) {
+	entry, err := s.leases.Get(ctx, execID)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		s.clearLeaseObservation(execID)
+
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	var cur Lease
+	if err = json.Unmarshal(entry.Value(), &cur); err != nil {
+		return false, err
+	}
+
+	return !s.leaseRevisionStale(execID, entry.Revision(), ttl), nil
+}
+
 // ReleaseLease drops ownership of execID if held by owner. Releasing a lease not
 // owned by owner is a no-op.
+//
+// The delete is guarded on the revision read above, so if our own heartbeat
+// renewed the lease between the Get and the Delete the delete no-ops and the
+// lease lingers until its Expires (≤ LeaseTTL). That is self-healing — the lease
+// still frees on expiry — it only briefly delays a legitimate takeover; it never
+// deletes a lease a different owner has taken over (the owner check and the
+// revision guard both protect that).
 func (s *Store) ReleaseLease(ctx context.Context, execID, owner string) error {
 	entry, err := s.leases.Get(ctx, execID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
@@ -119,5 +163,40 @@ func (s *Store) ReleaseLease(ctx context.Context, execID, owner string) error {
 		return nil // someone else took over; leave it alone
 	}
 
+	if err == nil {
+		s.clearLeaseObservation(execID)
+	}
+
 	return err
+}
+
+func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
+	}
+
+	now := time.Now()
+
+	s.leaseObsMu.Lock()
+	defer s.leaseObsMu.Unlock()
+
+	if s.leaseObs == nil {
+		s.leaseObs = make(map[string]leaseObservation)
+	}
+
+	obs, ok := s.leaseObs[execID]
+	if !ok || obs.revision != revision {
+		s.leaseObs[execID] = leaseObservation{revision: revision, at: now}
+
+		return false
+	}
+
+	return now.Sub(obs.at) >= ttl
+}
+
+func (s *Store) clearLeaseObservation(execID string) {
+	s.leaseObsMu.Lock()
+	defer s.leaseObsMu.Unlock()
+
+	delete(s.leaseObs, execID)
 }

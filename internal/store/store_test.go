@@ -17,6 +17,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +43,7 @@ func TestCreateGetMutate(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
-	e := &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a", Payload: json.RawMessage(`{}`)}
+	e := &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a"}
 	if _, err := s.Create(ctx, e); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -70,7 +72,7 @@ func TestMutateConcurrent(t *testing.T) {
 	ctx := context.Background()
 
 	s := open(t)
-	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning, Payload: json.RawMessage(`{}`), Branches: map[string]BranchState{}}); err != nil {
+	if _, err := s.Create(ctx, &Execution{ID: "e", Status: StatusRunning, Branches: map[string]BranchState{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,6 +107,59 @@ func TestMutateConcurrent(t *testing.T) {
 	}
 }
 
+func TestArchiveTerminal(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableArchive(ctx, time.Hour); err != nil {
+		t.Fatalf("enable archive: %v", err)
+	}
+
+	mk := func(id, status string) {
+		if _, err := s.Create(ctx, &Execution{ID: id, FlowName: "f", Status: status}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+
+	mk("done", StatusCompleted)
+	mk("gone", StatusCancelled)
+	mk("bust", StatusFailed)
+	mk("live", StatusRunning)
+
+	// Completed and cancelled are archivable; failed (resumable) and running stay.
+	moved, err := s.ArchiveTerminal(ctx)
+	if err != nil || moved != 2 {
+		t.Fatalf("ArchiveTerminal = %d, %v; want 2, nil", moved, err)
+	}
+
+	keys, err := s.ListExecutionKeys(ctx)
+	if err != nil {
+		t.Fatalf("keys: %v", err)
+	}
+
+	hot := map[string]bool{}
+	for _, k := range keys {
+		hot[k] = true
+	}
+
+	if hot["done"] || hot["gone"] {
+		t.Errorf("archivable exec still in hot bucket after archive: hot=%v", keys)
+	}
+
+	if !hot["bust"] || !hot["live"] {
+		t.Errorf("failed/running execs were archived: hot=%v", keys)
+	}
+
+	// Both archived execs are still readable via Get's cold-store fallback.
+	if got, gErr := s.Get(ctx, "done"); gErr != nil || got.Status != StatusCompleted {
+		t.Fatalf("Get archived completed = %v, %v; want completed", got, gErr)
+	}
+
+	if got, gErr := s.Get(ctx, "gone"); gErr != nil || got.Status != StatusCancelled {
+		t.Fatalf("Get archived cancelled = %v, %v; want cancelled", got, gErr)
+	}
+}
+
 func TestLease(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
@@ -134,17 +189,293 @@ func TestLease(t *testing.T) {
 	}
 }
 
-func TestLeaseExpiry(t *testing.T) {
+func TestLeaseTakeoverAfterStableRevision(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
-	// Short TTL: B should take over once it lapses.
-	if ok, _ := s.AcquireLease(ctx, "e", "inst-A", 200*time.Millisecond); !ok {
+
+	const ttl = 20 * time.Millisecond
+
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-A", ttl); !ok {
 		t.Fatal("A acquire")
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", ttl); ok {
+		t.Fatal("B took over before observing a stable lease revision for a full TTL")
+	}
 
-	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", 30*time.Second); !ok {
-		t.Fatal("B could not take over expired lease")
+	time.Sleep(ttl + 10*time.Millisecond)
+
+	if ok, _ := s.AcquireLease(ctx, "e", "inst-B", ttl); !ok {
+		t.Fatal("B could not take over stale lease revision")
+	}
+}
+
+func TestLeaseHeldUsesStableRevision(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	const ttl = 20 * time.Millisecond
+
+	if ok, _ := s.AcquireLease(ctx, "held", "inst-A", ttl); !ok {
+		t.Fatal("A acquire")
+	}
+
+	held, err := s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || !held {
+		t.Fatalf("initial LeaseHeld = %v, %v; want true/nil", held, err)
+	}
+
+	time.Sleep(ttl + 10*time.Millisecond)
+
+	held, err = s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || held {
+		t.Fatalf("stale LeaseHeld = %v, %v; want false/nil", held, err)
+	}
+
+	if ok, _ := s.AcquireLease(ctx, "held", "inst-A", ttl); !ok {
+		t.Fatal("A renewal")
+	}
+
+	held, err = s.LeaseHeld(ctx, "held", ttl)
+	if err != nil || !held {
+		t.Fatalf("renewed LeaseHeld = %v, %v; want true/nil", held, err)
+	}
+}
+
+func TestPayloadSizeGuard(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxPayloadBytes(64)
+
+	big := json.RawMessage(`{"data":"` + strings.Repeat("x", 128) + `"}`)
+
+	// PutPayload rejects an oversized data-plane entry before it reaches NATS.
+	if err := s.PutPayload(ctx, OutputKey("e", "n"), big); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("PutPayload oversized: err = %v, want ErrPayloadTooLarge", err)
+	}
+
+	// The rejected write left nothing behind; a within-limit entry round-trips.
+	if _, err := s.GetPayload(ctx, OutputKey("e", "n")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected write left an entry: %v", err)
+	}
+
+	if err := s.PutPayload(ctx, OutputKey("e", "n"), json.RawMessage(`{"ok":1}`)); err != nil {
+		t.Fatalf("put small: %v", err)
+	}
+
+	got, err := s.GetPayload(ctx, OutputKey("e", "n"))
+	if err != nil || string(got) != `{"ok":1}` {
+		t.Fatalf("get = %s, %v; want {\"ok\":1}", got, err)
+	}
+}
+
+func TestDocumentSizeGuard(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxDocumentBytes(256)
+
+	if _, err := s.Create(ctx, &Execution{ID: "e1", FlowName: "f", Status: StatusRunning, CurrentNode: "a"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A Mutate that would grow the control document past the limit is rejected
+	// before it reaches NATS.
+	_, err := s.Mutate(ctx, "e1", func(e *Execution) error {
+		e.Error = strings.Repeat("x", 512)
+
+		return nil
+	})
+	if !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("oversized Mutate: err = %v, want ErrDocumentTooLarge", err)
+	}
+
+	// The rejected write left the last within-limit document intact.
+	got, err := s.Get(ctx, "e1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.Error != "" {
+		t.Fatalf("rejected write persisted: Error = %q, want empty", got.Error)
+	}
+
+	// A within-limit Mutate still succeeds.
+	if _, mErr := s.Mutate(ctx, "e1", func(e *Execution) error {
+		e.Error = "small"
+
+		return nil
+	}); mErr != nil {
+		t.Fatalf("within-limit Mutate: %v", mErr)
+	}
+}
+
+func TestDocumentSizeGuardOnCreate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxDocumentBytes(128)
+
+	_, err := s.Create(ctx, &Execution{
+		ID:          "e-create-big",
+		FlowName:    "f",
+		Status:      StatusRunning,
+		CurrentNode: "a",
+		Error:       strings.Repeat("x", 512),
+	})
+	if !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("oversized Create: err = %v, want ErrDocumentTooLarge", err)
+	}
+
+	if _, getErr := s.Get(ctx, "e-create-big"); !errors.Is(getErr, ErrNotFound) {
+		t.Fatalf("oversized Create persisted an entry: get err = %v, want ErrNotFound", getErr)
+	}
+}
+
+func TestHistoryRepairsCurrentState(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableHistory(ctx, time.Hour); err != nil {
+		t.Fatalf("enable history: %v", err)
+	}
+
+	ex := &Execution{ID: "hist-repair", FlowName: "flow", Status: StatusCompleted, CurrentNode: "", Error: "done"}
+	if _, err := s.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	trace, err := s.History(ctx, ex.ID, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(trace) != 1 {
+		t.Fatalf("history len = %d, want 1", len(trace))
+	}
+
+	got := trace[0]
+	if got.ExecID != ex.ID || got.FlowName != "flow" || got.Status != StatusCompleted ||
+		got.Error != "done" || got.Revision != ex.Revision {
+		t.Fatalf("repaired event = %+v, want current execution revision %d", got, ex.Revision)
+	}
+}
+
+func TestHistoryRepairBypassesOriginalPublishDedupe(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.EnableHistory(ctx, time.Hour); err != nil {
+		t.Fatalf("enable history: %v", err)
+	}
+
+	ex := &Execution{ID: "hist-stale-tail", FlowName: "flow", Status: StatusRunning}
+	if _, err := s.Create(ctx, ex); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	stale := eventFromExecution(ex)
+
+	updated, err := s.Mutate(ctx, ex.ID, func(e *Execution) error {
+		e.Status = StatusCompleted
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mutate: %v", err)
+	}
+
+	if err = s.EmitEvent(ctx, updated); err != nil {
+		t.Fatalf("emit current: %v", err)
+	}
+
+	if err = s.publishEventWithMsgID(ctx, s.names.SubjHistoryPrefix+ex.ID, stale, "manual-stale-tail"); err != nil {
+		t.Fatalf("publish stale tail: %v", err)
+	}
+
+	trace, err := s.History(ctx, ex.ID, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(trace) < 3 {
+		t.Fatalf("history len = %d, want original, stale tail, and repair events", len(trace))
+	}
+
+	if got := trace[len(trace)-1]; got.Revision != updated.Revision || got.Status != StatusCompleted {
+		t.Fatalf("history tail = %+v, want repaired current revision %d", got, updated.Revision)
+	}
+}
+
+func TestPayloadGuardDisabled(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	s.SetMaxPayloadBytes(0) // disabled
+
+	big := json.RawMessage(`{"data":"` + strings.Repeat("x", DefaultMaxPayloadBytes+1) + `"}`)
+	if err := s.PutPayload(ctx, InputKey("e"), big); err != nil {
+		t.Fatalf("put with guard disabled: %v", err)
+	}
+}
+
+// TestDeletePayloads verifies the per-execution sweep removes every data-plane
+// entry of one execution and leaves other executions' entries intact.
+func TestDeletePayloads(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	for _, key := range []string{InputKey("a"), OutputKey("a", "n1"), SignalKey("a", "go", 3), InputKey("b")} {
+		if err := s.PutPayload(ctx, key, json.RawMessage(`{}`)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	if err := s.DeletePayloads(ctx, "a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	for _, key := range []string{InputKey("a"), OutputKey("a", "n1"), SignalKey("a", "go", 3)} {
+		if _, err := s.GetPayload(ctx, key); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("entry %s survived the sweep: %v", key, err)
+		}
+	}
+
+	if _, err := s.GetPayload(ctx, InputKey("b")); err != nil {
+		t.Fatalf("other execution's entry was swept: %v", err)
+	}
+}
+
+// TestDeletePayloadsOlderThan verifies the age-guarded sweep (F-029): entries
+// created before the cutoff are removed, while a fresh entry (as a recreated
+// execution generation would write) is preserved, so GC cannot wipe a re-Started
+// id's data.
+func TestDeletePayloadsOlderThan(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	// Old entry: created before the cutoff.
+	if err := s.PutPayload(ctx, InputKey("a"), json.RawMessage(`{"old":1}`)); err != nil {
+		t.Fatalf("put old: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	cutoff := time.Now()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Young entry: created after the cutoff (as a recreated generation would write).
+	if err := s.PutPayload(ctx, OutputKey("a", "fresh"), json.RawMessage(`{"new":1}`)); err != nil {
+		t.Fatalf("put young: %v", err)
+	}
+
+	if err := s.DeletePayloadsOlderThan(ctx, "a", cutoff); err != nil {
+		t.Fatalf("delete older than: %v", err)
+	}
+
+	if _, err := s.GetPayload(ctx, InputKey("a")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old entry survived the age-guarded sweep: %v", err)
+	}
+
+	if _, err := s.GetPayload(ctx, OutputKey("a", "fresh")); err != nil {
+		t.Fatalf("fresh entry was swept (age guard failed): %v", err)
 	}
 }

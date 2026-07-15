@@ -17,8 +17,11 @@ package invoker_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -78,6 +81,107 @@ func TestCacheDedupesSameAttempt(t *testing.T) {
 	}
 }
 
+func TestCacheSeparatesNodeGenerations(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-generation"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	delegate := invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
+		n := calls.Add(1)
+
+		return invoker.Result{Status: invoker.StatusOK, Payload: []byte(fmt.Sprintf(`{"call":%d}`, n))}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+
+	req := invoker.Request{ExecutionID: "exec-1", NodeID: "triage", Generation: 1, Attempt: 0}
+
+	res, err := cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("generation 1 invoke: %v", err)
+	}
+
+	if string(res.Payload) != `{"call":1}` {
+		t.Fatalf("generation 1 payload = %s, want first call", res.Payload)
+	}
+
+	req.Generation = 2
+
+	res, err = cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("generation 2 invoke: %v", err)
+	}
+
+	if string(res.Payload) != `{"call":2}` {
+		t.Fatalf("generation 2 payload = %s, want fresh call", res.Payload)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("delegate called %d times, want one per generation", got)
+	}
+}
+
+// TestCacheKeyedSeparatesKeyspaces encodes the two-layer contract behind
+// packtrail's async result caching: the engine-side dispatch cache stores
+// StatusPending for an async node under (execution, node, attempt), and the
+// worker-side execution cache stores the real result of the *same* triple in
+// the same bucket. With distinct key prefixes each layer sees only its own
+// entry; sharing a key would freeze the node at Pending (the worker would read
+// the dispatcher's entry and never invoke) or clobber the dispatch dedup.
+func TestCacheKeyedSeparatesKeyspaces(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-keyed"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var dispatches, execs atomic.Int32
+
+	dispatch := invoker.NewCache(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		dispatches.Add(1)
+		return invoker.Result{Status: invoker.StatusPending}, nil
+	}))
+
+	work := invoker.NewCacheKeyed(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		execs.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"done":true}`)}, nil
+	}), "w.")
+
+	req := invoker.Request{ExecutionID: "exec-1", NodeID: "agent", Attempt: 0}
+
+	// Dispatch caches Pending under the unprefixed key.
+	if res, invokeErr := dispatch.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch: res=%+v err=%v, want pending", res, invokeErr)
+	}
+
+	// The worker must not see the cached Pending: it invokes and gets OK.
+	res, invokeErr := work.Invoke(ctx, req)
+	if invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("worker: res=%+v err=%v, want ok (collided with dispatch entry?)", res, invokeErr)
+	}
+
+	// A redelivered job serves the worker's cached result without re-invoking.
+	if res, invokeErr = work.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("worker redelivery: res=%+v err=%v, want cached ok", res, invokeErr)
+	}
+
+	// And the dispatch layer still sees its own Pending, untouched by the worker.
+	if res, invokeErr = dispatch.Invoke(ctx, req); invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch redelivery: res=%+v err=%v, want cached pending", res, invokeErr)
+	}
+
+	if d, e := dispatches.Load(), execs.Load(); d != 1 || e != 1 {
+		t.Fatalf("dispatches=%d execs=%d, want 1/1 (each layer invoked once, then cached)", d, e)
+	}
+}
+
 // TestCacheDoesNotCacheTransportError ensures a transport failure is not cached,
 // so a redelivery retries the call rather than replaying the error.
 func TestCacheDoesNotCacheTransportError(t *testing.T) {
@@ -117,6 +221,100 @@ func TestCacheDoesNotCacheTransportError(t *testing.T) {
 
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("delegate called %d times, want 2 (error not cached)", got)
+	}
+}
+
+// TestCacheConcurrentSameAttemptSingleDelegate covers the atomic miss path: many
+// concurrent callers for the same attempt must not all observe a miss and execute
+// side effects before any of them stores the result.
+func TestCacheConcurrentSameAttemptSingleDelegate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-concurrent"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	firstCall := make(chan struct{})
+	release := make(chan struct{})
+
+	delegate := invoker.Func(func(ctx context.Context, req invoker.Request) (invoker.Result, error) {
+		if calls.Add(1) == 1 {
+			close(firstCall)
+		}
+
+		select {
+		case <-ctx.Done():
+			return invoker.Result{}, ctx.Err()
+		case <-release:
+		}
+
+		return invoker.Result{Status: invoker.StatusOK, Payload: req.Payload}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+
+	req := invoker.Request{
+		ExecutionID: "exec-concurrent", NodeID: "triage", Attempt: 0,
+		Payload:  json.RawMessage(`{"v":1}`),
+		Deadline: time.Now().Add(5 * time.Second),
+	}
+
+	const callers = 12
+
+	var wg sync.WaitGroup
+
+	errs := make(chan error, callers)
+
+	for range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			res, invokeErr := cache.Invoke(ctx, req)
+			if invokeErr != nil {
+				errs <- invokeErr
+
+				return
+			}
+
+			if res.Status != invoker.StatusOK || string(res.Payload) != `{"v":1}` {
+				errs <- fmt.Errorf("unexpected result %+v", res)
+
+				return
+			}
+		}()
+	}
+
+	select {
+	case <-firstCall:
+	case <-ctx.Done():
+		t.Fatal("delegate was not called")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("delegate called %d times while first invocation held the claim, want 1", got)
+	}
+
+	close(release)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("invoke: %v", err)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("delegate called %d times, want 1", got)
 	}
 }
 

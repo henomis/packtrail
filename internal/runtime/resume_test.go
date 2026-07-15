@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/henomis/packtrail/internal/dsl"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
@@ -57,15 +59,15 @@ func TestResumeFailedExecution(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 
-	sch, err := scheduler.New(ctx, srv.JS, names.New(""))
-	if err != nil {
+	sch := scheduler.New(srv.JS, names.New(""))
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
 	flow, _ := dsl.Parse([]byte(resumeFlow))
 	inv := &flakyInvoker{}
 
-	eng, err := New(inv, st, sch, map[string]*dsl.Flow{flow.Name: flow}, Config{})
+	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, Config{})
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
@@ -105,9 +107,15 @@ func TestResumeFailedExecution(t *testing.T) {
 		t.Fatalf("resume: %v", resumeErr)
 	}
 
-	ex := waitFor(id, store.StatusCompleted)
-	if string(ex.Payload) != `{"done":true}` {
-		t.Errorf("payload = %s, want {\"done\":true}", ex.Payload)
+	waitFor(id, store.StatusCompleted)
+
+	doc, err := eng.Results(ctx, id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	if got := parseCtx(t, doc); string(got.Results["a"]) != `{"done":true}` {
+		t.Errorf("results.a = %s, want {\"done\":true}", got.Results["a"])
 	}
 
 	// Resuming a non-failed (now completed) execution is an error.
@@ -117,5 +125,84 @@ func TestResumeFailedExecution(t *testing.T) {
 	// Resuming an unknown execution returns ErrNotFound.
 	if resumeErr := eng.Resume(ctx, "exec-nope"); !errors.Is(resumeErr, store.ErrNotFound) {
 		t.Errorf("resume unknown = %v, want ErrNotFound", resumeErr)
+	}
+}
+
+func TestResumeUsesFreshCacheGeneration(t *testing.T) {
+	srv := natstest.Start(t)
+	ctx := context.Background()
+
+	st, err := store.Open(ctx, srv.JS, names.New(""))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	sch := scheduler.New(srv.JS, names.New(""))
+	if err = sch.EnsureStream(ctx); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "resume-cache-generation"})
+	if err != nil {
+		t.Fatalf("cache kv: %v", err)
+	}
+
+	flow, _ := dsl.Parse([]byte(resumeFlow))
+	inv := &flakyInvoker{}
+
+	eng, err := New(invoker.NewCache(kv, inv), st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, Config{})
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() { _ = eng.Run(runCtx) }()
+
+	waitFor := func(id, status string) *store.Execution {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ex, getErr := st.Get(ctx, id)
+			if getErr == nil && ex.Status == status {
+				return ex
+			}
+
+			time.Sleep(15 * time.Millisecond)
+		}
+
+		t.Fatalf("exec %s never reached %q", id, status)
+
+		return nil
+	}
+
+	id, err := eng.Start(ctx, "resume-me", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	first := waitFor(id, store.StatusFailed)
+	if first.NodeGeneration == 0 {
+		t.Fatal("failed execution has generation 0, want cache-scoped generation")
+	}
+
+	inv.ok.Store(true)
+
+	if resumeErr := eng.Resume(ctx, id); resumeErr != nil {
+		t.Fatalf("resume: %v", resumeErr)
+	}
+
+	resumed := waitFor(id, store.StatusCompleted)
+	if resumed.NodeGeneration <= first.NodeGeneration {
+		t.Fatalf("generation after resume = %d, want > %d", resumed.NodeGeneration, first.NodeGeneration)
+	}
+
+	doc, err := eng.Results(ctx, id)
+	if err != nil {
+		t.Fatalf("results: %v", err)
+	}
+
+	if got := parseCtx(t, doc); string(got.Results["a"]) != `{"done":true}` {
+		t.Fatalf("results.a = %s, want resumed success (not cached failure)", got.Results["a"])
 	}
 }

@@ -43,8 +43,8 @@ func TestCrashDuringFanoutResumesFromPersistedBranches(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 
-	sch, err := scheduler.New(ctx, srv.JS, n)
-	if err != nil {
+	sch := scheduler.New(srv.JS, n)
+	if err = sch.EnsureStream(ctx); err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
 
@@ -58,12 +58,12 @@ func TestCrashDuringFanoutResumesFromPersistedBranches(t *testing.T) {
 	// Short lease/ack so takeover happens quickly in the test.
 	cfg := Config{LeaseTTL: time.Second, AckWait: 2 * time.Second}
 
-	engineA, err := New(natstask.New(srv.NC, n.Prefix), st, sch, flows, cfg)
+	engineA, err := New(natstask.New(srv.NC, n.Prefix), st, sch, testSignals(t, st), flows, cfg)
 	if err != nil {
 		t.Fatalf("engine A: %v", err)
 	}
 
-	engineB, err := New(natstask.New(srv.NC, n.Prefix), st, sch, flows, cfg)
+	engineB, err := New(natstask.New(srv.NC, n.Prefix), st, sch, testSignals(t, st), flows, cfg)
 	if err != nil {
 		t.Fatalf("engine B: %v", err)
 	}

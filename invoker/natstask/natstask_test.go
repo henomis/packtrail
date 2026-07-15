@@ -17,7 +17,11 @@ package natstask_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/invoker"
@@ -34,7 +38,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 	var gotReq protocol.TaskRequest
 
 	// Worker subscribes under the namespaced subject the invoker will use.
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, req protocol.TaskRequest) (protocol.TaskResponse, error) {
 		gotReq = req
 		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage(`{"ok":true}`)}, nil
 	})
@@ -51,6 +55,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 		ExecutionID: "exec-1",
 		NodeID:      "node-1",
 		Payload:     json.RawMessage(`{"in":1}`),
+		Generation:  7,
 		Attempt:     3,
 	})
 	if err != nil {
@@ -65,8 +70,9 @@ func TestInvokeMapsResponse(t *testing.T) {
 		t.Fatalf("payload = %s, want {\"ok\":true}", res.Payload)
 	}
 
-	if gotReq.ExecutionID != "exec-1" || gotReq.NodeID != "node-1" || gotReq.Attempt != 3 {
-		t.Fatalf("worker saw %+v, want exec-1/node-1/attempt 3", gotReq)
+	if gotReq.ExecutionID != "exec-1" || gotReq.NodeID != "node-1" ||
+		gotReq.Generation != 7 || gotReq.Attempt != 3 {
+		t.Fatalf("worker saw %+v, want exec-1/node-1/generation 7/attempt 3", gotReq)
 	}
 }
 
@@ -75,7 +81,7 @@ func TestInvokeMapsResponse(t *testing.T) {
 func TestInvokeMapsError(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusError, Error: "permanent"}, nil
 	})
 	if err != nil {
@@ -100,6 +106,77 @@ func TestInvokeMapsError(t *testing.T) {
 	}
 }
 
+// TestInvokeRejectsPending verifies an out-of-contract "pending" reply is
+// converted to a permanent error instead of parking the execution in a wait
+// no request/reply worker can ever settle.
+func TestInvokeRejectsPending(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := srv.NC.Subscribe("packtrail.tasks.rogue.*", func(msg *nats.Msg) {
+		data, _ := json.Marshal(protocol.TaskResponse{Status: "pending"})
+		_ = msg.Respond(data)
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err = srv.NC.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	inv := natstask.New(srv.NC, "packtrail")
+
+	res, err := inv.Invoke(context.Background(), invoker.Request{Target: "tasks.rogue.x", ExecutionID: "exec-5"})
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	if res.Status != invoker.StatusError {
+		t.Fatalf("status = %q, want error (pending must not park a request/reply node)", res.Status)
+	}
+
+	if res.Error == "" {
+		t.Fatal("expected an actionable error message for the pending reply")
+	}
+
+	if !strings.Contains(res.Error, "pending") {
+		t.Fatalf("error = %q, want it to mention pending", res.Error)
+	}
+}
+
+func TestInvokeUsesRequestDeadlineWithoutCallerDeadline(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := srv.NC.Subscribe("packtrail.tasks.silent.*", func(_ *nats.Msg) {})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err = srv.NC.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	inv := natstask.New(srv.NC, "packtrail")
+	start := time.Now()
+
+	_, err = inv.Invoke(context.Background(), invoker.Request{
+		Target:      "tasks.silent.x",
+		ExecutionID: "exec-deadline",
+		Deadline:    time.Now().Add(100 * time.Millisecond),
+	})
+	if err == nil {
+		t.Fatal("invoke succeeded, want request-deadline error from silent responder")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("invoke took %v, want it bounded by request deadline", elapsed)
+	}
+}
+
 // TestInvokeNoWorkerReturnsError verifies a request with no responder surfaces a
 // transport error (the engine treats this as a transient failure).
 func TestInvokeNoWorkerReturnsError(t *testing.T) {
@@ -116,7 +193,7 @@ func TestInvokeNoWorkerReturnsError(t *testing.T) {
 func TestNewDefaultsPrefix(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
 	})
 	if err != nil {

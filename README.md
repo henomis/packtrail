@@ -497,6 +497,13 @@ stream — so it needs no access to your flow source or engine process.
 go run ./cmd/packtrail-ui --namespace packtrail --addr :8088   # NATS_URL honoured
 ```
 
+> **Security:** packtrail-ui has no built-in authentication or authorization —
+> every `/api/*` route, including execution payloads, signals, and dead-letter
+> records, is served to anyone who can reach `--addr`. Since that data can
+> carry secrets or PII passed through your workflows, only bind it to a
+> trusted network, or put it behind your own auth proxy/reverse proxy if it
+> must be reachable from outside one.
+
 It serves an embedded (no-npm) dashboard: a filterable execution list, a detail
 view (status, current node, payload, branches, signals, error), and an **SVG flow
 graph** with the live execution overlaid, updated in real time over SSE. The

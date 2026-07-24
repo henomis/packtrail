@@ -182,6 +182,64 @@ func TestCacheKeyedSeparatesKeyspaces(t *testing.T) {
 	}
 }
 
+// TestCacheKeyedDoesNotCollideAcrossPrefixBoundary is a regression test for a
+// key-construction bug: joining prefix+execID directly (with no delimiter
+// between them) let a prefixed key collide byte-for-byte with an unprefixed
+// key from a different Cache sharing the same bucket. Concretely, prefix
+// "w." with (execID "42", node "7", generation 0, attempt 0) used to produce
+// the identical key as the unprefixed (execID "w", node "42", generation 7,
+// attempt 0) — both rendered as "w.42.7.0". A caller-supplied execution id of
+// "w" (StartWithID accepts arbitrary token-safe ids) would silently read or
+// clobber an unrelated execution's cached result.
+func TestCacheKeyedDoesNotCollideAcrossPrefixBoundary(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-no-collision"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	unprefixed := invoker.NewCache(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		calls.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"who":"unprefixed"}`)}, nil
+	}))
+
+	prefixed := invoker.NewCacheKeyed(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		calls.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"who":"prefixed"}`)}, nil
+	}), "w.")
+
+	// Under the old prefix+execID concatenation these two distinct requests
+	// on two distinct Cache layers rendered to the same underlying key.
+	unprefixedReq := invoker.Request{ExecutionID: "w", NodeID: "42", Generation: 7, Attempt: 0}
+	prefixedReq := invoker.Request{ExecutionID: "42", NodeID: "7", Generation: 0, Attempt: 0}
+
+	resA, err := unprefixed.Invoke(ctx, unprefixedReq)
+	if err != nil {
+		t.Fatalf("unprefixed invoke: %v", err)
+	}
+
+	resB, err := prefixed.Invoke(ctx, prefixedReq)
+	if err != nil {
+		t.Fatalf("prefixed invoke: %v", err)
+	}
+
+	if string(resA.Payload) != `{"who":"unprefixed"}` {
+		t.Fatalf("unprefixed result = %s, want its own delegate's result (collision?)", resA.Payload)
+	}
+
+	if string(resB.Payload) != `{"who":"prefixed"}` {
+		t.Fatalf("prefixed result = %s, want its own delegate's result (collision?)", resB.Payload)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("delegate called %d times, want 2 (one cached the other's entry)", got)
+	}
+}
+
 // TestCacheDoesNotCacheTransportError ensures a transport failure is not cached,
 // so a redelivery retries the call rather than replaying the error.
 func TestCacheDoesNotCacheTransportError(t *testing.T) {

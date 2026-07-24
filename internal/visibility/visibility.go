@@ -31,6 +31,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +40,15 @@ import (
 
 	"github.com/henomis/packtrail/internal/store"
 )
+
+// flowNamePattern mirrors internal/dsl's namePattern: flow names that reach
+// this package must already be valid NATS-token identifiers. Rejecting
+// anything else here (rather than trusting the caller) matters because
+// status/flow feed directly into a KV watch pattern below (see collectIDs and
+// collectEvents): an unvalidated value containing "*" or ">" is not a literal
+// string to NATS, it's a wildcard, and would match far more than the caller's
+// single flow or status.
+var flowNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 const (
 	// sep joins the index dimension and the execution id. NATS KV keys cannot
@@ -515,11 +526,19 @@ func isTerminal(status string) bool {
 
 // ByStatus returns the ids of executions currently indexed under status.
 func (ix *Indexer) ByStatus(ctx context.Context, status string) ([]string, error) {
+	if !validStatus(status) {
+		return nil, invalidStatusError(status)
+	}
+
 	return collectIDs(ctx, ix.idxStatus, status+sep, 0)
 }
 
 // ByFlow returns the ids of executions belonging to flow.
 func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
+	if !flowNamePattern.MatchString(flow) {
+		return nil, invalidFlowError(flow)
+	}
+
 	return collectIDs(ctx, ix.idxFlow, flow+sep, 0)
 }
 
@@ -528,12 +547,12 @@ func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
 // can build summaries (including the error message) without a per-execution
 // round-trip.
 func (ix *Indexer) ByStatusEvents(ctx context.Context, status string) ([]store.Event, error) {
-	return collectEvents(ctx, ix.idxStatus, status+sep, 0)
+	return ix.ByStatusEventsLimit(ctx, status, 0)
 }
 
 // ByFlowEvents returns the index entries for all executions belonging to flow.
 func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event, error) {
-	return collectEvents(ctx, ix.idxFlow, flow+sep, 0)
+	return ix.ByFlowEventsLimit(ctx, flow, 0)
 }
 
 // ByStatusEventsLimit is ByStatusEvents capped at limit entries (limit <= 0
@@ -541,13 +560,36 @@ func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event
 // arbitrary subset, not an ordered page; it is a guardrail against transferring
 // an unbounded result set, not a pagination cursor.
 func (ix *Indexer) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]store.Event, error) {
+	if !validStatus(status) {
+		return nil, invalidStatusError(status)
+	}
+
 	return collectEvents(ctx, ix.idxStatus, status+sep, limit)
 }
 
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (limit <= 0 means no
 // cap). The same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (ix *Indexer) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]store.Event, error) {
+	if !flowNamePattern.MatchString(flow) {
+		return nil, invalidFlowError(flow)
+	}
+
 	return collectEvents(ctx, ix.idxFlow, flow+sep, limit)
+}
+
+// validStatus reports whether status is one of the closed set of execution
+// statuses. Unlike flow names, statuses are a fixed enum, so membership
+// (rather than a charset regexp) is the precise check.
+func validStatus(status string) bool {
+	return slices.Contains(allStatuses, status)
+}
+
+func invalidStatusError(status string) error {
+	return fmt.Errorf("invalid status %q: must be one of %v", status, allStatuses)
+}
+
+func invalidFlowError(flow string) error {
+	return fmt.Errorf("invalid flow name %q: must match [A-Za-z0-9_-]{1,128}", flow)
 }
 
 // collectIDs gathers the execution ids of keys in kv under prefix, up to limit

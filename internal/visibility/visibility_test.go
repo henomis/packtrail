@@ -158,6 +158,51 @@ func TestByFlow(t *testing.T) {
 	}
 }
 
+// TestByFlowRejectsWildcard is a regression test: flow (and status) values
+// feed directly into a NATS KV Watch pattern (collectIDs/collectEvents build
+// "<value>.>"), so an unvalidated "*" or ">" is not a literal string to NATS —
+// it's a wildcard that matches every flow/status in the bucket, leaking every
+// execution's data across the whole namespace instead of returning just the
+// caller's flow. ByFlow/ByStatus and their Events variants must reject
+// anything that isn't a valid flow-name token / a known status before ever
+// reaching the watch.
+func TestByFlowRejectsWildcard(t *testing.T) {
+	ctx, st, ix := setup(t)
+	a := mkExec(t, st, "alpha")
+	b := mkExec(t, st, "bravo")
+
+	waitIndex(t, ix, store.StatusRunning, a.ID, true)
+	waitIndex(t, ix, store.StatusRunning, b.ID, true)
+
+	for _, wildcard := range []string{"*", ">", "alpha.>", "*.>"} {
+		if _, err := ix.ByFlow(ctx, wildcard); err == nil {
+			t.Fatalf("ByFlow(%q) succeeded, want rejection of non-literal flow value", wildcard)
+		}
+
+		if _, err := ix.ByFlowEvents(ctx, wildcard); err == nil {
+			t.Fatalf("ByFlowEvents(%q) succeeded, want rejection of non-literal flow value", wildcard)
+		}
+
+		if _, err := ix.ByStatus(ctx, wildcard); err == nil {
+			t.Fatalf("ByStatus(%q) succeeded, want rejection of unknown status", wildcard)
+		}
+
+		if _, err := ix.ByStatusEvents(ctx, wildcard); err == nil {
+			t.Fatalf("ByStatusEvents(%q) succeeded, want rejection of unknown status", wildcard)
+		}
+	}
+
+	// Sanity: legitimate, distinct values still work and stay scoped.
+	alpha, err := ix.ByFlow(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("by flow alpha: %v", err)
+	}
+
+	if !contains(alpha, a.ID) || contains(alpha, b.ID) {
+		t.Fatalf("ByFlow(alpha) = %v, want {%s} only", alpha, a.ID)
+	}
+}
+
 func TestIndexCleansPreviousFlowMembership(t *testing.T) {
 	ctx, st, ix := setup(t)
 	ex := mkExec(t, st, "oldflow")

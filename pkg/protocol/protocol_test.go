@@ -164,6 +164,104 @@ func TestServeBadRequest(t *testing.T) {
 	}
 }
 
+// TestServeRecoversHandlerPanic is a regression test: a panicking Handler used
+// to escape onto NATS's shared per-connection dispatcher goroutine, crashing
+// the whole worker process (every subscription on that connection, not just
+// this one). Serve must recover it and reply with StatusError instead.
+func TestServeRecoversHandlerPanic(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.panic.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	resp := request(t, srv, "tasks.panic.x", protocol.TaskRequest{ExecutionID: "exec-panic"})
+	if resp.Status != protocol.StatusError {
+		t.Fatalf("status = %q, want error", resp.Status)
+	}
+
+	if !strings.Contains(resp.Error, "panic") {
+		t.Fatalf("error = %q, want panic explanation", resp.Error)
+	}
+
+	// The connection (and every other subscription on it) must still be alive.
+	resp2 := request(t, srv, "tasks.panic.x", protocol.TaskRequest{ExecutionID: "exec-panic-2"})
+	if resp2.Status != protocol.StatusError {
+		t.Fatalf("second request status = %q, want error (connection should have survived the panic)", resp2.Status)
+	}
+}
+
+// TestServeHandlesConcurrentRequestsWithoutHeadOfLineBlocking is a regression
+// test: Serve used to invoke handlers inline on NATS's single shared
+// per-connection dispatcher goroutine, so one slow handler for one subject
+// blocked every other subject sharing the same *nats.Conn. Here a slow
+// handler and a fast handler share one connection; the fast one must not wait
+// for the slow one to finish.
+func TestServeHandlesConcurrentRequestsWithoutHeadOfLineBlocking(t *testing.T) {
+	srv := natstest.Start(t)
+
+	release := make(chan struct{})
+	slowStarted := make(chan struct{})
+
+	slowSub, err := protocol.Serve(context.Background(), srv.NC, "tasks.slow.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		close(slowStarted)
+		<-release
+
+		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve slow: %v", err)
+	}
+
+	t.Cleanup(func() { _ = slowSub.Unsubscribe() })
+
+	fastSub, err := protocol.Serve(context.Background(), srv.NC, "tasks.fast.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve fast: %v", err)
+	}
+
+	t.Cleanup(func() { _ = fastSub.Unsubscribe() })
+
+	// Fire the slow request asynchronously (it blocks until we release it) on
+	// the SAME connection the fast request below uses.
+	slowDone := make(chan protocol.TaskResponse, 1)
+
+	go func() {
+		slowDone <- request(t, srv, "tasks.slow.x", protocol.TaskRequest{ExecutionID: "exec-slow"})
+	}()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(requestTimeout):
+		t.Fatal("slow handler never started")
+	}
+
+	// The fast request must complete promptly even though the slow handler on
+	// the same connection is still blocked.
+	fastResp := request(t, srv, "tasks.fast.x", protocol.TaskRequest{ExecutionID: "exec-fast"})
+	if fastResp.Status != protocol.StatusOK {
+		t.Fatalf("fast status = %q, want ok (blocked behind the slow handler?)", fastResp.Status)
+	}
+
+	close(release)
+
+	select {
+	case slowResp := <-slowDone:
+		if slowResp.Status != protocol.StatusOK {
+			t.Fatalf("slow status = %q, want ok", slowResp.Status)
+		}
+	case <-time.After(requestTimeout):
+		t.Fatal("slow handler never completed")
+	}
+}
+
 // TestServeNamespaced verifies the namespace is prepended to the subscription
 // subject.
 func TestServeNamespaced(t *testing.T) {

@@ -79,13 +79,27 @@ func NewCacheKeyed(kv jetstream.KeyValue, delegate Invoker, prefix string) *Cach
 }
 
 func (c *Cache) key(req Request) string {
-	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are token-safe.
+	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are restricted to
+	// [A-Za-z0-9_-] (see internal/dsl's namePattern) and so can never contain
+	// "/". A non-empty prefix is therefore joined with "/" rather than relying
+	// on the prefix's own trailing character: a prefix like "w." joined
+	// directly (prefix+id) makes prefix "w." + id "42.7.0" collide byte-for-
+	// byte with the unprefixed key for execution "w", node "42" — a real
+	// cross-Cache key collision between two layers sharing one KV bucket.
+	// Ids can never contain "/", so this boundary is unambiguous.
+	var id string
 	if req.Generation != 0 {
-		return c.prefix + req.ExecutionID + "." + req.NodeID + "." +
+		id = req.ExecutionID + "." + req.NodeID + "." +
 			strconv.FormatUint(req.Generation, 10) + "." + strconv.Itoa(req.Attempt)
+	} else {
+		id = req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
 	}
 
-	return c.prefix + req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
+	if c.prefix == "" {
+		return id
+	}
+
+	return c.prefix + "/" + id
 }
 
 // Invoke returns a cached Result for this (execution, node, attempt) if present;

@@ -23,6 +23,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -68,39 +70,69 @@ type Handler func(ctx context.Context, req TaskRequest) (TaskResponse, error)
 // the returned subscription should still be drained/unsubscribed by the caller
 // when done.
 //
+// Each request runs h on its own goroutine, so concurrent requests run h
+// concurrently with each other — h must be safe for concurrent use. A
+// handler panic is recovered and reported to the caller as StatusError; it
+// does not take down the worker process.
+//
 // subject may contain NATS wildcards (e.g. "tasks.triage.*") so a single worker
 // can serve every execution of a task.
 func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error) {
 	return nc.QueueSubscribe(subject, "packtrail-workers", func(msg *nats.Msg) {
-		var req TaskRequest
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			reply(msg, TaskResponse{Status: StatusError, Error: "bad request: " + err.Error()})
-			return
-		}
-
-		callCtx := ctx
-
-		if !req.Deadline.IsZero() {
-			var cancel context.CancelFunc
-
-			callCtx, cancel = context.WithDeadline(ctx, req.Deadline)
-			defer cancel()
-		}
-
-		resp, err := h(callCtx, req)
-		if err != nil {
-			resp = TaskResponse{Status: StatusRetry, Error: err.Error()}
-		} else if !validStatus(resp.Status) {
-			resp = TaskResponse{
-				Status: StatusError,
-				Error: fmt.Sprintf(
-					"handler returned invalid task status %q; want %q, %q, or %q",
-					resp.Status, StatusOK, StatusError, StatusRetry),
-			}
-		}
-
-		reply(msg, resp)
+		// Every NATS async callback for a *nats.Conn — every subscription, every
+		// subject — is dispatched one at a time through one shared per-connection
+		// goroutine. Handling the request inline here would block that goroutine
+		// (and therefore every other subscription sharing nc, including unrelated
+		// task kinds) for as long as h takes to return. Handing off to its own
+		// goroutine per request restores per-request concurrency and keeps one
+		// slow or wedged handler from stalling the rest of the process's traffic.
+		go serveOne(ctx, msg, h)
 	})
+}
+
+func serveOne(ctx context.Context, msg *nats.Msg, h Handler) {
+	// A handler panic must still produce a reply (so the engine sees a failure
+	// instead of waiting out a request timeout) and must not escape this
+	// goroutine — an unrecovered panic here would crash the whole process,
+	// taking down every other task kind sharing this connection, not just the
+	// one execution that triggered it.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("protocol: handler panic",
+				"subject", msg.Subject, "panic", r, "stack", string(debug.Stack()))
+
+			reply(msg, TaskResponse{Status: StatusError, Error: fmt.Sprintf("handler panic: %v", r)})
+		}
+	}()
+
+	var req TaskRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		reply(msg, TaskResponse{Status: StatusError, Error: "bad request: " + err.Error()})
+		return
+	}
+
+	callCtx := ctx
+
+	if !req.Deadline.IsZero() {
+		var cancel context.CancelFunc
+
+		callCtx, cancel = context.WithDeadline(ctx, req.Deadline)
+		defer cancel()
+	}
+
+	resp, err := h(callCtx, req)
+	if err != nil {
+		resp = TaskResponse{Status: StatusRetry, Error: err.Error()}
+	} else if !validStatus(resp.Status) {
+		resp = TaskResponse{
+			Status: StatusError,
+			Error: fmt.Sprintf(
+				"handler returned invalid task status %q; want %q, %q, or %q",
+				resp.Status, StatusOK, StatusError, StatusRetry),
+		}
+	}
+
+	reply(msg, resp)
 }
 
 func validStatus(status string) bool {

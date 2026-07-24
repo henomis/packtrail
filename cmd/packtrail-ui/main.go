@@ -16,6 +16,12 @@
 // deployment. It connects to the same NATS cluster, reads execution state and
 // the flow registry, tails the live event stream, and serves a small web UI.
 // It never drives executions — it is purely an observer.
+//
+// Security: this binary has no built-in authentication or authorization.
+// Every route it serves, including execution payloads/signals and dead-letter
+// records, is available to anyone who can reach --addr. Bind it to a trusted
+// network only, or front it with your own auth proxy if it must be reachable
+// from anywhere less trusted.
 package main
 
 import (

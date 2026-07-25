@@ -31,6 +31,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,6 +54,25 @@ const (
 var allStatuses = []string{
 	store.StatusRunning, store.StatusWaiting, store.StatusCompleted, store.StatusFailed,
 	store.StatusCancelled,
+}
+
+// flowNamePattern mirrors internal/dsl's flow-name token rule. It is restated
+// here rather than imported so this package's public By*/By*Events methods can
+// validate a caller-supplied flow name before using it to build a NATS KV
+// Watch subject filter (kv.Watch(flow+sep+">", ...)): an unvalidated value
+// containing '*' or '>' would otherwise widen the filter to match every flow
+// (or every execution) in the bucket instead of erroring.
+var flowNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func validFlowName(flow string) bool {
+	return flowNamePattern.MatchString(flow)
+}
+
+// validExecStatus reports whether status is one of the closed set of execution
+// statuses, for the same reason flowNamePattern exists: status is used to
+// build a NATS KV Watch subject filter and must never contain wildcards.
+func validExecStatus(status string) bool {
+	return slices.Contains(allStatuses, status)
 }
 
 // Indexer projects domain events into the visibility indexes and answers
@@ -515,11 +536,19 @@ func isTerminal(status string) bool {
 
 // ByStatus returns the ids of executions currently indexed under status.
 func (ix *Indexer) ByStatus(ctx context.Context, status string) ([]string, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectIDs(ctx, ix.idxStatus, status+sep, 0)
 }
 
 // ByFlow returns the ids of executions belonging to flow.
 func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectIDs(ctx, ix.idxFlow, flow+sep, 0)
 }
 
@@ -528,11 +557,19 @@ func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
 // can build summaries (including the error message) without a per-execution
 // round-trip.
 func (ix *Indexer) ByStatusEvents(ctx context.Context, status string) ([]store.Event, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectEvents(ctx, ix.idxStatus, status+sep, 0)
 }
 
 // ByFlowEvents returns the index entries for all executions belonging to flow.
 func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectEvents(ctx, ix.idxFlow, flow+sep, 0)
 }
 
@@ -541,12 +578,20 @@ func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event
 // arbitrary subset, not an ordered page; it is a guardrail against transferring
 // an unbounded result set, not a pagination cursor.
 func (ix *Indexer) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]store.Event, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectEvents(ctx, ix.idxStatus, status+sep, limit)
 }
 
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (limit <= 0 means no
 // cap). The same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (ix *Indexer) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]store.Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectEvents(ctx, ix.idxFlow, flow+sep, limit)
 }
 

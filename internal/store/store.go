@@ -107,8 +107,9 @@ type Store struct {
 
 	historyEnabled atomic.Bool // set by EnableHistory; EmitEvent mirrors events into the history stream
 
-	leaseObsMu sync.Mutex
-	leaseObs   map[string]leaseObservation
+	leaseObsMu    sync.Mutex
+	leaseObs      map[string]leaseObservation
+	leaseObsCalls uint64 // triggers a periodic sweep of stale leaseObs entries
 }
 
 // Open ensures every bucket and stream exists, under the given namespace, and

@@ -23,6 +23,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -87,20 +89,43 @@ func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats
 			defer cancel()
 		}
 
-		resp, err := h(callCtx, req)
-		if err != nil {
-			resp = TaskResponse{Status: StatusRetry, Error: err.Error()}
-		} else if !validStatus(resp.Status) {
-			resp = TaskResponse{
-				Status: StatusError,
-				Error: fmt.Sprintf(
-					"handler returned invalid task status %q; want %q, %q, or %q",
-					resp.Status, StatusOK, StatusError, StatusRetry),
-			}
-		}
-
-		reply(msg, resp)
+		reply(msg, callHandler(callCtx, req, h))
 	})
+}
+
+// callHandler runs h and recovers a panic into a StatusError response. The
+// callback passed to QueueSubscribe runs directly on the NATS client library's
+// delivery goroutine; nats.go does not recover subscription-callback panics
+// itself, so an unrecovered panic in a Handler (e.g. a nil-map access on an
+// edge-case payload) would otherwise crash the entire hosting process —
+// including every other in-flight request on any subject — not just the one
+// that triggered it.
+func callHandler(ctx context.Context, req TaskRequest, h Handler) (resp TaskResponse) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("protocol: handler panic",
+				"execution_id", req.ExecutionID, "node_id", req.NodeID,
+				"panic", r, "stack", string(debug.Stack()))
+
+			resp = TaskResponse{Status: StatusError, Error: fmt.Sprintf("handler panic: %v", r)}
+		}
+	}()
+
+	resp, err := h(ctx, req)
+	if err != nil {
+		return TaskResponse{Status: StatusRetry, Error: err.Error()}
+	}
+
+	if !validStatus(resp.Status) {
+		return TaskResponse{
+			Status: StatusError,
+			Error: fmt.Sprintf(
+				"handler returned invalid task status %q; want %q, %q, or %q",
+				resp.Status, StatusOK, StatusError, StatusRetry),
+		}
+	}
+
+	return resp
 }
 
 func validStatus(status string) bool {

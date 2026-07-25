@@ -80,12 +80,27 @@ func NewCacheKeyed(kv jetstream.KeyValue, delegate Invoker, prefix string) *Cach
 
 func (c *Cache) key(req Request) string {
 	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are token-safe.
+	rest := req.ExecutionID + "." + req.NodeID + "."
 	if req.Generation != 0 {
-		return c.prefix + req.ExecutionID + "." + req.NodeID + "." +
-			strconv.FormatUint(req.Generation, 10) + "." + strconv.Itoa(req.Attempt)
+		rest += strconv.FormatUint(req.Generation, 10) + "."
 	}
 
-	return c.prefix + req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
+	rest += strconv.Itoa(req.Attempt)
+
+	if c.prefix == "" {
+		return rest
+	}
+
+	// The prefix is length-prefixed ("<len>=<prefix>", netstring-style) rather
+	// than simply concatenated: two Cache layers sharing one bucket with
+	// different prefixes (e.g. "" and "w.") must never collide on the same key
+	// for different (execution, node) tuples. A fixed delimiter can't guarantee
+	// that for an arbitrary prefix/execution-id combination — e.g. prefix "w."
+	// with ExecutionID "42" and prefix "" with ExecutionID "w" both used to
+	// produce the key "w.42.<gen>.<attempt>" under plain concatenation. A
+	// length prefix makes the prefix/rest boundary unambiguous regardless of
+	// what characters the prefix or the ids contain.
+	return strconv.Itoa(len(c.prefix)) + "=" + c.prefix + rest
 }
 
 // Invoke returns a cached Result for this (execution, node, attempt) if present;

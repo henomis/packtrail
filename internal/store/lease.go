@@ -170,6 +170,21 @@ func (s *Store) ReleaseLease(ctx context.Context, execID, owner string) error {
 	return err
 }
 
+// leaseObsPruneAge and leaseObsPruneEvery bound the growth of leaseObs.
+// AcquireLease/ReleaseLease clear their own execution's entry once this
+// instance takes/renews/releases a lease, but LeaseHeld (the stall watchdog's
+// read-only check, run on every reconcile-active pass for every quiet-but-
+// active execution) only ever observes and never owns those executions — an
+// entry it creates is never cleared. Without pruning, s.leaseObs grows by one
+// entry per distinct execution id this process has ever watched, unbounded,
+// for the process lifetime. An entry this stale is certainly no longer useful
+// (any live renewal would have refreshed it, any takeover would have cleared
+// it), so periodically sweep entries older than leaseObsPruneAge.
+const (
+	leaseObsPruneAge   = time.Hour
+	leaseObsPruneEvery = 256
+)
+
 func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Duration) bool {
 	if ttl <= 0 {
 		return true
@@ -184,6 +199,11 @@ func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Dura
 		s.leaseObs = make(map[string]leaseObservation)
 	}
 
+	s.leaseObsCalls++
+	if s.leaseObsCalls%leaseObsPruneEvery == 0 {
+		s.pruneLeaseObsLocked(now)
+	}
+
 	obs, ok := s.leaseObs[execID]
 	if !ok || obs.revision != revision {
 		s.leaseObs[execID] = leaseObservation{revision: revision, at: now}
@@ -192,6 +212,16 @@ func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Dura
 	}
 
 	return now.Sub(obs.at) >= ttl
+}
+
+// pruneLeaseObsLocked removes observations older than leaseObsPruneAge. Callers
+// must hold s.leaseObsMu.
+func (s *Store) pruneLeaseObsLocked(now time.Time) {
+	for execID, obs := range s.leaseObs {
+		if now.Sub(obs.at) >= leaseObsPruneAge {
+			delete(s.leaseObs, execID)
+		}
+	}
 }
 
 func (s *Store) clearLeaseObservation(execID string) {

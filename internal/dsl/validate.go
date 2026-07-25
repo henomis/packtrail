@@ -564,10 +564,21 @@ func (f *Flow) validateNode(n *Node) error {
 			return fmt.Errorf("flow %q: fanin node %q: wait_for is required", f.Name, n.ID)
 		}
 
+		// A duplicate id would double-count that branch's completion in
+		// evalFanin's quorum/all tally, letting the join advance before enough
+		// distinct branches have actually settled.
+		seenWait := make(map[string]bool, len(n.WaitFor))
+
 		for _, w := range n.WaitFor {
 			if err := ref(w, "wait_for"); err != nil {
 				return err
 			}
+
+			if seenWait[w] {
+				return fmt.Errorf("flow %q: fanin node %q: wait_for lists %q twice", f.Name, n.ID, w)
+			}
+
+			seenWait[w] = true
 		}
 
 		jp := strings.TrimSpace(n.JoinPolicy)

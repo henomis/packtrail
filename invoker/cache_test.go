@@ -182,6 +182,52 @@ func TestCacheKeyedSeparatesKeyspaces(t *testing.T) {
 	}
 }
 
+// TestCacheKeyedNoBoundaryCollision reproduces the exact key-join collision a
+// missing prefix/id delimiter used to allow: with plain concatenation, prefix
+// "w." + ExecutionID "42" produced the same string as prefix "" + ExecutionID
+// "w" ("w.42.<gen>.<attempt>"), so one execution's worker-cached result could
+// be read back as an unrelated execution's dispatch-cache entry.
+func TestCacheKeyedNoBoundaryCollision(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-boundary"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var dispatches, execs atomic.Int32
+
+	// Unprefixed dispatch cache for a short execution id "w".
+	dispatch := invoker.NewCache(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		dispatches.Add(1)
+		return invoker.Result{Status: invoker.StatusPending}, nil
+	}))
+	dispatchReq := invoker.Request{ExecutionID: "w", NodeID: "42", Generation: 7, Attempt: 0}
+
+	// Prefixed worker cache ("w.") for an unrelated execution "42".
+	work := invoker.NewCacheKeyed(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		execs.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"done":true}`)}, nil
+	}), "w.")
+	workReq := invoker.Request{ExecutionID: "42", NodeID: "7", Generation: 0, Attempt: 0}
+
+	if res, invokeErr := work.Invoke(ctx, workReq); invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("work: res=%+v err=%v, want ok", res, invokeErr)
+	}
+
+	// Before the fix this read the worker's cached OK result for a completely
+	// unrelated execution instead of invoking its own delegate.
+	res, invokeErr := dispatch.Invoke(ctx, dispatchReq)
+	if invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch: res=%+v err=%v, want its own pending (cross-execution collision?)", res, invokeErr)
+	}
+
+	if d, e := dispatches.Load(), execs.Load(); d != 1 || e != 1 {
+		t.Fatalf("dispatches=%d execs=%d, want 1/1 (no cross-execution cache hit)", d, e)
+	}
+}
+
 // TestCacheDoesNotCacheTransportError ensures a transport failure is not cached,
 // so a redelivery retries the call rather than replaying the error.
 func TestCacheDoesNotCacheTransportError(t *testing.T) {

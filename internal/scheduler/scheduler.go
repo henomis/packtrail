@@ -144,6 +144,13 @@ func (s *Scheduler) Cron(ctx context.Context, name, key, expr string, payload []
 const (
 	firedAckWait  = 30 * time.Second
 	firedNakDelay = 2 * time.Second
+	// maxDeliverHardCapMult sets a server-side MaxDeliver backstop at a multiple
+	// of the client-side cap. The client-side dead-lettering (which needs a
+	// working msg.Metadata()) is the primary path; the server cap only matters
+	// if Metadata() fails persistently, so it sits above the client cap to avoid
+	// preempting the durable dead-letter trace in normal operation while still
+	// bounding an otherwise-infinite Nak loop.
+	maxDeliverHardCapMult = 3
 	// scheduleDedupWindow is the explicit JetStream dedup window for the schedule
 	// stream, matching NATS's implicit ~2m default (see AtID).
 	scheduleDedupWindow = 2 * time.Minute
@@ -174,6 +181,7 @@ func (s *Scheduler) ConsumeFired(
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       firedAckWait,
 		FilterSubject: s.fire + ">",
+		MaxDeliver:    serverMaxDeliver(maxDeliver),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fired consumer: %w", err)
@@ -292,6 +300,17 @@ func isTerminal(err error) bool {
 	var t interface{ Terminal() bool }
 
 	return errors.As(err, &t) && t.Terminal()
+}
+
+// serverMaxDeliver returns the server-side MaxDeliver backstop for a client cap,
+// or 0 (JetStream's "unlimited") when the caller disabled the cap (maxDeliver
+// <= 0) — respecting an operator's choice of unbounded transient retries.
+func serverMaxDeliver(maxDeliver int) int {
+	if maxDeliver <= 0 {
+		return 0
+	}
+
+	return maxDeliver * maxDeliverHardCapMult
 }
 
 // deliveriesExhausted reports whether a message has been delivered at least

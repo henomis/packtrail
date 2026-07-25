@@ -24,6 +24,37 @@ import (
 	"github.com/henomis/packtrail/internal/scheduler"
 )
 
+// TestConsumeFiredSetsServerMaxDeliverBackstop verifies the fired consumer is
+// created with a server-side MaxDeliver above the client cap, so a persistent
+// msg.Metadata() failure cannot Nak-loop forever.
+func TestConsumeFiredSetsServerMaxDeliverBackstop(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+	n := names.New("")
+
+	sched := scheduler.New(srv.JS, n)
+	if err := sched.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	cc, err := sched.ConsumeFired(ctx, "test-maxdeliver", 10, nil,
+		func(string, []byte, string) error { return nil })
+	if err != nil {
+		t.Fatalf("consume fired: %v", err)
+	}
+
+	t.Cleanup(cc.Stop)
+
+	cons, err := srv.JS.Consumer(ctx, n.StreamSchedule, "test-maxdeliver")
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+
+	if got := cons.CachedInfo().Config.MaxDeliver; got != 30 {
+		t.Fatalf("MaxDeliver = %d, want 30 (client cap 10 × 3)", got)
+	}
+}
+
 type fired struct {
 	key     string
 	payload []byte

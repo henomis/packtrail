@@ -145,6 +145,11 @@ type Delivery struct {
 const (
 	signalAckWait  = 30 * time.Second
 	signalNakDelay = 2 * time.Second
+	// maxDeliverHardCapMult sets a server-side MaxDeliver backstop at a multiple
+	// of the client-side cap, so a persistent msg.Metadata() failure (which the
+	// client-side exhaustion check depends on) cannot Nak-loop forever. It sits
+	// above the client cap to avoid preempting the durable dead-letter trace.
+	maxDeliverHardCapMult = 3
 )
 
 // Consume sets up a durable consumer and invokes handler for every signal. The
@@ -163,11 +168,17 @@ func (s *Signals) Consume(
 	onDeadLetter func(execID, name, reason string, deliveries uint64),
 	handler func(context.Context, Delivery) error,
 ) (jetstream.ConsumeContext, error) {
+	serverMaxDeliver := 0 // 0 = unlimited; only cap when the client cap is enabled
+	if maxDeliver > 0 {
+		serverMaxDeliver = maxDeliver * maxDeliverHardCapMult
+	}
+
 	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
 		Durable:       durable,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       signalAckWait,
 		FilterSubject: s.prefix + ">",
+		MaxDeliver:    serverMaxDeliver,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("signals consumer: %w", err)

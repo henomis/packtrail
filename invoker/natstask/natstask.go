@@ -39,13 +39,24 @@ type Invoker struct {
 
 // New returns a nats-task Invoker over nc. prefix is the namespace (e.g.
 // "packtrail" or "acme") prepended to every task subject so workers are
-// isolated per deployment. An empty prefix defaults to "packtrail".
+// isolated per deployment. An empty prefix opts out of a namespace segment
+// entirely: task subjects are then the bare, unprefixed target. packtrail's
+// own wiring never passes an empty prefix (names.New already defaults an
+// empty namespace to "packtrail" before it reaches here); this constructor
+// no longer applies its own default on top, so a direct caller that wants no
+// prefix gets one.
 func New(nc *nats.Conn, prefix string) *Invoker {
-	if prefix == "" {
-		prefix = "packtrail"
+	return &Invoker{nc: nc, prefix: prefix}
+}
+
+// subject builds the NATS subject for target: prefix.target, or just target
+// when no prefix was configured.
+func (i *Invoker) subject(target string) string {
+	if i.prefix == "" {
+		return target
 	}
 
-	return &Invoker{nc: nc, prefix: prefix}
+	return i.prefix + "." + target
 }
 
 // Invoke marshals req into a protocol.TaskRequest, performs a NATS request to
@@ -78,7 +89,7 @@ func (i *Invoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Resu
 		}
 	}
 
-	msg, err := i.nc.RequestWithContext(callCtx, i.prefix+"."+req.Target, data)
+	msg, err := i.nc.RequestWithContext(callCtx, i.subject(req.Target), data)
 	if err != nil {
 		return invoker.Result{}, err
 	}

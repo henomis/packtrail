@@ -272,6 +272,36 @@ func TestServesDashboard(t *testing.T) {
 	}
 }
 
+// TestAppJSEscapesStatusField is a regression test: the served JS used to
+// interpolate an execution's status field into innerHTML without the esc()
+// helper every other field uses, in both the execution-list row and the
+// detail header. There's no JS test runner in this repo, so this checks the
+// served source directly for the un-escaped patterns rather than executing it.
+func TestAppJSEscapesStatusField(t *testing.T) {
+	s := newTestServer(t)
+	h := newAPI(s).routes()
+
+	body := doGet(t, h, "/app.js")
+
+	for _, unescaped := range []string{
+		"badge ${e.status}\">${e.status}",
+		"badge ${ex.status}\">${ex.status}",
+	} {
+		if strings.Contains(body, unescaped) {
+			t.Errorf("app.js still interpolates status without esc(): found %q", unescaped)
+		}
+	}
+
+	for _, escaped := range []string{
+		"badge ${esc(e.status)}\">${esc(e.status)}",
+		"badge ${esc(ex.status)}\">${esc(ex.status)}",
+	} {
+		if !strings.Contains(body, escaped) {
+			t.Errorf("app.js missing expected escaped status pattern %q", escaped)
+		}
+	}
+}
+
 func doGet(t *testing.T, h http.Handler, path string) string {
 	t.Helper()
 

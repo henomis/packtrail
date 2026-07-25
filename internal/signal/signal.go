@@ -145,6 +145,9 @@ type Delivery struct {
 const (
 	signalAckWait  = 30 * time.Second
 	signalNakDelay = 2 * time.Second
+	// maxDeliverHardCapMult sizes the server-side MaxDeliver backstop as a
+	// multiple of the client-tracked maxDeliver: see Consume.
+	maxDeliverHardCapMult = 3
 )
 
 // Consume sets up a durable consumer and invokes handler for every signal. The
@@ -158,17 +161,30 @@ const (
 // cannot Nak-loop forever (the waiting execution falls back to its wait timeout).
 // onDeadLetter (when non-nil) is called with the execution id, signal name, reason
 // and delivery count just before a Term, so the caller can record a durable trace.
+//
+// maxDeliver > 0 also sets a server-side MaxDeliver backstop at
+// maxDeliverHardCapMult times that value: handleDelivery's own exhaustion check
+// compares against msg.Metadata(), so a delivery whose metadata read
+// persistently fails would otherwise Nak forever without ever reaching it
+// (server default MaxDeliver is -1, unlimited). The multiple keeps this
+// backstop well clear of ordinary operation.
 func (s *Signals) Consume(
 	ctx context.Context, durable string, maxDeliver int,
 	onDeadLetter func(execID, name, reason string, deliveries uint64),
 	handler func(context.Context, Delivery) error,
 ) (jetstream.ConsumeContext, error) {
-	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
+	consCfg := jetstream.ConsumerConfig{
 		Durable:       durable,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       signalAckWait,
 		FilterSubject: s.prefix + ">",
-	})
+	}
+
+	if maxDeliver > 0 {
+		consCfg.MaxDeliver = maxDeliver * maxDeliverHardCapMult
+	}
+
+	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, consCfg)
 	if err != nil {
 		return nil, fmt.Errorf("signals consumer: %w", err)
 	}

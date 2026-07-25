@@ -14,12 +14,16 @@
 
 // Package rules compiles and evaluates the boolean expressions used by choice
 // nodes. Expressions are written in expr-lang and evaluated against the
-// invocation context, exposed as three variables: `input` (the start payload),
-// `results` (each visited node's output, keyed by node id) and `signals`
-// (received signal payloads, keyed by signal name).
+// invocation context, exposed as five variables: `input` (the start payload),
+// `results` (each visited node's output, keyed by node id), `signals`
+// (received signal payloads, keyed by signal name), `branches` (the outputs of
+// the current fan's branches, a subset of results) and `last_node` (the id of
+// the most recently settled output, so "the previous step's result" is
+// results[last_node]).
 //
 //	when: "results.triage.risk_score > 80"
 //	when: "input.tier == 'pro' && signals.approval.granted"
+//	when: "last_node == 'triage' && branches.a.ok"
 package rules
 
 import (

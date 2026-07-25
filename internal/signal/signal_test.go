@@ -61,6 +61,54 @@ func consume(ctx context.Context, t *testing.T, sigs *signal.Signals, durable st
 	return ch
 }
 
+// TestConsumeSetsServerSideMaxDeliverBackstop is a regression test: the
+// consumer used to have no server-side MaxDeliver at all (server default -1,
+// unlimited), so a delivery whose metadata read persistently fails would Nak
+// forever without ever reaching handleDelivery's own exhaustion check. Consume
+// must set a generous backstop above the client-tracked maxDeliver.
+func TestConsumeSetsServerSideMaxDeliverBackstop(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	n := names.New("")
+	sigs := signal.New(srv.JS, n)
+
+	if err := sigs.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	const maxDeliver = 10
+
+	cc, err := sigs.Consume(ctx, "durable-maxdeliver", maxDeliver, nil, func(context.Context, signal.Delivery) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	t.Cleanup(cc.Stop)
+
+	stream, err := srv.JS.Stream(ctx, n.StreamSignals)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	cons, err := stream.Consumer(ctx, "durable-maxdeliver")
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+
+	info, err := cons.Info(ctx)
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+
+	if info.Config.MaxDeliver <= maxDeliver {
+		t.Fatalf("MaxDeliver = %d, want > %d (client-tracked maxDeliver, so the server backstop sits above it)",
+			info.Config.MaxDeliver, maxDeliver)
+	}
+}
+
 // TestPublishConsumeRoundTrip verifies a published signal is delivered with its
 // execution id, name, payload and a non-zero stream sequence.
 func TestPublishConsumeRoundTrip(t *testing.T) {

@@ -30,6 +30,24 @@ func TestNewEmptyPrefixFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestNewPanicsOnInvalidPrefix is a regression test: New used to accept any
+// string, including one with characters that would fail much later with an
+// opaque NATS error at bucket/stream creation. A future caller that skips
+// packtrail.go's own validation must fail fast here instead.
+func TestNewPanicsOnInvalidPrefix(t *testing.T) {
+	for _, bad := range []string{"has.dot", "has space", "has/slash", "wild*card", strings.Repeat("x", 65)} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("New(%q) did not panic", bad)
+				}
+			}()
+
+			New(bad)
+		}()
+	}
+}
+
 func TestNewDefaultValues(t *testing.T) {
 	n := New("")
 

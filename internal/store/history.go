@@ -35,7 +35,15 @@ const (
 // subject. Until it runs, EmitEvent skips history and History returns nothing.
 // The trace is observability, not operational truth — the execution document
 // and the events stream stay authoritative.
+//
+// A positive retention bounds how long a history record survives; a negative
+// value disables the age limit (normalized to 0, JetStream's "no MaxAge"),
+// mirroring Signals.SetRetention.
 func (s *Store) EnableHistory(ctx context.Context, retention time.Duration) error {
+	if retention < 0 {
+		retention = 0 // no MaxAge
+	}
+
 	duplicates := eventDedupWindow
 	if retention > 0 && retention < duplicates {
 		duplicates = retention

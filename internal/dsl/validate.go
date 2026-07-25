@@ -29,6 +29,11 @@ import (
 // NATS rejection (or a silently ambiguous key) at runtime.
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// placeholderPattern matches any {...}-shaped token in a task node's
+// subject/target, so validateTaskNode can reject anything other than the one
+// placeholder ResolvePlaceholders actually recognizes ("{execution_id}").
+var placeholderPattern = regexp.MustCompile(`\{[^{}]*\}`)
+
 // MaxRetryAttempts bounds a task node's retry.max_attempts. The ceiling keeps
 // the exponential backoff shift (base << (attempt-1)) well clear of int64
 // overflow and stops a pathological config from scheduling an unreasonable
@@ -534,6 +539,18 @@ func (f *Flow) validateTaskNode(n *Node) error {
 		target := n.Target
 		if target == "" {
 			target = n.Subject
+		}
+
+		// ResolvePlaceholders only replaces the literal "{execution_id}"
+		// substring; anything else shaped like a placeholder (e.g. a typo such
+		// as "{exec_id}") passes through unresolved and becomes part of the
+		// literal subject every execution shares, silently, unless rejected here.
+		for _, m := range placeholderPattern.FindAllString(target, -1) {
+			if m != "{execution_id}" {
+				return fmt.Errorf(
+					"flow %q: task node %q: subject %q contains unrecognized placeholder %q (only {execution_id} is supported)",
+					f.Name, n.ID, target, m)
+			}
 		}
 
 		resolved := ResolvePlaceholders(target, "x")

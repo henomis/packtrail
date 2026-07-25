@@ -189,11 +189,16 @@ func TestInvokeNoWorkerReturnsError(t *testing.T) {
 	}
 }
 
-// TestNewDefaultsPrefix verifies an empty prefix falls back to "packtrail".
-func TestNewDefaultsPrefix(t *testing.T) {
+// TestNewEmptyPrefixOptsOutOfNamespace is a regression test: New used to
+// silently default an empty prefix to "packtrail" with no way to opt out. A
+// direct caller that wants bare, unprefixed task subjects (e.g. workers that
+// don't share a NATS account with any other packtrail namespace) now gets
+// exactly that instead.
+func TestNewEmptyPrefixOptsOutOfNamespace(t *testing.T) {
 	srv := natstest.Start(t)
 
-	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "packtrail", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+	// Serve on the bare subject, with no namespace prefix at all.
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
 		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
 	})
 	if err != nil {
@@ -202,7 +207,7 @@ func TestNewDefaultsPrefix(t *testing.T) {
 
 	t.Cleanup(func() { _ = sub.Unsubscribe() })
 
-	inv := natstask.New(srv.NC, "") // empty prefix -> "packtrail"
+	inv := natstask.New(srv.NC, "") // empty prefix -> no namespace segment
 
 	res, err := inv.Invoke(context.Background(), invoker.Request{Target: "tasks.echo.x", ExecutionID: "exec-4"})
 	if err != nil {

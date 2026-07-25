@@ -147,6 +147,9 @@ const (
 	// scheduleDedupWindow is the explicit JetStream dedup window for the schedule
 	// stream, matching NATS's implicit ~2m default (see AtID).
 	scheduleDedupWindow = 2 * time.Minute
+	// maxDeliverHardCapMult sizes the server-side MaxDeliver backstop as a
+	// multiple of the client-tracked maxDeliver: see ConsumeFired.
+	maxDeliverHardCapMult = 3
 )
 
 // ConsumeFired sets up a durable consumer that invokes handler for every fired
@@ -164,17 +167,30 @@ const (
 // case would otherwise Nak-loop forever on every cron tick. onDeadLetter (when
 // non-nil) is called with the key, reason and delivery count just before a Term,
 // so the caller can record a durable trace.
+//
+// maxDeliver > 0 also sets a server-side MaxDeliver backstop at
+// maxDeliverHardCapMult times that value: the client-side check above compares
+// against msg.Metadata(), so a message whose metadata read persistently fails
+// would otherwise never reach it and redeliver forever (server default
+// MaxDeliver is -1, unlimited). The multiple keeps this backstop well clear of
+// ordinary operation — the client-side path is expected to dead-letter first.
 func (s *Scheduler) ConsumeFired(
 	ctx context.Context, durable string, maxDeliver int,
 	onDeadLetter func(key, reason string, deliveries uint64),
 	handler func(key string, payload []byte, firedID string) error,
 ) (jetstream.ConsumeContext, error) {
-	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
+	consCfg := jetstream.ConsumerConfig{
 		Durable:       durable,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       firedAckWait,
 		FilterSubject: s.fire + ">",
-	})
+	}
+
+	if maxDeliver > 0 {
+		consCfg.MaxDeliver = maxDeliver * maxDeliverHardCapMult
+	}
+
+	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, consCfg)
 	if err != nil {
 		return nil, fmt.Errorf("fired consumer: %w", err)
 	}
@@ -243,7 +259,11 @@ func (s *Scheduler) ReclaimFired(ctx context.Context, durable string) (uint64, e
 		return 0, nil // nothing acked yet
 	}
 
-	before, err := stream.Info(ctx)
+	// Scoped to the fire.> subject count (not the stream's total message count):
+	// the same stream also carries sched.cron.* and sched.once.* entries, whose
+	// unrelated growth between these two reads would otherwise dilute a
+	// total-message delta and under-report what this purge actually removed.
+	before, err := stream.Info(ctx, jetstream.WithSubjectFilter(s.fire+">"))
 	if err != nil {
 		return 0, fmt.Errorf("stream info: %w", err)
 	}
@@ -253,16 +273,31 @@ func (s *Scheduler) ReclaimFired(ctx context.Context, durable string) (uint64, e
 		return 0, fmt.Errorf("purge fired: %w", err)
 	}
 
-	after, err := stream.Info(ctx)
+	after, err := stream.Info(ctx, jetstream.WithSubjectFilter(s.fire+">"))
 	if err != nil {
 		return 0, fmt.Errorf("stream info: %w", err)
 	}
 
-	if before.State.Msgs < after.State.Msgs {
-		return 0, nil // concurrent growth; report nothing purged rather than underflow
+	beforeCount := subjectMsgTotal(before.State.Subjects)
+	afterCount := subjectMsgTotal(after.State.Subjects)
+
+	if beforeCount < afterCount {
+		return 0, nil // concurrent fire.> growth; report nothing purged rather than underflow
 	}
 
-	return before.State.Msgs - after.State.Msgs, nil
+	return beforeCount - afterCount, nil
+}
+
+// subjectMsgTotal sums per-subject message counts from a StreamInfo fetched
+// with WithSubjectFilter.
+func subjectMsgTotal(subjects map[string]uint64) uint64 {
+	var total uint64
+
+	for _, n := range subjects {
+		total += n
+	}
+
+	return total
 }
 
 // numDelivered returns a message's delivery count, or 0 if unavailable.

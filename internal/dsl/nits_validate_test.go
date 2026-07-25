@@ -150,6 +150,21 @@ nodes:
 	}
 }
 
+// TestValidateRejectsUnrecognizedPlaceholder is a regression test: only
+// "{execution_id}" is ever substituted; any other {...}-shaped token (e.g. a
+// typo like "{exec_id}") used to pass through unresolved and become a fixed
+// literal subject segment shared by every execution, silently.
+func TestValidateRejectsUnrecognizedPlaceholder(t *testing.T) {
+	_, err := Parse([]byte(`
+name: bad-placeholder
+nodes:
+  - {id: a, type: task, subject: "tasks.notify.{exec_id}"}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unrecognized placeholder") {
+		t.Fatalf("err = %v, want unrecognized-placeholder rejection", err)
+	}
+}
+
 // TestValidateAllowsFreeFormCustomTarget: custom invoker kinds interpret Target
 // freely (it may be a URL), so the subject check applies to nats-task only.
 func TestValidateAllowsFreeFormCustomTarget(t *testing.T) {

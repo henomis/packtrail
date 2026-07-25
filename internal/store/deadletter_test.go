@@ -16,6 +16,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"testing"
 )
 
@@ -78,7 +79,9 @@ func TestRecentDeadLettersLimit(t *testing.T) {
 
 	const total = 20
 	for i := range total {
-		if err := s.EmitDeadLetter(ctx, DeadLetter{Kind: DeadLetterWork, Key: "exec", Reason: "boom"}); err != nil {
+		// Distinct keys so each is a genuinely different dead-letter (see
+		// TestEmitDeadLetterDedupesSameKindKey for the same-key collapse).
+		if err := s.EmitDeadLetter(ctx, DeadLetter{Kind: DeadLetterWork, Key: "exec-" + strconv.Itoa(i), Reason: "boom"}); err != nil {
 			t.Fatalf("emit %d: %v", i, err)
 		}
 	}
@@ -90,5 +93,34 @@ func TestRecentDeadLettersLimit(t *testing.T) {
 
 	if len(recent) != 5 {
 		t.Fatalf("recent capped wrong: got %d, want 5", len(recent))
+	}
+}
+
+// TestEmitDeadLetterDedupesSameKindKey proves a re-emitted (kind, key) within
+// the dedup window leaves exactly one durable record and bumps the counter
+// once — the crash-between-emit-and-Term redelivery case.
+func TestEmitDeadLetterDedupesSameKindKey(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	dl := DeadLetter{Kind: DeadLetterWork, Key: "exec-poison", Reason: "boom", Deliveries: 1}
+	if err := s.EmitDeadLetter(ctx, dl); err != nil {
+		t.Fatalf("first emit: %v", err)
+	}
+
+	// Re-emit the same (kind, key), even with a different delivery count/reason.
+	dl.Deliveries = 2
+	dl.Reason = "boom again"
+	if err := s.EmitDeadLetter(ctx, dl); err != nil {
+		t.Fatalf("second emit: %v", err)
+	}
+
+	if got := s.DeadLetters(); got != 1 {
+		t.Fatalf("DeadLetters() = %d, want 1 (dedup should not double-count)", got)
+	}
+
+	count, err := s.DeadLetterCount(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("DeadLetterCount = %d, %v; want 1", count, err)
 	}
 }

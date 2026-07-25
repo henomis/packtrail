@@ -31,6 +31,12 @@ const (
 	defaultDrainTimeout    = 30 * time.Second
 	defaultMaxQueuedJobs   = 10_000
 	defaultMaxQueuedBytes  = 1 << 30
+	// minAckWait floors WithAckWait. The heartbeat ticker interval is derived
+	// from ackWait (ackWait/heartbeatDivisor); a caller passing a tiny or
+	// accidental raw-nanosecond Duration (e.g. WithAckWait(2) meaning "2s") must
+	// not be able to push that interval towards zero, since time.NewTicker
+	// panics on a non-positive duration.
+	minAckWait = 1 * time.Second
 	// defaultDedupWindow must exceed the maximum expected lag between a
 	// Dispatcher publishing a job and a Worker consuming it, so a redelivered
 	// dispatch of the same attempt is collapsed.
@@ -99,11 +105,18 @@ func WithActivityTimeout(d time.Duration) Option {
 
 // WithAckWait sets the job ack window, extended by heartbeats while a job runs
 // (default 30s). A worker that dies mid-job has its job redelivered after this.
+// Non-positive values keep the default; values below 1s are floored to 1s.
 func WithAckWait(d time.Duration) Option {
 	return func(c *config) {
-		if d > 0 {
-			c.ackWait = d
+		if d <= 0 {
+			return
 		}
+
+		if d < minAckWait {
+			d = minAckWait
+		}
+
+		c.ackWait = d
 	}
 }
 

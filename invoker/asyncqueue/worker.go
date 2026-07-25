@@ -32,6 +32,8 @@ import (
 const (
 	nakDelay         = 2 * time.Second
 	heartbeatDivisor = 3
+	// minHeartbeatInterval floors the heartbeat ticker; see heartbeat's doc comment.
+	minHeartbeatInterval = 100 * time.Millisecond
 )
 
 // Worker consumes jobs for one async invoker kind and runs the embedder's
@@ -332,8 +334,26 @@ func numDelivered(msg jetstream.Msg) uint64 {
 	return 0
 }
 
+// heartbeat runs on its own goroutine (spawned via `go w.heartbeat(...)` in
+// handle). handle's own panic-recovering defer only guards handle's stack, not
+// a child goroutine's, so an unrecovered panic here — e.g. from time.NewTicker
+// on a non-positive interval, or from msg.InProgress — would otherwise crash
+// the entire hosting process. minHeartbeatInterval is a backstop alongside
+// WithAckWait's floor: ackWait/heartbeatDivisor can only be non-positive if a
+// config is built without going through WithAckWait.
 func (w *Worker) heartbeat(ctx context.Context, msg jetstream.Msg) {
-	t := time.NewTicker(w.cfg.ackWait / heartbeatDivisor)
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("heartbeat panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	interval := w.cfg.ackWait / heartbeatDivisor
+	if interval <= 0 {
+		interval = minHeartbeatInterval
+	}
+
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	for {

@@ -17,7 +17,6 @@ package rules
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -104,6 +103,26 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 			code:    "sort(input.items) != nil",
 			wantErr: "function calls other than len() are not allowed",
 		},
+		{
+			name:    "string concatenation",
+			code:    `input.name + input.name + input.name != ""`,
+			wantErr: "concatenation and slicing are not allowed",
+		},
+		{
+			name:    "numeric addition",
+			code:    "input.x + input.y > 0",
+			wantErr: "concatenation and slicing are not allowed",
+		},
+		{
+			name:    "slicing",
+			code:    "input.items[1:2] != nil",
+			wantErr: "concatenation and slicing are not allowed",
+		},
+		{
+			name:    "regex matching",
+			code:    `input.name matches "^a+$"`,
+			wantErr: "regex matching is not allowed",
+		},
 	}
 
 	for _, tt := range cases {
@@ -173,11 +192,6 @@ func largeArrayPredicate(entries int) string {
 		}
 
 		b.WriteString("input.x")
-
-		if i%10 == 0 {
-			b.WriteString(" + ")
-			b.WriteString(strconv.Itoa(i))
-		}
 	}
 
 	b.WriteString("] != nil")

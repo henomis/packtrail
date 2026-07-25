@@ -29,6 +29,12 @@ import (
 // NATS rejection (or a silently ambiguous key) at runtime.
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// placeholderPattern matches any {…}-shaped token in a task subject/target.
+// ResolvePlaceholders only substitutes {execution_id}; any other such token is
+// a typo (e.g. {exec_id}) that would silently become a literal subject shared
+// by every execution of the node, defeating per-execution addressing.
+var placeholderPattern = regexp.MustCompile(`\{[^}]*\}`)
+
 // MaxRetryAttempts bounds a task node's retry.max_attempts. The ceiling keeps
 // the exponential backoff shift (base << (attempt-1)) well clear of int64
 // overflow and stops a pathological config from scheduling an unreasonable
@@ -156,6 +162,15 @@ func (f *Flow) buildEdges(inbound map[string]bool) error {
 
 		if e.From == e.To {
 			return fmt.Errorf("flow %q: node %q has a self-edge (would advance-loop forever)", f.Name, e.From)
+		}
+
+		// A choice node routes solely by its rules (stepChoice never consults
+		// edges), so an outgoing edge from one is dead weight that would pollute
+		// the reachability/cycle graph — making a phantom target look reachable
+		// and masking the typo the reachability check exists to catch. Reject it.
+		if f.byID[e.From].Type == NodeChoice {
+			return fmt.Errorf(
+				"flow %q: choice node %q has an outgoing edge; choice nodes route via rules, not edges", f.Name, e.From)
 		}
 
 		if _, dup := f.next[e.From]; dup {
@@ -518,6 +533,18 @@ func (f *Flow) validateTaskNode(n *Node) error {
 		target := n.Target
 		if target == "" {
 			target = n.Subject
+		}
+
+		// {execution_id} is the only supported placeholder; any other {…} token
+		// is a typo that ResolvePlaceholders would leave as a literal subject
+		// segment shared by every execution, silently defeating per-execution
+		// addressing. Reject it at load time.
+		for _, ph := range placeholderPattern.FindAllString(target, -1) {
+			if ph != "{execution_id}" {
+				return fmt.Errorf(
+					"flow %q: task node %q: subject %q contains unknown placeholder %s (only {execution_id} is supported)",
+					f.Name, n.ID, target, ph)
+			}
 		}
 
 		resolved := ResolvePlaceholders(target, "x")

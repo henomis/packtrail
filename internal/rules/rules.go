@@ -85,10 +85,12 @@ func Compile(code string) (*Program, error) {
 // concatenation (OpAdd) and slicing (OpSlice) allocate without ever calling
 // memGrow, so a budgeted VM does not bound them: a handful of chained `+`
 // operators over a large payload field can allocate hundreds of megabytes and
-// run for seconds despite passing MemoryBudget. Reject those, plus regex
-// matching (OpMatches/OpMatchesConst), which can run for a caller-unbounded
-// time on pathological patterns regardless of any memory budget. The remaining
+// run for seconds despite passing MemoryBudget. Reject those. The remaining
 // bytecode is a straight-line predicate over a size-limited execution document.
+//
+// Regex matching (`matches`) is intentionally NOT rejected: Go's regexp is RE2
+// (linear-time, no catastrophic backtracking) and the input is capped by
+// WithMaxPayloadBytes, so a match is bounded — unlike string concatenation.
 func validateBudgetedProgram(code string, prog *vm.Program) error {
 	for ip, op := range prog.Bytecode {
 		//nolint:exhaustive // Validation only rejects disallowed opcodes; the rest are allowed.
@@ -99,8 +101,6 @@ func validateBudgetedProgram(code string, prog *vm.Program) error {
 			return fmt.Errorf("rules: compile %q: iteration expressions are not allowed in choice rules", code)
 		case vm.OpAdd, vm.OpSlice:
 			return fmt.Errorf("rules: compile %q: concatenation and slicing are not allowed in choice rules", code)
-		case vm.OpMatches, vm.OpMatchesConst:
-			return fmt.Errorf("rules: compile %q: regex matching is not allowed in choice rules", code)
 		case vm.OpCall, vm.OpCall0, vm.OpCall1, vm.OpCall2, vm.OpCall3,
 			vm.OpCallN, vm.OpCallFast, vm.OpCallSafe, vm.OpCallTyped:
 			return fmt.Errorf("rules: compile %q: function calls other than len() are not allowed in choice rules", code)

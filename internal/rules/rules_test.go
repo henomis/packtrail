@@ -118,11 +118,6 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 			code:    "input.items[1:2] != nil",
 			wantErr: "concatenation and slicing are not allowed",
 		},
-		{
-			name:    "regex matching",
-			code:    `input.name matches "^a+$"`,
-			wantErr: "regex matching is not allowed",
-		},
 	}
 
 	for _, tt := range cases {
@@ -138,6 +133,20 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 func TestCompileAllowsLenAndMembership(t *testing.T) {
 	if _, err := Compile(`len(input.items) > 0 && input.tier in ["pro", "team"]`); err != nil {
 		t.Fatalf("compile bounded expression: %v", err)
+	}
+}
+
+// TestCompileAllowsRegexMatch: `matches` stays allowed — Go's RE2 regexp is
+// linear-time and the input is size-capped, so it is not a DoS vector like `+`.
+func TestCompileAllowsRegexMatch(t *testing.T) {
+	p, err := Compile(`input.name matches "^acme-"`)
+	if err != nil {
+		t.Fatalf("compile regex predicate: %v", err)
+	}
+
+	got, err := p.Match(json.RawMessage(`{"input":{"name":"acme-corp"}}`))
+	if err != nil || !got {
+		t.Fatalf("match = %v, %v; want true, nil", got, err)
 	}
 }
 

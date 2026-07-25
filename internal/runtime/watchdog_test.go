@@ -91,7 +91,7 @@ func TestRedriveStalledRunning(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	time.Sleep(20 * time.Millisecond) // age past the tiny threshold
+	waitStale(t, st, "stall-run", staleEnough)
 
 	redriven, err := eng.RedriveStalled(ctx, "stall-run", staleEnough)
 	if err != nil {
@@ -131,7 +131,7 @@ func TestRedriveStalledFanin(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	time.Sleep(20 * time.Millisecond)
+	waitStale(t, st, "stall-fan", staleEnough)
 
 	redriven, err := eng.RedriveStalled(ctx, "stall-fan", staleEnough)
 	if err != nil {
@@ -186,7 +186,10 @@ func TestRedriveStalledSkips(t *testing.T) {
 		t.Fatalf("acquire lease: held=%v err=%v", held, err)
 	}
 
-	time.Sleep(20 * time.Millisecond)
+	// Age the whole batch past staleEnough (skip-fresh is exempt: it's checked
+	// against its own much larger threshold below, so a few ms of aging here
+	// never makes it stale relative to that).
+	waitStale(t, st, "skip-leased", staleEnough)
 
 	thresholds := map[string]time.Duration{"skip-fresh": time.Hour}
 
@@ -207,8 +210,34 @@ func TestRedriveStalledSkips(t *testing.T) {
 	}
 
 	// Give any wrongly-enqueued work a moment to reach the invoker (which
-	// t.Errors) before the test ends.
+	// t.Errors) before the test ends. Unlike the "age past threshold" sleeps
+	// above, this one can't become a poll-on-observable-condition: it's
+	// asserting an absence (the invoker is never called) under an async
+	// dispatch pipeline (eng.Run's background consumer), so there is no
+	// positive signal to wait for — only a bounded window to let a wrongly
+	// enqueued item surface before concluding none did.
 	time.Sleep(200 * time.Millisecond)
+}
+
+// waitStale polls until execID has been quiet for longer than staleEnough —
+// RedriveStalled's own condition — rather than guessing a fixed sleep long
+// enough to cover it regardless of scheduling delays.
+func waitStale(t *testing.T, st *store.Store, execID string, staleEnough time.Duration) {
+	t.Helper()
+
+	ctx := context.Background()
+	deadline := time.Now().Add(5 * time.Second)
+
+	for time.Now().Before(deadline) {
+		ex, err := st.Get(ctx, execID)
+		if err == nil && time.Since(ex.UpdatedAt) > staleEnough {
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("execution %s never aged past staleEnough (%s)", execID, staleEnough)
 }
 
 // waitStatus polls until the execution reaches the wanted status or fails.

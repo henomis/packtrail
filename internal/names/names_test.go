@@ -21,6 +21,8 @@ import (
 )
 
 func TestNewEmptyPrefixFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+
 	if got := New(""); got != New(Default) {
 		t.Fatalf("New(\"\") = %+v, want same as New(%q)", got, Default)
 	}
@@ -35,6 +37,8 @@ func TestNewEmptyPrefixFallsBackToDefault(t *testing.T) {
 // opaque NATS error at bucket/stream creation. A future caller that skips
 // packtrail.go's own validation must fail fast here instead.
 func TestNewPanicsOnInvalidPrefix(t *testing.T) {
+	t.Parallel()
+
 	for _, bad := range []string{"has.dot", "has space", "has/slash", "wild*card", strings.Repeat("x", 65)} {
 		func() {
 			defer func() {
@@ -49,6 +53,8 @@ func TestNewPanicsOnInvalidPrefix(t *testing.T) {
 }
 
 func TestNewDefaultValues(t *testing.T) {
+	t.Parallel()
+
 	n := New("")
 
 	want := map[string]string{
@@ -83,6 +89,8 @@ func TestNewDefaultValues(t *testing.T) {
 }
 
 func TestNewCustomPrefixAppliedEverywhere(t *testing.T) {
+	t.Parallel()
+
 	const prefix = "myapp"
 
 	n := New(prefix)
@@ -103,6 +111,8 @@ func TestNewCustomPrefixAppliedEverywhere(t *testing.T) {
 }
 
 func TestNewNamesAreUnique(t *testing.T) {
+	t.Parallel()
+
 	n := New(Default)
 
 	v := reflect.ValueOf(n)

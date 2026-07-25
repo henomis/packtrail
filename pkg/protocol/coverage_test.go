@@ -27,6 +27,8 @@ import (
 // TestServeAppliesDeadline verifies a non-zero request deadline is applied to the
 // handler's context.
 func TestServeAppliesDeadline(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	var hasDeadline bool
@@ -58,6 +60,8 @@ func TestServeAppliesDeadline(t *testing.T) {
 // response (invalid raw-JSON payload), reply falls back to a StatusError envelope
 // instead of replying with nothing.
 func TestReplyMarshalFallback(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.badresp.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {

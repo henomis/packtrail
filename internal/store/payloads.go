@@ -19,11 +19,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+// tokenPattern bounds the execID/node/name/version components used to build
+// data-plane keys below. internal/runtime (and packtrail.go) already validate
+// an execution id against this same pattern before any of these functions are
+// reached; this is a last-resort defense-in-depth backstop against a future
+// caller skipping that step — not a substitute for it — mirroring
+// internal/names.New's identical rationale. Every caller of these functions is
+// internal to this module and expected to have already validated, so a
+// violation panics rather than returning an error.
+var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func checkToken(kind, s string) {
+	if !tokenPattern.MatchString(s) {
+		panic(fmt.Sprintf("store: invalid %s %q: must match %s", kind, s, tokenPattern))
+	}
+}
 
 // The data plane: every payload an execution produces or consumes lives as its
 // own entry in the payloads bucket, keyed under the execution id. The control
@@ -37,15 +54,28 @@ import (
 // "in").
 
 // InputKey is the data-plane key of an execution's start input.
-func InputKey(execID string) string { return execID + ".in" }
+func InputKey(execID string) string {
+	checkToken("execution id", execID)
+
+	return execID + ".in"
+}
 
 // OutputKey is the data-plane key of a task or branch node's output.
-func OutputKey(execID, node string) string { return execID + ".out." + node }
+func OutputKey(execID, node string) string {
+	checkToken("execution id", execID)
+	checkToken("node id", node)
+
+	return execID + ".out." + node
+}
 
 // OutputVersionKey is the data-plane key of a candidate task or branch output.
 // The execution document commits exactly one version per output node; uncommitted
 // versions are harmless orphans swept with the execution's other payloads.
 func OutputVersionKey(execID, node, version string) string {
+	checkToken("execution id", execID)
+	checkToken("node id", node)
+	checkToken("output version", version)
+
 	return execID + ".outv." + node + "." + version
 }
 
@@ -56,6 +86,9 @@ func OutputVersionKey(execID, node, version string) string {
 // never leave the committed sequence pointing at the other delivery's payload.
 // Superseded entries are garbage until DeletePayloads sweeps the execution.
 func SignalKey(execID, name string, seq uint64) string {
+	checkToken("execution id", execID)
+	checkToken("signal name", name)
+
 	return execID + ".sig." + name + "." + strconv.FormatUint(seq, 10)
 }
 
@@ -110,6 +143,46 @@ func (s *Store) GetPayload(ctx context.Context, key string) (json.RawMessage, er
 	}
 
 	return append(json.RawMessage(nil), entry.Value()...), nil
+}
+
+// GetPayloads fetches every data-plane entry belonging to execID — its input,
+// every committed and candidate output, every received signal payload — in a
+// single round trip, keyed by their full KV key (InputKey/OutputKey/
+// OutputVersionKey/SignalKey). Callers that would otherwise call GetPayload
+// once per entry (e.g. assembling the full invocation context) can look their
+// keys up in the returned map instead: assembling context on every node visit
+// of a long linear flow used to do one sequential KV get per prior output,
+// compounding to O(depth²) total reads across the execution's lifetime. A
+// missing key is simply absent from the map, matching GetPayload's ErrNotFound
+// for that key. Returns an empty map (not an error) if the execution has no
+// data-plane entries at all.
+func (s *Store) GetPayloads(ctx context.Context, execID string) (map[string]json.RawMessage, error) {
+	checkToken("execution id", execID)
+
+	w, err := s.payloads.Watch(ctx, execID+".>", jetstream.IgnoreDeletes())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return map[string]json.RawMessage{}, nil
+		}
+
+		return nil, err
+	}
+	defer func() { _ = w.Stop() }()
+
+	out := map[string]json.RawMessage{}
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				return out, nil
+			}
+
+			out[entry.Key()] = append(json.RawMessage(nil), entry.Value()...)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // DeletePayloadsOlderThan removes an execution's data-plane entries created

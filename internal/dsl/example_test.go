@@ -25,6 +25,8 @@ import (
 // (each example keeps its own flows/ directory) parses and passes validation,
 // so the examples always work as documented.
 func TestExampleFlowsValidate(t *testing.T) {
+	t.Parallel()
+
 	found := 0
 
 	err := filepath.WalkDir("../../examples", func(path string, d fs.DirEntry, err error) error {

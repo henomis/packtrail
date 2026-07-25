@@ -22,6 +22,8 @@ import (
 // TestValidateRejectsSharedFanoutBranch: branch state is keyed by node id per
 // execution, so a node dispatched by two fanouts would reuse settled state.
 func TestValidateRejectsSharedFanoutBranch(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: shared-branch
 nodes:
@@ -42,6 +44,8 @@ edges:
 
 // TestValidateRejectsDuplicateBranch: the same branch listed twice in one fanout.
 func TestValidateRejectsDuplicateBranch(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: dup-branch
 nodes:
@@ -60,6 +64,8 @@ edges:
 // quorum:N's completed-count, letting the fanin advance while a genuinely
 // required branch is still outstanding.
 func TestValidateRejectsDuplicateWaitFor(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: dup-wait-for
 nodes:
@@ -78,6 +84,8 @@ edges:
 // TestValidateRejectsOrphanWaitFor: a fanin waiting on a node no fanout
 // dispatches would never settle.
 func TestValidateRejectsOrphanWaitFor(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: orphan-wait
 nodes:
@@ -97,6 +105,8 @@ edges:
 // TestValidateRejectsNonTaskBranch: the branch runner invokes task nodes only;
 // a branch of any other type would stay pending forever and strand the join.
 func TestValidateRejectsNonTaskBranch(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: sig-branch
 nodes:
@@ -114,6 +124,8 @@ edges:
 // TestValidateRejectsFanoutWithoutEdge: stepFanout parks the execution at its
 // successor fanin; a fanout with no outgoing edge is a guaranteed runtime error.
 func TestValidateRejectsFanoutWithoutEdge(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: no-fanin-edge
 nodes:
@@ -131,6 +143,8 @@ edges:
 // TestValidateRejectsFanoutToNonFanin: the fanout's successor is where the
 // execution parks and the join is evaluated; anything but a fanin can't join.
 func TestValidateRejectsFanoutToNonFanin(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: fanout-to-task
 nodes:
@@ -151,6 +165,8 @@ edges:
 // wait on a branch dispatched by fanout B — that branch is never pending in
 // A's fan, so A's join would never settle it.
 func TestValidateRejectsCrossFanWaitFor(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: cross-fan
 nodes:
@@ -173,6 +189,8 @@ edges:
 // TestValidateAllowsWaitForSubset: a fanin may wait on a subset of its fanout's
 // branches (e.g. join on the critical ones, let the rest settle in background).
 func TestValidateAllowsWaitForSubset(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: subset-wait
 nodes:
@@ -192,6 +210,8 @@ edges:
 // the fanout on a cycle; its per-execution branch state would be reused on the
 // second visit instead of re-running the branches.
 func TestValidateRejectsFanCycle(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: fan-cycle
 nodes:
@@ -214,6 +234,8 @@ edges:
 // TestValidateAllowsTaskCycle: cycles that avoid fanout/fanin nodes stay legal —
 // e.g. a retry loop between plain tasks via a choice.
 func TestValidateAllowsTaskCycle(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: task-cycle
 nodes:

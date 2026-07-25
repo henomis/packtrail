@@ -23,6 +23,8 @@ import (
 // as NATS subject tokens and KV-key segments, so unsafe characters are rejected
 // at parse time instead of failing opaquely (or routing ambiguously) at runtime.
 func TestValidateRejectsUnsafeNames(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		yaml string
@@ -57,6 +59,8 @@ func TestValidateRejectsUnsafeNames(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, err := Parse([]byte(tc.yaml))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want mention of %q", err, tc.want)

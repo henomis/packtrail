@@ -27,6 +27,8 @@ import (
 // TestValidateRejectsMultipleDefaults: two default rules silently last-win at
 // runtime, so validation must reject the ambiguity at load time.
 func TestValidateRejectsMultipleDefaults(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: two-defaults
 nodes:
@@ -45,6 +47,8 @@ edges:
 // TestValidateRejectsDefaultWithWhen: a default rule that also carries a when
 // silently ignores the when at runtime, so it is rejected as ambiguous.
 func TestValidateRejectsDefaultWithWhen(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: default-with-when
 nodes:
@@ -59,7 +63,34 @@ edges:
 	}
 }
 
+// TestValidateRejectsEdgeFromChoiceNode is a regression test: stepChoice
+// routes purely from the matched rule's `to`, never consulting edges: for a
+// choice node. A stray edges: entry from one used to be silently accepted and
+// fed into the reachability/cycle graph walks as if it were a real successor
+// alongside the rule targets — able to mask an unreachable node or produce a
+// false cycle rejection. It must be rejected outright instead.
+func TestValidateRejectsEdgeFromChoiceNode(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse([]byte(`
+name: choice-edge
+nodes:
+  - {id: a, type: task, subject: "x"}
+  - {id: c, type: choice, rules: [{default: true, to: b}]}
+  - {id: b, type: task, subject: "y"}
+  - {id: ghost, type: task, subject: "z"}
+edges:
+  - {from: a, to: c}
+  - {from: c, to: ghost}
+`))
+	if err == nil || !strings.Contains(err.Error(), "routes via rules, not edges") {
+		t.Fatalf("err = %v, want edge-from-choice rejection", err)
+	}
+}
+
 func TestValidateRejectsUnreachableNode(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: island
 nodes:
@@ -80,6 +111,8 @@ edges:
 // fanout branches all count as reachability edges — a flow wired only through
 // them must stay valid.
 func TestValidateReachabilityFollowsAllTransitions(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: all-routes
 nodes:
@@ -99,6 +132,8 @@ edges:
 // TestValidateRejectsOnTimeoutWithoutTimeout: the wait schedule is only
 // installed for a positive timeout, so on_timeout without one can never fire.
 func TestValidateRejectsOnTimeoutWithoutTimeout(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: dead-route
 nodes:
@@ -113,6 +148,8 @@ nodes:
 // TestValidateRejectsWildcardSubject: a nats-task subject with wildcard or
 // whitespace characters can never be published to.
 func TestValidateRejectsWildcardSubject(t *testing.T) {
+	t.Parallel()
+
 	for _, subject := range []string{"tasks.>", "tasks.*.go", "tasks. spaced"} {
 		_, err := Parse([]byte(`
 name: bad-subject
@@ -126,6 +163,8 @@ nodes:
 }
 
 func TestValidateRejectsMalformedSubjectTokens(t *testing.T) {
+	t.Parallel()
+
 	for _, subject := range []string{"tasks..notify", ".tasks.notify", "tasks.notify.", "tasks.\nnotify"} {
 		_, err := Parse([]byte(`
 name: bad-subject-shape
@@ -141,6 +180,8 @@ nodes:
 // TestValidateAllowsPlaceholderSubject: the {execution_id} placeholder is part
 // of the nats-task contract and must stay legal.
 func TestValidateAllowsPlaceholderSubject(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: placeholder
 nodes:
@@ -155,6 +196,8 @@ nodes:
 // typo like "{exec_id}") used to pass through unresolved and become a fixed
 // literal subject segment shared by every execution, silently.
 func TestValidateRejectsUnrecognizedPlaceholder(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: bad-placeholder
 nodes:
@@ -168,6 +211,8 @@ nodes:
 // TestValidateAllowsFreeFormCustomTarget: custom invoker kinds interpret Target
 // freely (it may be a URL), so the subject check applies to nats-task only.
 func TestValidateAllowsFreeFormCustomTarget(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: custom-target
 nodes:
@@ -178,6 +223,8 @@ nodes:
 }
 
 func TestValidateRejectsUnknownJoinPolicy(t *testing.T) {
+	t.Parallel()
+
 	for _, jp := range []string{"majority", "quorm:2", "Any", "banana"} {
 		_, err := Parse([]byte(`
 name: bad-join
@@ -196,6 +243,8 @@ edges:
 }
 
 func TestValidateRejectsSelfEdge(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: self-loop
 nodes:
@@ -211,6 +260,8 @@ edges:
 }
 
 func TestValidateRejectsUnknownBackoff(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: bad-backoff
 nodes:
@@ -222,6 +273,8 @@ nodes:
 }
 
 func TestValidateAcceptsKnownBackoffs(t *testing.T) {
+	t.Parallel()
+
 	for _, b := range []string{"fixed", "linear", "exponential"} {
 		if _, err := Parse([]byte(`
 name: ok-backoff
@@ -234,6 +287,8 @@ nodes:
 }
 
 func TestValidateRejectsNodeReachableOnlyViaBranchEdge(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: dead-via-branch-edge
 nodes:
@@ -263,6 +318,8 @@ edges:
 // TestValidateRejectsUnknownVersion: a version other than SupportedVersion is a
 // future/typo'd schema and must fail fast at parse (F-032).
 func TestValidateRejectsUnknownVersion(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 version: "2.0"
 name: bad-version
@@ -277,6 +334,8 @@ nodes:
 // TestValidateAcceptsVersions: the supported version and an omitted version both
 // parse (omitted is accepted with a warning until v1.0) (F-032).
 func TestValidateAcceptsVersions(t *testing.T) {
+	t.Parallel()
+
 	for _, doc := range []string{
 		"version: \"1.0\"\nname: v\nnodes:\n  - {id: a, type: task, subject: \"x\"}\n",
 		"name: no-version\nnodes:\n  - {id: a, type: task, subject: \"x\"}\n",
@@ -290,6 +349,8 @@ func TestValidateAcceptsVersions(t *testing.T) {
 // TestValidateRejectsUnknownOnError: a choice on_error other than "fail" (or
 // omitted) is rejected at parse (F-033).
 func TestValidateRejectsUnknownOnError(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: bad-onerror
 nodes:
@@ -306,6 +367,8 @@ edges:
 
 // TestValidateAcceptsOnErrorFail: on_error: fail is a valid choice option (F-033).
 func TestValidateAcceptsOnErrorFail(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: good-onerror
 nodes:

@@ -73,6 +73,8 @@ edges:
 `
 
 func TestParseResearchPipeline(t *testing.T) {
+	t.Parallel()
+
 	f, err := Parse([]byte(researchPipeline))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -104,6 +106,8 @@ func TestParseResearchPipeline(t *testing.T) {
 }
 
 func TestJoinKind(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]struct {
 		kind   string
 		quorum int
@@ -124,6 +128,8 @@ func TestJoinKind(t *testing.T) {
 }
 
 func TestValidateErrors(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]string{
 		"dup node": `
 name: f

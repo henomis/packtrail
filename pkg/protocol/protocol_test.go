@@ -54,6 +54,8 @@ func request(t *testing.T, srv *natstest.Server, subject string, req protocol.Ta
 // TestServeRoundTrip verifies a handler's response is delivered to the caller
 // and that the decoded request carries the fields the caller sent.
 func TestServeRoundTrip(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	var gotReq protocol.TaskRequest
@@ -91,6 +93,8 @@ func TestServeRoundTrip(t *testing.T) {
 // TestServeHandlerErrorIsRetry verifies a handler error is reported to the
 // caller as StatusRetry (a transient failure).
 func TestServeHandlerErrorIsRetry(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.fail.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
@@ -113,6 +117,8 @@ func TestServeHandlerErrorIsRetry(t *testing.T) {
 }
 
 func TestServeRejectsInvalidStatus(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.invalid.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
@@ -137,6 +143,8 @@ func TestServeRejectsInvalidStatus(t *testing.T) {
 // TestServeBadRequest verifies malformed JSON is answered with StatusError
 // rather than dropped.
 func TestServeBadRequest(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.bad.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
@@ -169,6 +177,8 @@ func TestServeBadRequest(t *testing.T) {
 // the whole worker process (every subscription on that connection, not just
 // this one). Serve must recover it and reply with StatusError instead.
 func TestServeRecoversHandlerPanic(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.panic.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
@@ -203,6 +213,8 @@ func TestServeRecoversHandlerPanic(t *testing.T) {
 // handler and a fast handler share one connection; the fast one must not wait
 // for the slow one to finish.
 func TestServeHandlesConcurrentRequestsWithoutHeadOfLineBlocking(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	release := make(chan struct{})
@@ -265,6 +277,8 @@ func TestServeHandlesConcurrentRequestsWithoutHeadOfLineBlocking(t *testing.T) {
 // TestServeNamespaced verifies the namespace is prepended to the subscription
 // subject.
 func TestServeNamespaced(t *testing.T) {
+	t.Parallel()
+
 	srv := natstest.Start(t)
 
 	sub, err := protocol.ServeNamespaced(context.Background(), srv.NC, "acme", "tasks.echo.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {

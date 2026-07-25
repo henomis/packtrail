@@ -23,6 +23,8 @@ import (
 // silently dropped setting ("retires:" instead of "retry:" would otherwise
 // quietly disable the retry policy).
 func TestParseRejectsUnknownField(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: typo
 nodes:
@@ -37,6 +39,8 @@ nodes:
 // the first document and silently drop the rest; every document after the
 // first must be an explicit error.
 func TestParseRejectsMultipleDocuments(t *testing.T) {
+	t.Parallel()
+
 	_, err := Parse([]byte(`
 name: first
 nodes:
@@ -54,6 +58,8 @@ nodes:
 // TestParseAllowsTrailingSeparator: a trailing "---" (an empty document) is
 // harmless and stays accepted.
 func TestParseAllowsTrailingSeparator(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte(`
 name: trailing
 nodes:
@@ -67,6 +73,8 @@ nodes:
 // TestParseRejectsEmptyInput: empty bytes get a clear error instead of an
 // opaque EOF or a zero-value flow failing name validation.
 func TestParseRejectsEmptyInput(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse(nil); err == nil || !strings.Contains(err.Error(), "empty flow definition") {
 		t.Fatalf("err = %v, want empty-input rejection", err)
 	}

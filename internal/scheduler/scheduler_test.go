@@ -102,6 +102,39 @@ func TestAtFires(t *testing.T) {
 	}
 }
 
+// TestAtIDDedupesRepublish verifies AtID's caller-supplied idempotency id
+// dedups a re-published identical timer within the stream's dedup window: the
+// first publish's schedule wins and fires once; the second (same msgID) is
+// dropped by the server rather than installing a duplicate.
+func TestAtIDDedupesRepublish(t *testing.T) {
+	ctx, sched, ch := setup(t)
+
+	when := time.Now().Add(50 * time.Millisecond)
+
+	if err := sched.AtID(ctx, "exec-dedup", "fire-1", when, []byte("first")); err != nil {
+		t.Fatalf("AtID 1: %v", err)
+	}
+
+	if err := sched.AtID(ctx, "exec-dedup", "fire-1", when, []byte("second")); err != nil {
+		t.Fatalf("AtID 2 (duplicate msgID): %v", err)
+	}
+
+	select {
+	case f := <-ch:
+		if string(f.payload) != "first" {
+			t.Fatalf("payload = %q, want the first publish to win", f.payload)
+		}
+	case <-time.After(fireTimeout):
+		t.Fatal("schedule did not fire within timeout")
+	}
+
+	select {
+	case dup := <-ch:
+		t.Fatalf("duplicate firing delivered: %+v", dup)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
 // TestFireSubject verifies the fire subject embeds the key after the prefix.
 func TestFireSubject(t *testing.T) {
 	_, sched, _ := setup(t)

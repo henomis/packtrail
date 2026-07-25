@@ -45,13 +45,22 @@ edges:
 // StatusPending — so the branch is already completed (and its fanin_eval already
 // dropped as stale) while the "slow" synchronous branch is still running and the
 // fanout has not yet parked the execution at the fanin.
+//
+// "slow" blocks on fastDone, closed only once "fast"'s CompleteActivity call
+// has returned, rather than guessing a sleep long enough to cover it: this
+// pins the exact ordering the race depends on (fast's stale fanin_eval attempt
+// strictly before dispatchBranches' wg.Wait unblocks and the fanout parks)
+// regardless of how slow or loaded the machine running the test is.
 type fanRaceInvoker struct {
-	eng *Engine // set after New (the engine needs the invoker first)
+	eng      *Engine // set after New (the engine needs the invoker first)
+	fastDone chan struct{}
 }
 
 func (f *fanRaceInvoker) Invoke(ctx context.Context, req invoker.Request) (invoker.Result, error) {
 	switch req.NodeID {
 	case "fast":
+		defer close(f.fastDone)
+
 		if err := f.eng.CompleteActivity(ctx, req.ExecutionID, req.NodeID, req.Attempt,
 			invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"fast":true}`)}); err != nil {
 			return invoker.Result{Status: invoker.StatusError, Error: err.Error()}, nil
@@ -59,7 +68,7 @@ func (f *fanRaceInvoker) Invoke(ctx context.Context, req invoker.Request) (invok
 
 		return invoker.Result{Status: invoker.StatusPending}, nil
 	case "slow":
-		time.Sleep(300 * time.Millisecond) // hold the fanout's wg.Wait open past the completion
+		<-f.fastDone // hold the fanout's wg.Wait open past fast's completion
 
 		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"slow":true}`)}, nil
 	default:
@@ -90,7 +99,7 @@ func TestFanoutCompletionBeatsPark(t *testing.T) {
 		t.Fatalf("flow: %v", err)
 	}
 
-	inv := &fanRaceInvoker{}
+	inv := &fanRaceInvoker{fastDone: make(chan struct{})}
 
 	eng, err := New(inv, st, sch, testSignals(t, st), map[string]*dsl.Flow{flow.Name: flow}, Config{})
 	if err != nil {

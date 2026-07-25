@@ -22,6 +22,8 @@ import (
 )
 
 func TestInvokerKind(t *testing.T) {
+	t.Parallel()
+
 	if got := (&Node{}).InvokerKind(); got != DefaultInvoker {
 		t.Errorf("default InvokerKind = %q, want %q", got, DefaultInvoker)
 	}
@@ -32,6 +34,8 @@ func TestInvokerKind(t *testing.T) {
 }
 
 func TestInvokeTarget(t *testing.T) {
+	t.Parallel()
+
 	if got := (&Node{Target: "t", Subject: "s"}).InvokeTarget(); got != "t" {
 		t.Errorf("InvokeTarget with Target = %q, want t (Target wins)", got)
 	}
@@ -46,6 +50,8 @@ func TestInvokeTarget(t *testing.T) {
 }
 
 func TestJoinKindEdgeCases(t *testing.T) {
+	t.Parallel()
+
 	// Unknown policy falls back to JoinAll.
 	if k, q := (&Node{JoinPolicy: "majority"}).JoinKind(); k != JoinAll || q != 0 {
 		t.Errorf("JoinKind(majority) = (%q,%d), want (all,0)", k, q)
@@ -57,6 +63,8 @@ func TestJoinKindEdgeCases(t *testing.T) {
 }
 
 func TestDurationUnmarshal(t *testing.T) {
+	t.Parallel()
+
 	// Valid duration on a task node.
 	f, err := Parse([]byte(`
 name: f
@@ -105,12 +113,16 @@ nodes:
 }
 
 func TestParseInvalidYAML(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Parse([]byte("\t: not: valid: yaml:")); err == nil {
 		t.Fatal("invalid YAML parsed without error")
 	}
 }
 
 func TestParseFile(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
 
 	good := filepath.Join(dir, "good.yaml")
@@ -139,6 +151,8 @@ func TestParseFile(t *testing.T) {
 }
 
 func TestLoadDir(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
 
 	// One valid flow, a non-YAML file and a subdirectory that must be skipped.
@@ -170,6 +184,8 @@ func TestLoadDir(t *testing.T) {
 }
 
 func TestLoadDirInvalidFile(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "broken.yaml"), []byte("name: f\nnodes: []\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -181,6 +197,8 @@ func TestLoadDirInvalidFile(t *testing.T) {
 }
 
 func TestLoadDirDuplicateName(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
 
 	flow := "name: same\nnodes:\n  - {id: a, type: task, subject: s}\n"
@@ -200,6 +218,8 @@ func TestLoadDirDuplicateName(t *testing.T) {
 // TestValidateNodeErrors covers the per-type validation error branches not
 // already exercised by TestValidateErrors.
 func TestValidateNodeErrors(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]string{
 		"empty name": `
 name: "  "

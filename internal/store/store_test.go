@@ -443,6 +443,61 @@ func TestDeletePayloads(t *testing.T) {
 	}
 }
 
+// TestGetPayloads verifies a single scan returns every data-plane entry for
+// one execution, keyed by their full KV key, and never entries belonging to a
+// different execution.
+func TestGetPayloads(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	entries := map[string]json.RawMessage{
+		InputKey("a"):           json.RawMessage(`{"in":1}`),
+		OutputKey("a", "n1"):    json.RawMessage(`{"out":1}`),
+		SignalKey("a", "go", 3): json.RawMessage(`{"sig":1}`),
+		OutputKey("b", "unrel"): json.RawMessage(`{"other":1}`),
+	}
+	for key, data := range entries {
+		if err := s.PutPayload(ctx, key, data); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	got, err := s.GetPayloads(ctx, "a")
+	if err != nil {
+		t.Fatalf("get payloads: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("got %d entries, want 3: %+v", len(got), got)
+	}
+
+	for _, key := range []string{InputKey("a"), OutputKey("a", "n1"), SignalKey("a", "go", 3)} {
+		if string(got[key]) != string(entries[key]) {
+			t.Errorf("entry %s = %s, want %s", key, got[key], entries[key])
+		}
+	}
+
+	if _, ok := got[OutputKey("b", "unrel")]; ok {
+		t.Fatal("GetPayloads(\"a\") returned another execution's entry")
+	}
+}
+
+// TestGetPayloadsEmpty verifies an execution with no data-plane entries yet
+// returns an empty map, not an error.
+func TestGetPayloadsEmpty(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	got, err := s.GetPayloads(ctx, "never-written")
+	if err != nil {
+		t.Fatalf("get payloads: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("got %d entries, want 0", len(got))
+	}
+}
+
 // TestDeletePayloadsOlderThan verifies the age-guarded sweep (F-029): entries
 // created before the cutoff are removed, while a fresh entry (as a recreated
 // execution generation would write) is preserved, so GC cannot wipe a re-Started

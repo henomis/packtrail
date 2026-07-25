@@ -23,6 +23,8 @@ import (
 )
 
 func TestMatch(t *testing.T) {
+	t.Parallel()
+
 	p, err := Compile("results.triage.risk_score > 80")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -50,6 +52,8 @@ func TestMatch(t *testing.T) {
 }
 
 func TestMatchInputAndSignals(t *testing.T) {
+	t.Parallel()
+
 	p, err := Compile(`input.tier == "pro" && signals.approval.granted`)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -64,6 +68,8 @@ func TestMatchInputAndSignals(t *testing.T) {
 }
 
 func TestMatchMissingFieldErrors(t *testing.T) {
+	t.Parallel()
+
 	p, _ := Compile("results.triage.risk_score > 80")
 	// Missing node output: expr errors fetching from nil; callers treat that as
 	// no-match and fall through to the default rule.
@@ -73,12 +79,16 @@ func TestMatchMissingFieldErrors(t *testing.T) {
 }
 
 func TestCompileInvalid(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Compile("results.x >"); err == nil {
 		t.Error("expected compile error")
 	}
 }
 
 func TestCompileRejectsUnboundedExpressions(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name    string
 		code    string
@@ -108,6 +118,8 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, err := Compile(tt.code)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Compile(%q) err = %v, want containing %q", tt.code, err, tt.wantErr)
@@ -117,12 +129,16 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 }
 
 func TestCompileAllowsLenAndMembership(t *testing.T) {
+	t.Parallel()
+
 	if _, err := Compile(`len(input.items) > 0 && input.tier in ["pro", "team"]`); err != nil {
 		t.Fatalf("compile bounded expression: %v", err)
 	}
 }
 
 func TestMatchLastNodeAndBranches(t *testing.T) {
+	t.Parallel()
+
 	p, err := Compile(`results[last_node] == "yes" && branches.b1 == "ok"`)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -137,6 +153,8 @@ func TestMatchLastNodeAndBranches(t *testing.T) {
 }
 
 func TestMatchContextCancelled(t *testing.T) {
+	t.Parallel()
+
 	p, err := Compile("input.x == 1")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -152,6 +170,8 @@ func TestMatchContextCancelled(t *testing.T) {
 }
 
 func TestMatchMemoryBudget(t *testing.T) {
+	t.Parallel()
+
 	p, err := Compile(largeArrayPredicate(600))
 	if err != nil {
 		t.Fatalf("compile: %v", err)

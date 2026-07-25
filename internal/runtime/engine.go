@@ -855,6 +855,12 @@ func (e *Engine) ScheduleReconcileFull(ctx context.Context, cronExpr string) err
 // (Outputs), and every received signal (LastSeq keys). A missing entry
 // (archived/pruned) is skipped rather than failing the assembly.
 //
+// A single GetPayloads scan fetches every entry belonging to the execution in
+// one round trip; loadOutputPayloads/loadSignalPayloads then just look their
+// keys up in that map. Fetching one key at a time here used to mean one
+// sequential KV get per prior output on every node visit, compounding to
+// O(depth²) total reads across a long linear flow's lifetime.
+//
 // Two navigation aids come with the raw maps, because results alone is
 // unordered: last_node is the id of the most recently settled output (chain
 // flows read "the previous step's result" as results[last_node]), and branches
@@ -862,24 +868,18 @@ func (e *Engine) ScheduleReconcileFull(ctx context.Context, cronExpr string) err
 // after a join reads its inputs there; whether the join just happened is
 // last_node ∈ branches).
 func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json.RawMessage, error) {
-	in, err := e.store.GetPayload(ctx, store.InputKey(ex.ID))
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-
-	results, err := e.loadOutputPayloads(ctx, ex)
+	payloads, err := e.store.GetPayloads(ctx, ex.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	signals, err := e.loadSignalPayloads(ctx, ex)
-	if err != nil {
-		return nil, err
-	}
-
+	in := payloads[store.InputKey(ex.ID)]
 	if len(in) == 0 {
 		in = json.RawMessage("{}")
 	}
+
+	results := loadOutputPayloads(payloads, ex)
+	signals := loadSignalPayloads(payloads, ex)
 
 	branches := map[string]json.RawMessage{}
 
@@ -903,26 +903,16 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 	}{Input: in, Results: results, Signals: signals, Branches: branches, LastNode: lastNode})
 }
 
-func (e *Engine) loadOutputPayloads(
-	ctx context.Context,
-	ex *store.Execution,
-) (map[string]json.RawMessage, error) {
+func loadOutputPayloads(payloads map[string]json.RawMessage, ex *store.Execution) map[string]json.RawMessage {
 	results := make(map[string]json.RawMessage, len(ex.Outputs))
 
 	for _, node := range ex.Outputs {
-		out, err := e.store.GetPayload(ctx, outputPayloadKey(ex, node))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, err
+		if out, ok := payloads[outputPayloadKey(ex, node)]; ok {
+			results[node] = out
 		}
-
-		results[node] = out
 	}
 
-	return results, nil
+	return results
 }
 
 func outputPayloadKey(ex *store.Execution, node string) string {
@@ -933,26 +923,16 @@ func outputPayloadKey(ex *store.Execution, node string) string {
 	return store.OutputKey(ex.ID, node)
 }
 
-func (e *Engine) loadSignalPayloads(
-	ctx context.Context,
-	ex *store.Execution,
-) (map[string]json.RawMessage, error) {
+func loadSignalPayloads(payloads map[string]json.RawMessage, ex *store.Execution) map[string]json.RawMessage {
 	signals := make(map[string]json.RawMessage, len(ex.LastSeq))
 
 	for name, seq := range ex.LastSeq {
-		p, err := e.store.GetPayload(ctx, store.SignalKey(ex.ID, name, seq))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, err
+		if p, ok := payloads[store.SignalKey(ex.ID, name, seq)]; ok {
+			signals[name] = p
 		}
-
-		signals[name] = p
 	}
 
-	return signals, nil
+	return signals
 }
 
 func (e *Engine) writeOutputCandidate(
@@ -1735,27 +1715,17 @@ func (e *Engine) stepNode(ctx context.Context, flow *dsl.Flow, node *dsl.Node, e
 	}
 }
 
-// advanceTo moves the execution from fromNode to nextNode (or completes it if
-// nextNode == "") via a CAS write that also commits the next step's work item
-// (transactional outbox), then flushes the outbox. mutate may apply additional
-// changes (e.g. merge payload) within the same CAS write.
+// advanceToGenerationAttempt moves the execution from fromNode to nextNode (or
+// completes it if nextNode == "") via a CAS write that also commits the next
+// step's work item (transactional outbox), then flushes the outbox. mutate may
+// apply additional changes (e.g. merge payload) within the same CAS write.
 //
 // The write is guarded: it applies only while the execution is still active and
-// still at fromNode. A stale caller — a duplicate delivery, or an instance that
-// lost its lease mid-invocation and settles late — must not rewind CurrentNode
-// or resurrect a terminal (notably cancelled) execution; its advance is a no-op.
-func (e *Engine) advanceTo(
-	ctx context.Context, execID, fromNode, nextNode string, mutate func(*store.Execution),
-) error {
-	return e.advanceToAttempt(ctx, execID, fromNode, -1, nextNode, mutate)
-}
-
-func (e *Engine) advanceToAttempt(
-	ctx context.Context, execID, fromNode string, expectedAttempt int, nextNode string, mutate func(*store.Execution),
-) error {
-	return e.advanceToGenerationAttempt(ctx, execID, fromNode, 0, expectedAttempt, nextNode, mutate)
-}
-
+// still at fromNode, at expectedGeneration and expectedAttempt (a negative
+// expectedAttempt skips that check). A stale caller — a duplicate delivery, or
+// an instance that lost its lease mid-invocation and settles late — must not
+// rewind CurrentNode or resurrect a terminal (notably cancelled) execution; its
+// advance is a no-op.
 func (e *Engine) advanceToGenerationAttempt(
 	ctx context.Context,
 	execID, fromNode string,

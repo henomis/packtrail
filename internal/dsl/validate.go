@@ -162,7 +162,8 @@ func (f *Flow) resolveGraph() error {
 
 // buildEdges builds f.next from the explicit edges, recording each edge target
 // as inbound, and rejects an unknown endpoint, a self-edge (an advance loop with
-// no exit), or a node with more than one outgoing edge.
+// no exit), an edge from a choice node, or a node with more than one outgoing
+// edge.
 func (f *Flow) buildEdges(inbound map[string]bool) error {
 	f.next = make(map[string]string, len(f.Edges))
 
@@ -177,6 +178,18 @@ func (f *Flow) buildEdges(inbound map[string]bool) error {
 
 		if e.From == e.To {
 			return fmt.Errorf("flow %q: node %q has a self-edge (would advance-loop forever)", f.Name, e.From)
+		}
+
+		// A choice node's successor comes entirely from its matched rule's `to`
+		// (stepChoice never consults edges: for a choice node); an edges: entry
+		// from one is always meaningless, and letting it populate f.next would
+		// make the reachability/cycle graph walks treat it as a real successor
+		// alongside the rule targets — silently masking an unreachable node or
+		// producing a false cycle rejection.
+		if f.byID[e.From].Type == NodeChoice {
+			return fmt.Errorf(
+				"flow %q: node %q is a choice node; it routes via rules, not edges: (edges from %q are not allowed)",
+				f.Name, e.From, e.From)
 		}
 
 		if _, dup := f.next[e.From]; dup {

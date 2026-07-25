@@ -301,7 +301,10 @@ func (c *Cache) invokeAndStore(ctx context.Context, key string, claimRev uint64,
 	}
 
 	if _, putErr := c.kv.Update(ctx, key, data, claimRev); putErr != nil {
-		slog.Debug("invoker cache: store result", "key", key, "err", putErr)
+		// Losing the stored result reopens the double-fire window for a later
+		// redelivery of this attempt, so surface it at Warn (Info is a common
+		// production level) rather than hiding the degradation at Debug.
+		slog.Warn("invoker cache: store result failed; dedup window reopened", "key", key, "err", putErr)
 	}
 
 	return res, nil

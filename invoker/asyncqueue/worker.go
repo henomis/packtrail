@@ -178,7 +178,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 					fmt.Sprintf("job panic: %v", r), numDelivered(msg))
 			}
 
-			_ = msg.Term()
+			w.term(msg, j)
 		}
 	}()
 
@@ -199,7 +199,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 				w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node, err.Error(), numDelivered(msg))
 			}
 
-			_ = msg.Term()
+			w.term(msg, j)
 
 			return
 		}
@@ -215,6 +215,16 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 
 	if ackErr := msg.Ack(); ackErr != nil {
 		w.log.Warn("ack job", "exec", j.ExecID, "node", j.Node, "err", ackErr)
+	}
+}
+
+// term dead-letters a poisoned job (no redelivery). A failed Term is logged
+// rather than swallowed: the message will redeliver despite the intended
+// terminal disposition, so the warning is the operator's only signal that the
+// dead-letter did not actually take and duplicate records/log noise may follow.
+func (w *Worker) term(msg jetstream.Msg, j job) {
+	if err := msg.Term(); err != nil {
+		w.log.Warn("term job failed; will redeliver", "exec", j.ExecID, "node", j.Node, "err", err)
 	}
 }
 

@@ -445,13 +445,22 @@ type gcCandidate struct{ flow, status, id string }
 
 // GC prunes index entries whose execution no longer exists in either the hot
 // bucket or the cold archive — orphans left behind when an archived terminal
-// execution passes its retention and expires. It inspects only terminal
-// (completed/failed) entries older than staleAfter: active executions always
-// exist in the hot bucket, and recently-terminal ones are still within archive
-// retention, so neither needs a source-of-truth read. For each surviving
-// candidate it reads the store; if the execution is gone it deletes the flow and
-// status membership entries. staleAfter should be the archive retention; a
-// non-positive value checks every terminal entry. It returns the count pruned.
+// execution passes its retention and expires. Only terminal (completed/failed)
+// entries older than staleAfter get a source-of-truth read against the store
+// (active executions always exist in the hot bucket, and recently-terminal
+// ones are still within archive retention, so neither needs one); for each
+// surviving candidate that reads absent, it deletes the flow and status
+// membership entries.
+//
+// Cost warning: filtering to that candidate set still requires reading every
+// meta entry in the bookkeeping keyspace — one per execution ever indexed,
+// active or terminal — via gcCandidates' full-keyspace scan. So GC's cost
+// scales with total indexed executions, not with the (usually much smaller)
+// number of stale terminal entries it actually prunes; it is not the bounded
+// operation its per-candidate logic might suggest.
+//
+// staleAfter should be the archive retention; a non-positive value checks
+// every terminal entry. It returns the count pruned.
 func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error) {
 	// Collect candidates first, then read-and-delete: mutating idxFlow while its
 	// watch is still streaming would disturb the iteration.

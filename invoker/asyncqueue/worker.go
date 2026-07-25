@@ -32,6 +32,11 @@ import (
 const (
 	nakDelay         = 2 * time.Second
 	heartbeatDivisor = 3
+	// minHeartbeatInterval floors the heartbeat ticker so a very small ackWait
+	// (misconfigured, or below heartbeatDivisor) can never make ackWait/
+	// heartbeatDivisor a zero or negative duration — time.NewTicker panics on
+	// those.
+	minHeartbeatInterval = 100 * time.Millisecond
 )
 
 // Worker consumes jobs for one async invoker kind and runs the embedder's
@@ -176,7 +181,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 					fmt.Sprintf("job panic: %v", r), numDelivered(msg))
 			}
 
-			_ = msg.Term()
+			w.term(msg, "term job after panic", j.ExecID, j.Node)
 		}
 	}()
 
@@ -197,7 +202,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 				w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node, err.Error(), numDelivered(msg))
 			}
 
-			_ = msg.Term()
+			w.term(msg, "term dead-lettered job", j.ExecID, j.Node)
 
 			return
 		}
@@ -332,8 +337,30 @@ func numDelivered(msg jetstream.Msg) uint64 {
 	return 0
 }
 
+// term calls msg.Term() and logs a warning if it fails, so a caller settling a
+// job (dead-lettered, or panicked) doesn't silently discard the error.
+func (w *Worker) term(msg jetstream.Msg, warnMsg, execID, node string) {
+	if err := msg.Term(); err != nil {
+		w.log.Warn(warnMsg, "exec", execID, "node", node, "err", err)
+	}
+}
+
+// heartbeat runs on its own goroutine (not the one handle's panic-recovering
+// defer covers), so it needs its own recover: an unrecovered panic here would
+// otherwise crash the whole worker process, taking every other in-flight job
+// with it. It also floors the ticker interval so a misconfigured ackWait too
+// small to divide into a positive duration can't make time.NewTicker itself
+// panic.
 func (w *Worker) heartbeat(ctx context.Context, msg jetstream.Msg) {
-	t := time.NewTicker(w.cfg.ackWait / heartbeatDivisor)
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("heartbeat panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	interval := max(w.cfg.ackWait/heartbeatDivisor, minHeartbeatInterval)
+
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	for {

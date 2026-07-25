@@ -56,6 +56,25 @@ edges:
 	}
 }
 
+// TestValidateRejectsDuplicateWaitFor: a duplicate id in wait_for would inflate
+// quorum:N's completed-count, letting the fanin advance while a genuinely
+// required branch is still outstanding.
+func TestValidateRejectsDuplicateWaitFor(t *testing.T) {
+	_, err := Parse([]byte(`
+name: dup-wait-for
+nodes:
+  - {id: fo, type: fanout, branches: [a, b]}
+  - {id: a, type: task, subject: "x"}
+  - {id: b, type: task, subject: "y"}
+  - {id: j, type: fanin, wait_for: [a, a, b], join_policy: "quorum:2"}
+edges:
+  - {from: fo, to: j}
+`))
+	if err == nil || !strings.Contains(err.Error(), "wait_for contains duplicate") {
+		t.Fatalf("err = %v, want duplicate wait_for rejection", err)
+	}
+}
+
 // TestValidateRejectsOrphanWaitFor: a fanin waiting on a node no fanout
 // dispatches would never settle.
 func TestValidateRejectsOrphanWaitFor(t *testing.T) {

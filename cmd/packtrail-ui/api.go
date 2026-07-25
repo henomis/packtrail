@@ -29,6 +29,12 @@ import (
 
 const pingInterval = 25 * time.Second
 
+// Generic client-facing error messages; see httpError.
+const (
+	msgInternalError = "internal error"
+	msgTimeout       = "request canceled or timed out"
+)
+
 type api struct {
 	srv *packtrail.Server
 }
@@ -355,16 +361,26 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+// httpError logs the real error server-side and replies with a generic
+// message. packtrail-ui has no authentication (see the package doc comment),
+// so err.Error() must never reach the client verbatim: internal errors from
+// the store/engine layer can carry NATS subject or bucket names, and anyone
+// who can reach the listener could use that text to probe internal naming.
 func httpError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
+	msg := msgInternalError
+
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		code = http.StatusServiceUnavailable
+		msg = msgTimeout
 	}
+
+	slog.Error("api error", "err", err)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 
-	if encErr := json.NewEncoder(w).Encode(map[string]string{"error": err.Error()}); encErr != nil {
+	if encErr := json.NewEncoder(w).Encode(map[string]string{"error": msg}); encErr != nil {
 		slog.Error("write error response", "err", encErr)
 	}
 }

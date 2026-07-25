@@ -684,6 +684,10 @@ func (s *Server) Cancel(ctx context.Context, execID, reason string) error {
 // Get returns a snapshot of an execution, or ErrNotFound. The execution KV is
 // the source of truth; read it (not the indexes) for correctness decisions.
 func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -852,6 +856,12 @@ func (s *Server) ArchiveTerminal(ctx context.Context) (int, error) {
 // from the hot bucket and, when archival is enabled, sweeps terminal executions
 // into the cold archive and prunes index entries orphaned by expired archives —
 // all on the same cadence.
+//
+// Both Reconcile and indexer.GC scan the entire bookkeeping keyspace (cost
+// scales with total indexed executions, not with what each actually
+// changes/prunes), so this hook's cost is at least two full scans per run —
+// expected for a periodic maintenance sweep, but worth knowing before shrinking
+// its interval on a namespace with many executions.
 func (s *Server) reconcileFull(ctx context.Context) error {
 	if err := s.indexer.Reconcile(ctx); err != nil {
 		return err

@@ -42,6 +42,43 @@ func (r *raceKV) Update(ctx context.Context, key string, value []byte, revision 
 	return r.KeyValue.Update(ctx, key, value, revision)
 }
 
+// TestLeaseObsPruneRemovesStaleEntries is a regression test: an execID this
+// process contended once and never polled again used to leak its leaseObs
+// entry for the process lifetime, since only this execID's own
+// acquire/release calls ever cleared it. pruneLeaseObsLocked must reclaim
+// entries that have gone idle, once the sweep interval has elapsed.
+func TestLeaseObsPruneRemovesStaleEntries(t *testing.T) {
+	s := open(t)
+
+	// Populate a stale entry (older than leaseObsPruneAge) and a fresh one
+	// directly, bypassing the TTL wait a real observation would need.
+	s.leaseObsMu.Lock()
+	s.leaseObs = map[string]leaseObservation{
+		"stale-exec": {revision: 1, at: time.Now().Add(-2 * leaseObsPruneAge)},
+		"fresh-exec": {revision: 1, at: time.Now()},
+	}
+	// Force the rate limit open so the next leaseRevisionStale call sweeps.
+	s.leaseObsLastSweep = time.Now().Add(-2 * leaseObsPruneEvery)
+	s.leaseObsMu.Unlock()
+
+	// Any call into leaseRevisionStale triggers the (rate-limited) sweep, keyed
+	// off an unrelated execID so it doesn't disturb the two entries above.
+	s.leaseRevisionStale("trigger-exec", 1, time.Minute)
+
+	s.leaseObsMu.Lock()
+	_, staleStillThere := s.leaseObs["stale-exec"]
+	_, freshStillThere := s.leaseObs["fresh-exec"]
+	s.leaseObsMu.Unlock()
+
+	if staleStillThere {
+		t.Fatal("stale-exec observation should have been pruned")
+	}
+
+	if !freshStillThere {
+		t.Fatal("fresh-exec observation should not have been pruned")
+	}
+}
+
 // TestAcquireLeaseRenewalLosesObservedStaleTakeover reproduces the split-brain
 // interleaving: instance A holds a lease and tries to renew it; between A's read
 // and A's CAS write, instance B (which has observed A's revision remain stable

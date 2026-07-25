@@ -16,6 +16,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"testing"
 )
 
@@ -71,6 +72,45 @@ func TestEmitAndReadDeadLetters(t *testing.T) {
 	}
 }
 
+// TestEmitDeadLetterDedupesSameKindAndKey is a regression test: a caller that
+// records a dead-letter trace and then fails to msg.Term() the poisoned
+// message sees it redelivered and re-dead-letters the same kind+key. Without
+// msg-id dedup on the publish, that produced two records for one poisoned
+// message instead of one.
+func TestEmitDeadLetterDedupesSameKindAndKey(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	dl := DeadLetter{Kind: DeadLetterWork, Key: "exec-1", Reason: "first attempt"}
+	if err := s.EmitDeadLetter(ctx, dl); err != nil {
+		t.Fatalf("emit 1: %v", err)
+	}
+
+	// Simulate the Term() failure retry: same kind+key, shortly after.
+	dl.Reason = "retry after failed Term"
+	if err := s.EmitDeadLetter(ctx, dl); err != nil {
+		t.Fatalf("emit 2: %v", err)
+	}
+
+	count, err := s.DeadLetterCount(ctx)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("DeadLetterCount = %d, want 1 (second emit for the same kind+key should have been deduped)", count)
+	}
+
+	// A different key must not be deduped against it.
+	if emitErr := s.EmitDeadLetter(ctx, DeadLetter{Kind: DeadLetterWork, Key: "exec-2", Reason: "unrelated"}); emitErr != nil {
+		t.Fatalf("emit 3: %v", emitErr)
+	}
+
+	if count, err = s.DeadLetterCount(ctx); err != nil || count != 2 {
+		t.Fatalf("DeadLetterCount = %d, %v; want 2", count, err)
+	}
+}
+
 // The recent-records tail is bounded by the limit, returning the most recent N.
 func TestRecentDeadLettersLimit(t *testing.T) {
 	ctx := context.Background()
@@ -78,7 +118,10 @@ func TestRecentDeadLettersLimit(t *testing.T) {
 
 	const total = 20
 	for i := range total {
-		if err := s.EmitDeadLetter(ctx, DeadLetter{Kind: DeadLetterWork, Key: "exec", Reason: "boom"}); err != nil {
+		// Distinct keys: EmitDeadLetter dedups same kind+key within
+		// deadLetterDedupWindow (see TestEmitDeadLetterDedupesSameKindAndKey).
+		key := "exec-" + strconv.Itoa(i)
+		if err := s.EmitDeadLetter(ctx, DeadLetter{Kind: DeadLetterWork, Key: key, Reason: "boom"}); err != nil {
 			t.Fatalf("emit %d: %v", i, err)
 		}
 	}

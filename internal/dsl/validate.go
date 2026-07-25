@@ -35,6 +35,22 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // number of retries; 64 is far more than any real workload needs.
 const MaxRetryAttempts = 64
 
+// firstDuplicate returns the first id that appears more than once in ids, or
+// "" if all ids are distinct.
+func firstDuplicate(ids []string) string {
+	seen := make(map[string]bool, len(ids))
+
+	for _, id := range ids {
+		if seen[id] {
+			return id
+		}
+
+		seen[id] = true
+	}
+
+	return ""
+}
+
 // Validate checks structural and semantic correctness of the flow and builds
 // the internal indexes used by the graph-walk helpers. It is called by Parse.
 //
@@ -562,6 +578,13 @@ func (f *Flow) validateNode(n *Node) error {
 	case NodeFanin:
 		if len(n.WaitFor) == 0 {
 			return fmt.Errorf("flow %q: fanin node %q: wait_for is required", f.Name, n.ID)
+		}
+
+		// A duplicate id here would inflate quorum:N's completed-count (each
+		// settled branch is counted once per occurrence in WaitFor), letting the
+		// fanin advance while a genuinely-required branch is still outstanding.
+		if dup := firstDuplicate(n.WaitFor); dup != "" {
+			return fmt.Errorf("flow %q: fanin node %q: wait_for contains duplicate %q", f.Name, n.ID, dup)
 		}
 
 		for _, w := range n.WaitFor {

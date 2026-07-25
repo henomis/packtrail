@@ -34,6 +34,20 @@ type leaseObservation struct {
 	at       time.Time
 }
 
+const (
+	// leaseObsPruneAge bounds how long an execID's observation lingers once this
+	// process stops being asked about it (e.g. the watchdog moves on, or the
+	// execution's true owner elsewhere releases/renews the lease without this
+	// process ever observing that). Any legitimate contention resolves within a
+	// lease TTL (seconds to a few minutes), so an hour of inactivity means the
+	// entry is stale garbage, not an in-progress observation.
+	leaseObsPruneAge = time.Hour
+	// leaseObsPruneEvery rate-limits the sweep so it doesn't scan the whole map
+	// on every call — leaseRevisionStale/AcquireLease can be called once per node
+	// invocation attempt.
+	leaseObsPruneEvery = 5 * time.Minute
+)
+
 // AcquireLease attempts to take or renew ownership of execID for owner with the
 // given TTL. It succeeds if the key is absent, already owned by owner, or held
 // by another owner whose lease revision has remained unchanged for a full TTL as
@@ -184,6 +198,8 @@ func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Dura
 		s.leaseObs = make(map[string]leaseObservation)
 	}
 
+	s.pruneLeaseObsLocked(now)
+
 	obs, ok := s.leaseObs[execID]
 	if !ok || obs.revision != revision {
 		s.leaseObs[execID] = leaseObservation{revision: revision, at: now}
@@ -192,6 +208,25 @@ func (s *Store) leaseRevisionStale(execID string, revision uint64, ttl time.Dura
 	}
 
 	return now.Sub(obs.at) >= ttl
+}
+
+// pruneLeaseObsLocked removes observations idle for longer than
+// leaseObsPruneAge, so an execID this process contended once and never polled
+// again doesn't leak its entry for the process lifetime. Callers must hold
+// leaseObsMu. Rate-limited by leaseObsPruneEvery so it's a no-op on the vast
+// majority of calls.
+func (s *Store) pruneLeaseObsLocked(now time.Time) {
+	if now.Sub(s.leaseObsLastSweep) < leaseObsPruneEvery {
+		return
+	}
+
+	s.leaseObsLastSweep = now
+
+	for id, obs := range s.leaseObs {
+		if now.Sub(obs.at) >= leaseObsPruneAge {
+			delete(s.leaseObs, id)
+		}
+	}
 }
 
 func (s *Store) clearLeaseObservation(execID string) {

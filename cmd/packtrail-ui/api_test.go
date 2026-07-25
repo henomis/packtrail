@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -180,6 +181,75 @@ func TestAPIFlowsAndExecutions(t *testing.T) {
 
 	if code := doGetCode(t, h, "/api/executions/nope/results"); code != http.StatusNotFound {
 		t.Errorf("missing execution results code = %d, want 404", code)
+	}
+}
+
+// TestHTTPErrorDoesNotLeakInternalErrorText is a regression test:
+// packtrail-ui has no authentication, so httpError used to hand err.Error()
+// straight to the client — including internal store/NATS error text (bucket
+// or subject names) that could help someone probe the deployment. The client
+// must get a generic message; the real error still goes to the server log.
+func TestHTTPErrorDoesNotLeakInternalErrorText(t *testing.T) {
+	rec := httptest.NewRecorder()
+	httpError(rec, errors.New("jetstream: key not found in bucket packtrail-secret-internal-bucket"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "packtrail-secret-internal-bucket") {
+		t.Fatalf("response leaked internal error text: %s", body)
+	}
+
+	var decoded map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if decoded["error"] != msgInternalError {
+		t.Fatalf("error = %q, want generic %q", decoded["error"], msgInternalError)
+	}
+}
+
+// TestHTTPErrorReportsDeadlineExceededGenerically checks the timeout/canceled
+// branch also stays generic (it already was, but must remain so as this
+// function evolves).
+func TestHTTPErrorReportsDeadlineExceededGenerically(t *testing.T) {
+	rec := httptest.NewRecorder()
+	httpError(rec, context.DeadlineExceeded)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503", rec.Code)
+	}
+
+	var decoded map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if decoded["error"] != msgTimeout {
+		t.Fatalf("error = %q, want the generic timeout message %q", decoded["error"], msgTimeout)
+	}
+}
+
+// TestGetResultsErrorDoesNotLeakValidationText exercises the fix end-to-end:
+// a malformed id reaching Server.Results (via the /results route) produces a
+// non-404 error whose text must not reach the client verbatim either.
+func TestGetResultsErrorDoesNotLeakValidationText(t *testing.T) {
+	s := newTestServer(t)
+	h := newAPI(s).routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/executions/exec-%2A/results", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "invalid execution id") {
+		t.Fatalf("response leaked validation error text: %s", body)
 	}
 }
 

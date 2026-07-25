@@ -48,6 +48,12 @@ const (
 	// robust against a server-default change. Beyond it a duplicate is still
 	// state-safe against the guarded transitions.
 	workDedupWindow = 2 * time.Minute
+	// deadLetterDedupWindow makes EmitDeadLetter idempotent per kind+key: a
+	// consumer that records a dead-letter trace and then fails to msg.Term() the
+	// poisoned message (transient error, or a crash between the two calls) sees
+	// that message redelivered and re-dead-lettered. Without this, the same
+	// poisoned message produces two records in the durable trace.
+	deadLetterDedupWindow = 2 * time.Minute
 )
 
 // DefaultMaxPayloadBytes caps a single data-plane entry (a start input, one
@@ -107,8 +113,9 @@ type Store struct {
 
 	historyEnabled atomic.Bool // set by EnableHistory; EmitEvent mirrors events into the history stream
 
-	leaseObsMu sync.Mutex
-	leaseObs   map[string]leaseObservation
+	leaseObsMu        sync.Mutex
+	leaseObs          map[string]leaseObservation
+	leaseObsLastSweep time.Time
 }
 
 // Open ensures every bucket and stream exists, under the given namespace, and
@@ -170,11 +177,12 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 	}
 
 	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      n.StreamDeadLetter,
-		Subjects:  []string{n.SubjDeadLetterPrefix + ">"},
-		MaxAge:    deadLetterMaxAge,
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
+		Name:       n.StreamDeadLetter,
+		Subjects:   []string{n.SubjDeadLetterPrefix + ">"},
+		MaxAge:     deadLetterMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: deadLetterDedupWindow,
 	}); err != nil {
 		return nil, fmt.Errorf("deadletter stream: %w", err)
 	}
@@ -210,6 +218,11 @@ func (s *Store) DeadLetters() uint64 { return s.deadLetters.Load() }
 // EmitDeadLetter appends a dead-letter record to the packtrail-deadletter stream
 // and bumps the in-process counter, so a consumer that gives up on poisoned work
 // (Term) leaves a durable, queryable trace instead of only a log line.
+//
+// The publish carries a msg-id of "kind.key", deduped by the stream within
+// deadLetterDedupWindow: a caller that emits the trace and then fails to Term
+// the poisoned message sees it redelivered and re-emits for the same kind+key,
+// which would otherwise double the durable record.
 func (s *Store) EmitDeadLetter(ctx context.Context, dl DeadLetter) error {
 	if dl.Time.IsZero() {
 		dl.Time = time.Now().UTC()
@@ -220,7 +233,9 @@ func (s *Store) EmitDeadLetter(ctx context.Context, dl DeadLetter) error {
 		return err
 	}
 
-	if _, err = s.js.Publish(ctx, s.names.SubjDeadLetterPrefix+dl.Kind, data); err != nil {
+	msgID := dl.Kind + "." + dl.Key
+
+	if _, err = s.js.Publish(ctx, s.names.SubjDeadLetterPrefix+dl.Kind, data, jetstream.WithMsgID(msgID)); err != nil {
 		return err
 	}
 

@@ -195,7 +195,9 @@ func (s *Scheduler) ConsumeFired(
 				onDeadLetter(key, handlerErr.Error(), numDelivered(msg))
 			}
 
-			_ = msg.Term()
+			if termErr := msg.Term(); termErr != nil {
+				slog.Warn("term fired schedule after dead-letter", "key", key, "err", termErr)
+			}
 
 			return
 		}

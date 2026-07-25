@@ -136,3 +136,29 @@ func TestHistoryRejectsWildcardExecutionID(t *testing.T) {
 		t.Fatalf("error = %q, want invalid-id rejection", err)
 	}
 }
+
+// TestGetRejectsWildcardExecutionID is a regression test: unlike its sibling
+// methods (Results, Cancel, Resume, CompleteActivity, History), Get used to
+// reach the store with no execID validation, surfacing a raw store/NATS error
+// instead of the uniform "invalid execution id" contract.
+func TestGetRejectsWildcardExecutionID(t *testing.T) {
+	srv := natstest.Start(t)
+
+	s, err := packtrail.New(srv.NC,
+		packtrail.WithNamespace("getbadid"),
+		packtrail.WithFlow([]byte(observeFlow)),
+		packtrail.WithInvoker("custom", okInvoker()),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	_, err = s.Get(context.Background(), "exec-*")
+	if err == nil {
+		t.Fatal("Get accepted wildcard-shaped execution id; want validation error")
+	}
+
+	if !strings.Contains(err.Error(), "invalid execution id") {
+		t.Fatalf("error = %q, want invalid-id rejection", err)
+	}
+}

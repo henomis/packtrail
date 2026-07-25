@@ -200,7 +200,9 @@ func (s *Signals) handleDelivery(
 			onDeadLetter(msg.Subject(), "", "unparseable signal subject", deliveries)
 		}
 
-		_ = msg.Term()
+		if termErr := msg.Term(); termErr != nil {
+			slog.Warn("term unparseable signal after dead-letter", "subject", msg.Subject(), "err", termErr)
+		}
 
 		return
 	}
@@ -228,7 +230,9 @@ func (s *Signals) handleDelivery(
 			onDeadLetter(execID, name, handlerErr.Error(), meta.NumDelivered)
 		}
 
-		_ = msg.Term()
+		if termErr := msg.Term(); termErr != nil {
+			slog.Warn("term signal after dead-letter", "exec", execID, "name", name, "err", termErr)
+		}
 
 		return
 	}

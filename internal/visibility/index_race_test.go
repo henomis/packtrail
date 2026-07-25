@@ -57,6 +57,12 @@ func (h *hookKV) Update(ctx context.Context, key string, value []byte, revision 
 	return h.KeyValue.Update(ctx, key, value, revision)
 }
 
+func (h *hookKV) Delete(ctx context.Context, key string, opts ...jetstream.KVDeleteOpt) error {
+	h.fire()
+
+	return h.KeyValue.Delete(ctx, key, opts...)
+}
+
 // TestIndexConcurrentProjectionDoesNotRegress reproduces the multi-instance
 // indexer race deterministically: indexer A reads the bookkeeping record for an
 // older event, and before A commits, indexer B fully projects a newer event for
@@ -249,6 +255,55 @@ func TestIndexMetaMatchesMembership(t *testing.T) {
 	if meta.Revision != 3 || meta.Status != store.StatusRunning ||
 		membership.Revision != meta.Revision || membership.Status != meta.Status {
 		t.Fatalf("meta %+v and membership %+v disagree", meta, membership)
+	}
+}
+
+// TestGCPreservesRecreatedExecution reproduces the GC-vs-re-Start race: GC
+// collects a terminal candidate and sees it absent from the store, but before
+// it deletes the index entries a re-Start recreates the id (rewriting the meta
+// entry and fresh membership). The revision-guarded meta delete must fail and
+// GC must leave the recreated execution's fresh index entries intact.
+func TestGCPreservesRecreatedExecution(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	st, err := store.Open(ctx, srv.JS, names.New(""))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	ix := New(st)
+
+	// Index a terminal execution that is NOT in the store, so GC sees it as gone
+	// and becomes a delete candidate.
+	old := store.Event{ExecID: "gc-x", FlowName: "f", Status: store.StatusCompleted, Revision: 1, Time: time.Now().UTC()}
+	if err = ix.index(ctx, old); err != nil {
+		t.Fatalf("index old: %v", err)
+	}
+
+	// Arm the meta delete: just before GC deletes the meta entry, a second
+	// indexer recreates gc-x with a newer event (bumping the meta revision and
+	// writing fresh membership) — exactly the re-Start-in-the-window case.
+	b := New(st)
+	fresh := store.Event{ExecID: "gc-x", FlowName: "f", Status: store.StatusRunning, Revision: 2, Time: time.Now().UTC()}
+	ix.idxFlow = &hookKV{KeyValue: ix.idxFlow, before: func() {
+		if idxErr := b.index(ctx, fresh); idxErr != nil {
+			t.Errorf("recreate index: %v", idxErr)
+		}
+	}}
+
+	if _, err = ix.GC(ctx, 0); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+
+	// The recreated execution's fresh membership must survive the guarded delete.
+	ids, err := b.ByFlow(ctx, "f")
+	if err != nil {
+		t.Fatalf("by flow: %v", err)
+	}
+
+	if len(ids) != 1 || ids[0] != "gc-x" {
+		t.Fatalf("ByFlow(f) = %v, want [gc-x] (GC clobbered the recreated execution's index)", ids)
 	}
 }
 

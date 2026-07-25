@@ -212,7 +212,7 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 	}
 
 	if exists && prev.Status != "" && prev.Status != ev.Status {
-		_ = ix.idxStatus.Delete(ctx, prev.Status+sep+ev.ExecID) // best-effort cleanup
+		ix.bestEffortDelete(ctx, ix.idxStatus, prev.Status+sep+ev.ExecID)
 	}
 
 	if _, putErr := ix.idxFlow.Put(ctx, ev.FlowName+sep+ev.ExecID, val); putErr != nil {
@@ -255,7 +255,7 @@ func (ix *Indexer) reassertIndexedEvent(ctx context.Context, prev, stale store.E
 	}
 
 	if prev.Status != stale.Status {
-		_ = ix.idxStatus.Delete(ctx, stale.Status+sep+stale.ExecID)
+		ix.bestEffortDelete(ctx, ix.idxStatus, stale.Status+sep+stale.ExecID)
 	}
 
 	if prev.FlowName != stale.FlowName {
@@ -427,7 +427,7 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 
 	for _, s := range allStatuses {
 		if s != ex.Status {
-			_ = ix.idxStatus.Delete(ctx, s+sep+ex.ID)
+			ix.bestEffortDelete(ctx, ix.idxStatus, s+sep+ex.ID)
 		}
 	}
 
@@ -451,7 +451,14 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 var errStop = errors.New("stop")
 
 // gcCandidate is a terminal index entry GC will check against the store.
-type gcCandidate struct{ flow, status, id string }
+// metaRev is the revision of the bookkeeping (meta) entry at collection time;
+// GC guards the meta delete on it so a re-Start that recreated the id between
+// the absence check and the delete (which rewrites the meta entry to a new
+// revision) is detected and its fresh index entries are left intact.
+type gcCandidate struct {
+	flow, status, id string
+	metaRev          uint64
+}
 
 // GC prunes index entries whose execution no longer exists in either the hot
 // bucket or the cold archive — orphans left behind when an archived terminal
@@ -487,14 +494,36 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 			return pruned, getErr
 		}
 
-		_ = ix.idxFlow.Delete(ctx, c.flow+sep+c.id)
-		_ = ix.idxStatus.Delete(ctx, c.status+sep+c.id)
-		_ = ix.idxFlow.Delete(ctx, metaKey(c.id))
-		_ = ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff) // sweep stale data-plane orphans the archive sweep missed
+		// The meta entry is the commit point: delete it guarded on the revision
+		// observed at collection. A re-Start that recreated this id in the window
+		// since the absence check rewrote the meta entry to a newer revision, so
+		// the guarded delete fails and we skip the membership/payload deletes,
+		// leaving the recreated execution's fresh index entries untouched.
+		if err := ix.idxFlow.Delete(ctx, metaKey(c.id), jetstream.LastRevision(c.metaRev)); err != nil {
+			slog.Debug("visibility GC: meta delete skipped (recreated or already gone)", "exec", c.id, "err", err)
+			continue
+		}
+
+		ix.bestEffortDelete(ctx, ix.idxFlow, c.flow+sep+c.id)
+		ix.bestEffortDelete(ctx, ix.idxStatus, c.status+sep+c.id)
+
+		if err := ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff); err != nil {
+			slog.Debug("visibility GC: sweep payloads", "exec", c.id, "err", err)
+		}
+
 		pruned++
 	}
 
 	return pruned, nil
+}
+
+// bestEffortDelete removes a key, tolerating a missing key but logging any other
+// failure so a sustained connectivity problem during cleanup is not silent
+// (the entry self-heals on the next full reconcile regardless).
+func (ix *Indexer) bestEffortDelete(ctx context.Context, kv jetstream.KeyValue, key string) {
+	if err := kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		slog.Debug("visibility: best-effort delete failed", "key", key, "err", err)
+	}
 }
 
 // gcCandidates scans the bookkeeping records for terminal entries older than
@@ -518,7 +547,9 @@ func (ix *Indexer) gcCandidates(ctx context.Context, staleAfter time.Duration) (
 			return nil
 		}
 
-		out = append(out, gcCandidate{ev.FlowName, ev.Status, ev.ExecID})
+		out = append(out, gcCandidate{
+			flow: ev.FlowName, status: ev.Status, id: ev.ExecID, metaRev: entry.Revision(),
+		})
 
 		return nil
 	})

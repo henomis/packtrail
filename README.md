@@ -493,6 +493,12 @@ to the same NATS cluster, reads execution state and the **flow registry** (every
 flow's graph is published to a KV bucket at startup), and tails the live event
 stream — so it needs no access to your flow source or engine process.
 
+> **No built-in authentication.** `packtrail-ui` serves every execution's
+> payloads, history, errors and dead-letters to anyone who can reach its HTTP
+> address — there is no login, token, or access control of any kind. Bind it to
+> a loopback or private address, or put an authenticating reverse proxy in
+> front, before exposing it beyond a network you already trust.
+
 ```sh
 go run ./cmd/packtrail-ui --namespace packtrail --addr :8088   # NATS_URL honoured
 ```

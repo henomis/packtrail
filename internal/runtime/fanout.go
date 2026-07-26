@@ -185,6 +185,17 @@ func (e *Engine) parkAtFanin(
 // enough (a 200-way fanout settling at once). Serializing keeps per-branch
 // durability (a completed branch is written before any crash, and is not
 // recomputed on takeover) while bounding contention to a single writer.
+//
+// At-least-once, amplified by width: branch dispatch inherits the engine's
+// at-least-once delivery. If the fanout work item is redelivered before its
+// terminal commit lands — e.g. a crash between this call returning pending and
+// parkAtFanin's CAS, then RedriveStalled — the redelivered stepFanout re-runs
+// *every* branch still BranchPending, not one. A completed branch is already
+// persisted (and excluded by pendingBranchIDs), so only genuinely-outstanding
+// branches repeat, but a wide fan can therefore fire N duplicate external side
+// effects at once. This is the standard at-least-once contract scaled to fan
+// width; it is mitigated the same way — enable the result cache (WithResultCache)
+// to dedup per-branch re-invocations, and keep side-effecting handlers idempotent.
 func (e *Engine) dispatchBranches(
 	ctx context.Context, flow *dsl.Flow, exec *store.Execution, branches []string,
 ) (anyPending bool, dispatchErr error) {

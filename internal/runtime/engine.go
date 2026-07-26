@@ -907,22 +907,12 @@ func (e *Engine) loadOutputPayloads(
 	ctx context.Context,
 	ex *store.Execution,
 ) (map[string]json.RawMessage, error) {
-	results := make(map[string]json.RawMessage, len(ex.Outputs))
-
+	keys := make(map[string]string, len(ex.Outputs))
 	for _, node := range ex.Outputs {
-		out, err := e.store.GetPayload(ctx, outputPayloadKey(ex, node))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, err
-		}
-
-		results[node] = out
+		keys[node] = outputPayloadKey(ex, node)
 	}
 
-	return results, nil
+	return e.loadPayloadSet(ctx, keys)
 }
 
 func outputPayloadKey(ex *store.Execution, node string) string {
@@ -937,22 +927,90 @@ func (e *Engine) loadSignalPayloads(
 	ctx context.Context,
 	ex *store.Execution,
 ) (map[string]json.RawMessage, error) {
-	signals := make(map[string]json.RawMessage, len(ex.LastSeq))
-
+	keys := make(map[string]string, len(ex.LastSeq))
 	for name, seq := range ex.LastSeq {
-		p, err := e.store.GetPayload(ctx, store.SignalKey(ex.ID, name, seq))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-
-			return nil, err
-		}
-
-		signals[name] = p
+		keys[name] = store.SignalKey(ex.ID, name, seq)
 	}
 
-	return signals, nil
+	return e.loadPayloadSet(ctx, keys)
+}
+
+// contextReadParallelism bounds the concurrent GetPayload calls a single
+// context assembly issues. assembleContext reads one data-plane entry per prior
+// output/signal; doing them sequentially made a deep flow's per-step latency
+// scale with its accumulated history (O(depth) round trips per step). A bounded
+// fan-out keeps that latency roughly constant without unleashing an unbounded
+// burst of concurrent KV reads.
+const contextReadParallelism = 16
+
+// loadPayloadSet reads a set of data-plane entries concurrently, keyed by a
+// caller-chosen result name (node id or signal name). A missing entry
+// (ErrNotFound) is skipped — an archived or not-yet-written payload is expected,
+// not an error. The first real read error wins and cancels the rest. Ordering is
+// irrelevant: results are collected into a map.
+func (e *Engine) loadPayloadSet(
+	ctx context.Context,
+	keys map[string]string,
+) (map[string]json.RawMessage, error) {
+	out := make(map[string]json.RawMessage, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		sem    = make(chan struct{}, contextReadParallelism)
+		errMu  sync.Mutex
+		getErr error
+	)
+
+	for name, key := range keys {
+		wg.Add(1)
+
+		go func(name, key string) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+
+			p, err := e.store.GetPayload(ctx, key)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					return
+				}
+
+				errMu.Lock()
+				if getErr == nil {
+					getErr = err
+
+					cancel() // stop the remaining reads; first error wins
+				}
+				errMu.Unlock()
+
+				return
+			}
+
+			mu.Lock()
+			out[name] = p
+			mu.Unlock()
+		}(name, key)
+	}
+
+	wg.Wait()
+
+	if getErr != nil {
+		return nil, getErr
+	}
+
+	return out, nil
 }
 
 func (e *Engine) writeOutputCandidate(

@@ -92,6 +92,13 @@ func (a *api) flowGraph(w http.ResponseWriter, r *http.Request) {
 // per-execution round-trips). The unfiltered case ("list all") fetches each
 // execution concurrently with a bounded pool because the index has no
 // all-executions view that carries full summary data.
+//
+// The unfiltered path is an O(N) scan of the entire hot bucket with no
+// pagination: its cost scales with the number of non-archived executions. It
+// stays cheap only when archival is enabled (WithArchival) so completed work
+// leaves the hot bucket — see the packtrail-ui README note. On a deployment
+// without archival, prefer the ?status= / ?flow= filtered queries, which the
+// index answers without a full scan.
 func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	status := r.URL.Query().Get("status")

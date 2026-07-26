@@ -72,6 +72,15 @@ type Handler func(ctx context.Context, req TaskRequest) (TaskResponse, error)
 //
 // subject may contain NATS wildcards (e.g. "tasks.triage.*") so a single worker
 // can serve every execution of a task.
+//
+// Concurrency: a single Serve subscription processes requests sequentially on
+// one delivery goroutine, so a slow Handler head-of-line-blocks other requests
+// routed to the same subscription. This is deliberate — it keeps a Handler free
+// to use non-thread-safe state without synchronisation. To process requests
+// concurrently, call Serve (or ServeNamespaced) more than once for the same
+// subject: all subscriptions share the "packtrail-workers" queue group, so NATS
+// load-balances requests across them, one in-flight per subscription. Size the
+// number of subscriptions to the concurrency you want.
 func Serve(ctx context.Context, nc *nats.Conn, subject string, h Handler) (*nats.Subscription, error) {
 	return nc.QueueSubscribe(subject, "packtrail-workers", func(msg *nats.Msg) {
 		var req TaskRequest

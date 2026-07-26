@@ -219,6 +219,18 @@ func (c *Cache) stealExpiredClaim(ctx context.Context, key string, revision uint
 	return c.kv.Update(ctx, key, data, revision)
 }
 
+// claimUntil is the wall-clock instant after which a claim is considered
+// abandoned and stealable by another attempt. It is the call's deadline plus a
+// small grace, so a claimant that finishes within its own deadline always
+// publishes its result before the claim becomes stealable.
+//
+// The grace bounds — but does not eliminate — the double-invocation window: a
+// delegate that keeps running past deadline+grace (i.e. ignores context
+// cancellation) can have its claim stolen and the work re-invoked concurrently.
+// The cache therefore guarantees single-invocation only for delegates that
+// honour cancellation; the engine's contract remains at-least-once, so handlers
+// with external side effects must still be idempotent. A well-behaved delegate
+// that returns promptly on ctx.Done() is never double-invoked here.
 func claimUntil(ctx context.Context, req Request) time.Time {
 	deadline := req.Deadline
 	if deadline.IsZero() {

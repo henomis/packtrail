@@ -249,9 +249,13 @@ func (s *Scheduler) ReclaimFired(ctx context.Context, durable string) (uint64, e
 		return 0, nil // nothing acked yet
 	}
 
-	before, err := stream.Info(ctx)
+	// Count only fire.> messages, not total stream Msgs: the same stream also
+	// holds cron/once definitions, so a definition installed concurrently (between
+	// these two snapshots) would otherwise corrupt the delta. Scoping to the purged
+	// subject makes the count immune to that unrelated growth.
+	before, err := s.fireMsgCount(ctx, stream)
 	if err != nil {
-		return 0, fmt.Errorf("stream info: %w", err)
+		return 0, err
 	}
 
 	if err = stream.Purge(ctx,
@@ -259,16 +263,32 @@ func (s *Scheduler) ReclaimFired(ctx context.Context, durable string) (uint64, e
 		return 0, fmt.Errorf("purge fired: %w", err)
 	}
 
-	after, err := stream.Info(ctx)
+	after, err := s.fireMsgCount(ctx, stream)
+	if err != nil {
+		return 0, err
+	}
+
+	if before < after {
+		return 0, nil // concurrent fire growth; report nothing purged rather than underflow
+	}
+
+	return before - after, nil
+}
+
+// fireMsgCount returns the number of fire.> messages currently in the stream,
+// summed from the subject-filtered stream state.
+func (s *Scheduler) fireMsgCount(ctx context.Context, stream jetstream.Stream) (uint64, error) {
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(s.fire+">"))
 	if err != nil {
 		return 0, fmt.Errorf("stream info: %w", err)
 	}
 
-	if before.State.Msgs < after.State.Msgs {
-		return 0, nil // concurrent growth; report nothing purged rather than underflow
+	var total uint64
+	for _, n := range info.State.Subjects {
+		total += n
 	}
 
-	return before.State.Msgs - after.State.Msgs, nil
+	return total, nil
 }
 
 // numDelivered returns a message's delivery count, or 0 if unavailable.

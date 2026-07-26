@@ -19,8 +19,19 @@
 // cluster without colliding.
 package names
 
+import (
+	"regexp"
+	"strconv"
+)
+
 // Default is the namespace prefix used when none is supplied.
 const Default = "packtrail"
+
+// prefixPattern bounds a namespace prefix to the token shape every resource
+// name is built from. It mirrors the caller-side validation in packtrail.New;
+// New restates it as a defense-in-depth guard because an unvalidated prefix
+// would silently corrupt every NATS bucket/stream/subject name derived here.
+var prefixPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // Names holds every concrete resource name for one namespace.
 type Names struct {
@@ -61,10 +72,16 @@ type Names struct {
 }
 
 // New builds the resource names for prefix. An empty prefix falls back to
-// Default ("packtrail").
+// Default ("packtrail"). A non-empty prefix must match [A-Za-z0-9_-]{1,64};
+// New panics otherwise, since an invalid namespace is an unrecoverable
+// configuration error that would corrupt every derived resource name.
 func New(prefix string) Names {
 	if prefix == "" {
 		prefix = Default
+	}
+
+	if !prefixPattern.MatchString(prefix) {
+		panic("names: invalid namespace prefix " + strconv.Quote(prefix) + "; must match [A-Za-z0-9_-]{1,64}")
 	}
 
 	return Names{

@@ -39,6 +39,7 @@ package packtrail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -123,6 +124,12 @@ const (
 // ErrNotFound is returned by Get when an execution does not exist.
 var ErrNotFound = store.ErrNotFound
 
+// ErrInvalidArgument wraps rejections of caller-supplied identifiers (execution
+// IDs, flow names, statuses) that fail validation before any lookup. It lets a
+// transport layer distinguish a client input mistake (map to 400) from a
+// server-side fault (500), via errors.Is.
+var ErrInvalidArgument = errors.New("packtrail: invalid argument")
+
 // defaultResultCacheTTL bounds the result-cache bucket: an entry is only ever
 // read during the redelivery window of its own attempt (ack wait × delivery
 // cap, i.e. minutes), so 24h is a generous ceiling that keeps the bucket from
@@ -138,6 +145,22 @@ var resourceTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validExecID(id string) bool { return execIDPattern.MatchString(id) }
+
+// validFlowName reuses the exec-id token rule: flow names share the same
+// [A-Za-z0-9_-]{1,128} shape and, like exec ids, must never carry NATS subject
+// wildcards when a read API turns them into KV Watch filters.
+func validFlowName(name string) bool { return execIDPattern.MatchString(name) }
+
+// validStatus reports whether status is one of the closed set of execution
+// statuses accepted by the By*/By*Events read APIs.
+func validStatus(status string) bool {
+	switch status {
+	case ExecRunning, ExecWaiting, ExecCompleted, ExecFailed, ExecCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // Server is an embeddable packtrail engine instance: it runs the work consumer,
 // visibility indexer and (optionally) reconciliation, and can host built-in
@@ -684,6 +707,10 @@ func (s *Server) Cancel(ctx context.Context, execID, reason string) error {
 // Get returns a snapshot of an execution, or ErrNotFound. The execution KV is
 // the source of truth; read it (not the indexes) for correctness decisions.
 func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -704,6 +731,10 @@ func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
 // archived execution are dropped by the archive sweep, so Results of an
 // archived id returns only what remains.
 func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -714,6 +745,10 @@ func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, e
 // ByStatus returns the ids of executions currently indexed under status. The
 // index is eventually consistent (best-effort visibility).
 func (s *Server) ByStatus(ctx context.Context, status string) ([]string, error) {
+	if !validStatus(status) {
+		return nil, fmt.Errorf("%w: unknown status %q", ErrInvalidArgument, status)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -723,6 +758,10 @@ func (s *Server) ByStatus(ctx context.Context, status string) ([]string, error) 
 
 // ByFlow returns the ids of executions belonging to flow.
 func (s *Server) ByFlow(ctx context.Context, flow string) ([]string, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("%w: flow name %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, flow)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}

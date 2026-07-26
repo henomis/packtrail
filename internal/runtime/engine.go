@@ -213,7 +213,7 @@ func New(
 		cfg.MaxDeliver = defaultMaxDeliver
 	}
 
-	if cfg.DrainTimeout == 0 {
+	if cfg.DrainTimeout <= 0 {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
 

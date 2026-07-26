@@ -357,7 +357,11 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func httpError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+
+	switch {
+	case errors.Is(err, packtrail.ErrInvalidArgument):
+		code = http.StatusBadRequest
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		code = http.StatusServiceUnavailable
 	}
 

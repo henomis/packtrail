@@ -37,7 +37,7 @@ async function refreshList() {
     const li = document.createElement("li");
     if (e.id === state.selected) li.classList.add("active");
     li.innerHTML = `<div class="row1"><span class="flow">${esc(e.flow)}</span>
-      <span class="badge ${e.status}">${e.status}</span></div>
+      <span class="badge ${esc(e.status)}">${esc(e.status)}</span></div>
       <div class="id">${esc(e.id)}</div>`;
     li.onclick = () => selectExec(e.id);
     list.appendChild(li);
@@ -70,7 +70,7 @@ async function renderDetail(id) {
   ]);
   const d = $("#detail");
   d.innerHTML = `
-    <h2>${esc(ex.flow)} <span class="badge ${ex.status}">${ex.status}</span></h2>
+    <h2>${esc(ex.flow)} <span class="badge ${esc(ex.status)}">${esc(ex.status)}</span></h2>
     <div class="meta">${esc(ex.id)} · node: ${esc(ex.current_node || "—")}${generationSuffix(ex.node_generation)} · attempt ${ex.attempt || 0}
       ${ex.wait_signal ? `· waiting on signal <b>${esc(ex.wait_signal)}</b>` : ""}
       · updated ${new Date(ex.updated_at).toLocaleString()}</div>

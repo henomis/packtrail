@@ -250,7 +250,7 @@ func WithMaxDeliver(n int) Option { return func(c *config) { c.maxDeliver = n } 
 // not abandon in-flight invocations to redelivery (which would double-fire
 // naturally non-idempotent targets). Stragglers exceeding the window are cancelled
 // and their work redelivers. A hard crash is unaffected (it always relies on
-// redelivery).
+// redelivery). A non-positive value falls back to the 30s default.
 func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drainTimeout = d } }
 
 // WithMaxPayloadBytes caps the size of an execution's payload (default 512 KiB,

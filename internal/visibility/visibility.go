@@ -499,16 +499,16 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 		// since the absence check rewrote the meta entry to a newer revision, so
 		// the guarded delete fails and we skip the membership/payload deletes,
 		// leaving the recreated execution's fresh index entries untouched.
-		if err := ix.idxFlow.Delete(ctx, metaKey(c.id), jetstream.LastRevision(c.metaRev)); err != nil {
-			slog.Debug("visibility GC: meta delete skipped (recreated or already gone)", "exec", c.id, "err", err)
+		if delErr := ix.idxFlow.Delete(ctx, metaKey(c.id), jetstream.LastRevision(c.metaRev)); delErr != nil {
+			slog.Debug("visibility GC: meta delete skipped (recreated or already gone)", "exec", c.id, "err", delErr)
 			continue
 		}
 
 		ix.bestEffortDelete(ctx, ix.idxFlow, c.flow+sep+c.id)
 		ix.bestEffortDelete(ctx, ix.idxStatus, c.status+sep+c.id)
 
-		if err := ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff); err != nil {
-			slog.Debug("visibility GC: sweep payloads", "exec", c.id, "err", err)
+		if sweepErr := ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff); sweepErr != nil {
+			slog.Debug("visibility GC: sweep payloads", "exec", c.id, "err", sweepErr)
 		}
 
 		pruned++

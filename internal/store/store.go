@@ -34,9 +34,9 @@ import (
 )
 
 const (
-	execBucketHistory  = 64
-	eventsMaxAge       = 24 * time.Hour
-	deadLetterMaxAge   = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
+	execBucketHistory = 64
+	eventsMaxAge      = 24 * time.Hour
+	deadLetterMaxAge  = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
 	// deadLetterDedupWindow collapses re-emissions of the same (kind, key)
 	// dead-letter. A consumer that gives up on poisoned work fails the execution
 	// and then emits — but if the process crashes (or the Term ack is lost)
@@ -45,10 +45,10 @@ const (
 	// this window make that idempotent so one poisoned item leaves one record.
 	deadLetterDedupWindow = 2 * time.Minute
 	deadLetterReadWait    = 500 * time.Millisecond
-	defaultDLQReadCap  = 100
-	casBackoffBase     = 250 * time.Microsecond
-	casBackoffCap      = 5 * time.Millisecond
-	eventDedupWindow   = 2 * time.Minute
+	defaultDLQReadCap     = 100
+	casBackoffBase        = 250 * time.Microsecond
+	casBackoffCap         = 5 * time.Millisecond
+	eventDedupWindow      = 2 * time.Minute
 	// workDedupWindow is set explicitly (rather than relying on NATS's implicit
 	// ~2m default) so the outbox's per-item msg-id dedup — which makes a
 	// re-flushed work item idempotent within the window — is self-documenting and

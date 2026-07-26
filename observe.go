@@ -269,6 +269,10 @@ func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, er
 // Since KV keys have no inherent order the cap yields an arbitrary subset, not
 // an ordered page; it is a guardrail against an unbounded transfer.
 func (s *Server) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]Event, error) {
+	if !validStatus(status) {
+		return nil, fmt.Errorf("%w: unknown status %q", ErrInvalidArgument, status)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -290,6 +294,10 @@ func (s *Server) ByFlowEvents(ctx context.Context, flow string) ([]Event, error)
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (0 = no cap). The
 // same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("%w: flow name %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, flow)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -308,7 +316,7 @@ func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) 
 // retention.
 func (s *Server) History(ctx context.Context, execID string, limit int) ([]Event, error) {
 	if !validExecID(execID) {
-		return nil, fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
 	}
 
 	if err := s.Init(ctx); err != nil {

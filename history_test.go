@@ -16,7 +16,7 @@ package packtrail_test
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
@@ -132,7 +132,7 @@ func TestHistoryRejectsWildcardExecutionID(t *testing.T) {
 		t.Fatal("History accepted wildcard-shaped execution id; want validation error")
 	}
 
-	if !strings.Contains(err.Error(), "invalid execution id") {
-		t.Fatalf("error = %q, want invalid-id rejection", err)
+	if !errors.Is(err, packtrail.ErrInvalidArgument) {
+		t.Fatalf("error = %q, want ErrInvalidArgument", err)
 	}
 }

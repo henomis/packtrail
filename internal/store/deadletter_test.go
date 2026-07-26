@@ -111,6 +111,7 @@ func TestEmitDeadLetterDedupesSameKindKey(t *testing.T) {
 	// Re-emit the same (kind, key), even with a different delivery count/reason.
 	dl.Deliveries = 2
 	dl.Reason = "boom again"
+
 	if err := s.EmitDeadLetter(ctx, dl); err != nil {
 		t.Fatalf("second emit: %v", err)
 	}

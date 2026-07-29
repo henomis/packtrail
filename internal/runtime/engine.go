@@ -2509,13 +2509,19 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 
 // Cancel transitions a running or waiting execution to the terminal cancelled
 // state with the given reason. It is idempotent and stale-safe: cancelling an
-// already-terminal execution (completed/failed/cancelled) — or one that no longer
-// exists — is a no-op. In-flight work is abandoned rather than interrupted: any
-// later work item or async CompleteActivity for this execution finds it
-// non-active and no-ops (process and CompleteActivity both drop non-active
-// executions), so pending retries, fanin evaluations and signal timeouts settle
-// harmlessly. Unlike Resume, a cancelled execution is terminal and cannot be
-// revived.
+// already-terminal execution (completed/failed/cancelled) is a no-op. In-flight
+// work is abandoned rather than interrupted: any later work item or async
+// CompleteActivity for this execution finds it non-active and no-ops (process
+// and CompleteActivity both drop non-active executions), so pending retries,
+// fanin evaluations and signal timeouts settle harmlessly. Unlike Resume, a
+// cancelled execution is terminal and cannot be revived.
+//
+// An execID naming no execution at all returns store.ErrNotFound. The
+// idempotence above is about *state* — this execution has already reached a
+// terminal one — and folding an unknown id into it made the two indistinguishable
+// answers: "there is nothing left to cancel" and "you have cancelled nothing".
+// An operator stopping a runaway with a mistyped id was told it had worked while
+// it kept running.
 func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 	if !validExecID(execID) {
 		return fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
@@ -2532,8 +2538,12 @@ func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errSkip) || errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, errSkip) {
 			return nil
+		}
+
+		if errors.Is(err, store.ErrNotFound) {
+			return e.cancelAbsent(ctx, execID)
 		}
 
 		return err
@@ -2542,6 +2552,25 @@ func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 	e.emitEvent(ctx, updated)
 
 	return nil
+}
+
+// cancelAbsent decides what a Cancel means when the hot bucket has no such
+// execution: a terminal one swept into the cold archive is present and already
+// past cancelling (a no-op), while an id that exists nowhere is a caller mistake
+// (store.ErrNotFound).
+//
+// The distinction is needed because Mutate reads the hot bucket only — archived
+// executions are immutable, so a CAS against them could never commit — which
+// makes "gone from hot" cover both cases. An archive lookup failure is reported
+// as not-found rather than masked: at that point nothing can confirm the
+// execution exists, and claiming a successful cancel is the one answer that is
+// certainly wrong.
+func (e *Engine) cancelAbsent(ctx context.Context, execID string) error {
+	if _, archived, err := e.store.ArchivedExecution(ctx, execID); err == nil && archived {
+		return nil
+	}
+
+	return store.ErrNotFound
 }
 
 // fail marks an execution failed via CAS and emits an event. It applies only

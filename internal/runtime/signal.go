@@ -31,12 +31,21 @@ import (
 var errSkip = errors.New("skip write")
 
 // Signal publishes an external signal to an execution.
+//
+// It deliberately does *not* require the execution to exist yet: a signal may
+// legitimately race ahead of the Start that creates its target, and the consumer
+// Naks and redelivers until the execution appears (see applySignal and
+// TestEarlySignalWaitsForExecution). Rejecting an unknown id here would trade
+// that tolerance away. A signal whose execution never appears is not lost
+// either — it exhausts the delivery cap and lands in the dead-letter stream,
+// keyed "<execID>/<name>".
 func (e *Engine) Signal(ctx context.Context, execID, name string, payload json.RawMessage) error {
 	return e.signals.Publish(ctx, execID, name, payload)
 }
 
 // SignalWithID publishes an external signal with a caller-supplied idempotency
-// key for safe retry after ambiguous publish failures.
+// key for safe retry after ambiguous publish failures. Like Signal, it accepts an
+// execution that does not exist yet.
 func (e *Engine) SignalWithID(
 	ctx context.Context, execID, name, idempotencyKey string, payload json.RawMessage,
 ) error {

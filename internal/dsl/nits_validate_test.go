@@ -264,6 +264,14 @@ nodes:
 	}
 }
 
+// TestValidateRejectsNodeReachableOnlyViaBranchEdge: an edge out of a fan-out
+// branch is never taken, so a node hanging off one is dead.
+//
+// This used to be caught downstream, as `unreachable node(s) [ghost]` — true,
+// but it names the victim rather than the mistake. rejectBranchExit now refuses
+// the edge itself, which is where the author has something to fix. The
+// unreachable check still guards a genuinely disconnected node (see the
+// "island" case above).
 func TestValidateRejectsNodeReachableOnlyViaBranchEdge(t *testing.T) {
 	_, err := Parse([]byte(`
 name: dead-via-branch-edge
@@ -286,8 +294,8 @@ edges:
   - from: b1
     to: ghost
 `))
-	if err == nil || !strings.Contains(err.Error(), "unreachable node(s) [ghost]") {
-		t.Fatalf("err = %v, want unreachable ghost rejection", err)
+	if err == nil || !strings.Contains(err.Error(), `node "b1" is a branch of fanout "fo" and has an outgoing edge`) {
+		t.Fatalf("err = %v, want branch-exit rejection", err)
 	}
 }
 

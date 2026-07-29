@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -105,11 +106,20 @@ func TestCancelCompletedIsNoOp(t *testing.T) {
 	}
 }
 
-// TestCancelUnknownExecution is a no-op (no execution to cancel), not an error.
+// TestCancelUnknownExecution: an id naming no execution is an error, not the
+// no-op that "cancel is idempotent" covers.
+//
+// This used to return nil, on the reading that cancelling nothing has already
+// achieved cancellation. But idempotence is a statement about *state* — this
+// execution has already reached a terminal one — and an unknown id is not a
+// state at all. Conflating them meant an operator stopping a runaway execution
+// with a mistyped id was told it had worked while it kept running, which is the
+// one answer that must not be silent.
 func TestCancelUnknownExecution(t *testing.T) {
 	h := newHarness(t, linearFlow, Config{})
 
-	if err := h.engine.Cancel(context.Background(), "exec-does-not-exist", "x"); err != nil {
-		t.Fatalf("cancel unknown: %v, want nil (no-op)", err)
+	err := h.engine.Cancel(context.Background(), "exec-does-not-exist", "x")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cancel unknown: %v, want store.ErrNotFound", err)
 	}
 }

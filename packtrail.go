@@ -241,6 +241,13 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		return nil, err
 	}
 
+	// The payload cap is only meaningful relative to what the connection can
+	// actually carry, which is knowable only from a live connection — so this is
+	// the first point at which the pair can be compared.
+	if err = reconcilePayloadCap(nc, &c); err != nil {
+		return nil, err
+	}
+
 	n := names.New(c.prefix)
 
 	return &Server{
@@ -282,6 +289,58 @@ func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 					f.Name, n.ID, kind)
 			}
 		}
+	}
+
+	return nil
+}
+
+// reconcilePayloadCap squares the configured per-entry payload cap with what
+// the connected server will actually accept.
+//
+// The cap exists so an over-large entry fails fast with an actionable error
+// instead of an opaque KV write near the transport limit. A cap set *above* that
+// limit therefore disables the guard it configures: an entry under the cap but
+// over the server's max_payload produces exactly the failure the setting was
+// meant to replace, at the worst possible moment — when a task returns a large
+// result, deep inside a running execution.
+//
+// The two cases are not the same and are not treated the same:
+//
+//   - An explicitly configured cap above the server's limit is a contradiction
+//     between two deliberate numbers, like a node timeout above its invoker's
+//     ceiling (see validateNodeTimeouts). It is rejected here rather than
+//     quietly adjusted, because adjusting it would substitute this package's
+//     guess for the caller's stated intent.
+//   - The *default* cap states no intent — it is this package's own guess at a
+//     safe value under a stock 1 MiB server. Against a server configured lower,
+//     it is simply too loose, so it is tightened to the server's limit. That can
+//     only turn an opaque write failure into a clear ErrPayloadTooLarge; it
+//     never rejects an entry the server would have accepted.
+func reconcilePayloadCap(nc *nats.Conn, c *config) error {
+	// A connection with no negotiated limit (not yet connected, or a server that
+	// advertises none) tells us nothing to reconcile against.
+	limit := nc.MaxPayload()
+	if limit <= 0 {
+		return nil
+	}
+
+	// A non-positive value is the documented way to switch the guard off
+	// entirely. That is a decision, not an absence of one, so it is left alone —
+	// tightening it here would silently re-enable a guard the caller disabled.
+	if c.maxPayloadBytes != 0 {
+		if int64(c.maxPayloadBytes) > limit {
+			return fmt.Errorf(
+				"%w: WithMaxPayloadBytes(%d) exceeds this server's max_payload (%d), which disables the guard it "+
+					"configures: an entry between the two would fail as an opaque write error instead of a clear one — "+
+					"lower it to at most %d",
+				ErrInvalidArgument, c.maxPayloadBytes, limit, limit)
+		}
+
+		return nil
+	}
+
+	if limit < store.DefaultMaxPayloadBytes {
+		c.maxPayloadBytes = int(limit)
 	}
 
 	return nil
@@ -331,8 +390,10 @@ func validateNodeTimeouts(flows map[string]*dsl.Flow, c *config) error {
 func validateConfig(c *config) error {
 	// The namespace prefixes every bucket, stream, subject and durable name; an
 	// unsafe one would otherwise fail much later with an opaque NATS error.
-	if c.prefix != "" && !resourceTokenPattern.MatchString(c.prefix) {
-		return fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
+	// Shared with the exported ValidateNamespace so an embedder pre-checking its
+	// own configuration cannot end up enforcing a different rule than this one.
+	if err := ValidateNamespace(c.prefix); err != nil {
+		return err
 	}
 
 	// The server validates a schedule only on the publish that installs it, and
@@ -805,6 +866,21 @@ func (s *Server) ScheduleFlow(ctx context.Context, name, flow, cronExpr string, 
 }
 
 // Signal sends an external signal to an execution.
+//
+// **An unknown execID is not an error here**, unlike [Server.Cancel] and
+// [Server.Resume]. A signal is allowed to race ahead of the [Server.Start] that
+// creates its target: the consumer redelivers it until the execution appears,
+// which is what makes "signal the order as soon as the webhook fires" safe
+// without coordinating against the start. Requiring existence at publish time
+// would trade that away.
+//
+// The cost is that a mistyped id also returns nil. It is not silently dropped —
+// after the delivery cap it lands in the dead-letter stream keyed
+// "<execID>/<name>", visible via [Server.RecentDeadLetters] — but the report is
+// asynchronous. A caller whose ids come from a human, rather than from a
+// concurrent Start, should [Server.Get] the execution first and decide for
+// itself; that check is a policy this package cannot make on its behalf without
+// breaking the race tolerance above.
 func (s *Server) Signal(ctx context.Context, execID, name string, payload json.RawMessage) error {
 	if err := s.Init(ctx); err != nil {
 		return err
@@ -816,6 +892,7 @@ func (s *Server) Signal(ctx context.Context, execID, name string, payload json.R
 // SignalWithID sends an external signal with a caller-supplied idempotency key.
 // Reusing the same key for the same execution/signal within the signal stream's
 // duplicate window collapses ambiguous publish retries into one stream entry.
+// Like [Server.Signal], it accepts an execution that does not exist yet.
 func (s *Server) SignalWithID(
 	ctx context.Context, execID, name, idempotencyKey string, payload json.RawMessage,
 ) error {
@@ -899,6 +976,11 @@ func (s *Server) FailActivity(
 // an async activity later settled via CompleteActivity — no-ops once the
 // execution is cancelled. A cancelled execution is terminal and, unlike a failed
 // one, cannot be resumed.
+//
+// An execID naming no execution returns [ErrNotFound]. That idempotence is about
+// *state*, not about the id: "already terminal, nothing to do" and "this id
+// names nothing" are opposite answers, and returning success for the second told
+// an operator their runaway execution had been stopped when it had not.
 func (s *Server) Cancel(ctx context.Context, execID, reason string) error {
 	if err := s.Init(ctx); err != nil {
 		return err
@@ -1237,7 +1319,7 @@ func (s *Server) startAsyncWorkers(ctx context.Context) *sync.WaitGroup {
 			exec = invoker.NewCacheKeyed(s.resultCacheKV, ai.exec, "w.")
 		}
 
-		w := asyncqueue.NewWorker(js, s.prefix, ai.kind, exec, s, append(ai.opts, asyncSink)...)
+		w := asyncqueue.NewWorker(js, s.prefix, ai.kind, exec, s, s.workerOptions(ai.opts, asyncSink)...)
 
 		wg.Add(1)
 
@@ -1251,6 +1333,32 @@ func (s *Server) startAsyncWorkers(ctx context.Context) *sync.WaitGroup {
 	}
 
 	return &wg
+}
+
+// workerOptions builds the option list for a hosted worker: this Server's own
+// derived defaults first, then the caller's options for the kind, then the
+// options the Server must own outright.
+//
+// Order carries the policy. Options are applied in sequence and last write wins,
+// so a value seeded here is a default the caller can override by passing the
+// same option to WithAsyncInvoker, while anything appended after ai.opts is not
+// negotiable.
+func (s *Server) workerOptions(kindOpts []asyncqueue.Option, owned ...asyncqueue.Option) []asyncqueue.Option {
+	opts := make([]asyncqueue.Option, 0, len(kindOpts)+len(owned)+1)
+
+	// A drain budget set on this Server governs the whole graceful shutdown, and
+	// the worker is part of that shutdown: Run waits for the workers to drain
+	// before returning (see the deferred wg.Wait), so a worker left on the
+	// package default outlasts the budget the caller set and Run returns late by
+	// however much the two differ. The caller configured one number for one
+	// shutdown; hosting two clocks for it is this package's problem, not theirs.
+	if s.cfg.drainTimeout > 0 {
+		opts = append(opts, asyncqueue.WithDrainTimeout(s.cfg.drainTimeout))
+	}
+
+	opts = append(opts, kindOpts...)
+
+	return append(opts, owned...)
 }
 
 // Close drains any registered task workers. It does not close the NATS

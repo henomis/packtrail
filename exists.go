@@ -53,9 +53,8 @@ import (
 // as in [WithNamespace]. An invalid namespace is an error rather than a false —
 // it is a caller mistake, not an answer about the cluster.
 func Exists(ctx context.Context, nc *nats.Conn, namespace string) (bool, error) {
-	if namespace != "" && !resourceTokenPattern.MatchString(namespace) {
-		return false, fmt.Errorf("%w: invalid namespace %q: must match [A-Za-z0-9_-]{1,64}",
-			ErrInvalidArgument, namespace)
+	if err := ValidateNamespace(namespace); err != nil {
+		return false, err
 	}
 
 	js, err := jetstream.New(nc)
@@ -75,4 +74,30 @@ func Exists(ctx context.Context, nc *nats.Conn, namespace string) (bool, error) 
 	}
 
 	return true, nil
+}
+
+// ValidateNamespace reports whether namespace is usable as a [WithNamespace]
+// prefix: it must match [A-Za-z0-9_-]{1,64}, since it becomes a segment of every
+// bucket, stream, consumer and subject name this package derives. An empty
+// namespace is valid and means the default namespace, exactly as in
+// [WithNamespace]. The returned error wraps [ErrInvalidArgument].
+//
+// [New] and [Exists] apply it themselves, so a caller that only builds a Server
+// never needs it. It is exported for a layer that takes a namespace from its own
+// configuration — where three things make an early check worth having: the rule
+// is enforced in more than one place here, a violation that slips past
+// construction reaches internal name derivation which *panics* rather than
+// returns, and such a layer usually wants to reject the value while it can still
+// name the setting the author wrote.
+//
+// A caller that composes a namespace from several parts (a deployment name and a
+// session, say) should validate the composed string, not the parts: two
+// individually-legal values can exceed the length bound once joined.
+func ValidateNamespace(namespace string) error {
+	if namespace != "" && !resourceTokenPattern.MatchString(namespace) {
+		return fmt.Errorf("%w: invalid namespace %q: must match [A-Za-z0-9_-]{1,64}",
+			ErrInvalidArgument, namespace)
+	}
+
+	return nil
 }

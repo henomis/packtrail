@@ -103,6 +103,19 @@ func (f *Flow) Validate() error {
 		return err
 	}
 
+	// After the fan-structure checks, deliberately: a flow whose fan is itself
+	// malformed (a fanout with no edge, a fanin joining a stranger) should be
+	// told that, not told about a stray route into one of its branches. These
+	// two fire on a fan that is otherwise sound — which is the dangerous case,
+	// because it is the one that runs.
+	if err := f.rejectBranchEntry(); err != nil {
+		return err
+	}
+
+	if err := f.rejectBranchExit(); err != nil {
+		return err
+	}
+
 	if err := f.rejectUnreachable(); err != nil {
 		return err
 	}
@@ -128,13 +141,32 @@ func (f *Flow) validateVersion() error {
 	}
 }
 
-// resolveGraph builds the edge map (f.next), marks every node with an inbound
-// transition — an explicit edge, or a node-internal transition (fanout branch,
-// fanin wait_for, choice rule target, signal on_timeout) — and determines the
-// unique start node (f.startID), the one node with no inbound transition. It
+// inboundRef records *what* gave a node an inbound transition: the node holding
+// the reference, and the field it was written in.
+//
+// The referrer is kept rather than a bare "is inbound" flag because it is the
+// only thing that makes a missing start node actionable. Every node having an
+// inbound transition is a statement about the whole graph; the author needs the
+// one reference to delete, and by the time the set is reduced to booleans that
+// information is gone. Only the first reference to a node is retained — it is
+// enough to name, and a node can legitimately have several.
+type inboundRef struct {
+	from  string // the node holding the reference
+	field string // "edge", "branch", "wait_for", "rule" or "on_timeout"
+}
+
+// String renders a reference the way the error messages quote it.
+func (r inboundRef) String() string {
+	return fmt.Sprintf("%s of %q", r.field, r.from)
+}
+
+// resolveGraph builds the edge map (f.next), records what gives every node an
+// inbound transition — an explicit edge, or a node-internal transition (fanout
+// branch, fanin wait_for, choice rule target, signal on_timeout) — and determines
+// the unique start node (f.startID), the one node with no inbound transition. It
 // rejects unknown/duplicate/self edges and a missing or ambiguous start node.
 func (f *Flow) resolveGraph() error {
-	inbound := make(map[string]bool)
+	inbound := make(map[string]inboundRef)
 
 	if err := f.buildEdges(inbound); err != nil {
 		return err
@@ -145,10 +177,18 @@ func (f *Flow) resolveGraph() error {
 	return f.determineStartNode(inbound)
 }
 
+// noteInbound records ref as what made id inbound, keeping the first reference
+// seen so the reported one is stable against map iteration order.
+func noteInbound(inbound map[string]inboundRef, id string, ref inboundRef) {
+	if _, seen := inbound[id]; !seen {
+		inbound[id] = ref
+	}
+}
+
 // buildEdges builds f.next from the explicit edges, recording each edge target
 // as inbound, and rejects an unknown endpoint, a self-edge (an advance loop with
 // no exit), or a node with more than one outgoing edge.
-func (f *Flow) buildEdges(inbound map[string]bool) error {
+func (f *Flow) buildEdges(inbound map[string]inboundRef) error {
 	f.next = make(map[string]string, len(f.Edges))
 
 	for _, e := range f.Edges {
@@ -178,7 +218,7 @@ func (f *Flow) buildEdges(inbound map[string]bool) error {
 		}
 
 		f.next[e.From] = e.To
-		inbound[e.To] = true
+		noteInbound(inbound, e.To, inboundRef{from: e.From, field: "edge"})
 	}
 
 	return nil
@@ -187,44 +227,58 @@ func (f *Flow) buildEdges(inbound map[string]bool) error {
 // markInternalInbound records nodes reachable only via a node-internal
 // transition (fanout branch, fanin wait_for, choice rule target, signal
 // on_timeout) as inbound, so they are not mistaken for start nodes.
-func (f *Flow) markInternalInbound(inbound map[string]bool) {
+func (f *Flow) markInternalInbound(inbound map[string]inboundRef) {
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 		switch n.Type {
 		case NodeFanout:
 			for _, b := range n.Branches {
-				inbound[b] = true
+				noteInbound(inbound, b, inboundRef{from: n.ID, field: "branch"})
 			}
 		case NodeFanin:
 			for _, w := range n.WaitFor {
-				inbound[w] = true
+				noteInbound(inbound, w, inboundRef{from: n.ID, field: "wait_for"})
 			}
 		case NodeChoice:
 			for _, r := range n.Rules {
-				inbound[r.To] = true
+				noteInbound(inbound, r.To, inboundRef{from: n.ID, field: "rule"})
 			}
 		case NodeSignal:
 			if n.OnTimeout != "" {
-				inbound[n.OnTimeout] = true
+				noteInbound(inbound, n.OnTimeout, inboundRef{from: n.ID, field: "on_timeout"})
 			}
 		}
 	}
 }
 
+// maxReportedRefs bounds how many "node ← reference" pairs a missing-start-node
+// error lists. Enough to see the loop that consumed the start in any hand-written
+// flow, short of pasting a large generated graph into an error message.
+const maxReportedRefs = 8
+
 // determineStartNode sets f.startID to the unique node with no inbound
 // transition, rejecting a flow with no start node or with more than one.
-func (f *Flow) determineStartNode(inbound map[string]bool) error {
+//
+// The no-start case names the reference that consumed each node, because the
+// bare fact is not actionable: the author knows which node was meant to start
+// the flow and needs to be told what routes into it. The shape that trips this
+// is an ordinary retry loop — "if the review says revise, go back to the
+// drafter" — where the drafter is the first node, and the fix is to loop back to
+// a later one instead.
+func (f *Flow) determineStartNode(inbound map[string]inboundRef) error {
 	var starts []string
 
 	for i := range f.Nodes {
-		if !inbound[f.Nodes[i].ID] {
+		if _, isInbound := inbound[f.Nodes[i].ID]; !isInbound {
 			starts = append(starts, f.Nodes[i].ID)
 		}
 	}
 
 	switch len(starts) {
 	case 0:
-		return fmt.Errorf("flow %q: no start node (every node has an inbound transition)", f.Name)
+		return fmt.Errorf(
+			"flow %q: no start node (exactly one node must have no inbound transition); every node is routed into: %s",
+			f.Name, f.describeInbound(inbound))
 	case 1:
 		f.startID = starts[0]
 	default:
@@ -232,6 +286,26 @@ func (f *Flow) determineStartNode(inbound map[string]bool) error {
 	}
 
 	return nil
+}
+
+// describeInbound renders "node ← reference" pairs in declaration order, so the
+// listing reads in the order the author wrote the flow.
+func (f *Flow) describeInbound(inbound map[string]inboundRef) string {
+	parts := make([]string, 0, len(f.Nodes))
+
+	for i := range f.Nodes {
+		if len(parts) == maxReportedRefs {
+			parts = append(parts, fmt.Sprintf("… and %d more", len(f.Nodes)-maxReportedRefs))
+			break
+		}
+
+		id := f.Nodes[i].ID
+		if ref, ok := inbound[id]; ok {
+			parts = append(parts, fmt.Sprintf("%q by the %s", id, ref))
+		}
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 // rejectUnreachable refuses flows containing nodes no execution can ever
@@ -426,6 +500,119 @@ func (f *Flow) validateFanMembership() error {
 	return nil
 }
 
+// branchOwners maps each fan-out branch id to the fanout that owns it.
+// validateFanMembership has already established that the mapping is
+// unambiguous — a node is a branch of at most one fanout — so callers after it
+// can treat the owner as definitive.
+func (f *Flow) branchOwners() map[string]string {
+	owners := map[string]string{}
+
+	for i := range f.Nodes {
+		n := &f.Nodes[i]
+		if n.Type != NodeFanout {
+			continue
+		}
+
+		for _, b := range n.Branches {
+			owners[b] = n.ID
+		}
+	}
+
+	return owners
+}
+
+// rejectBranchEntry refuses any ordinary routing transition into a fan-out
+// branch: an explicit edge, a choice rule target, or a signal's on_timeout.
+//
+// A branch is reached one way only — its fanout invokes it inline and the fanin
+// joins it. It has no successor of its own, so an execution that arrives there
+// by ordinary routing runs that single node and then has nowhere to advance to,
+// which the engine reports as **completed**. The fan-out, the join and
+// everything downstream are skipped, and the execution's terminal status says
+// the flow succeeded. That is the worst outcome this validator can permit: a
+// graph it accepted, silently doing a fraction of the work and calling it a
+// success. A wait_for reference is exempt — that is the fanin doing its job, and
+// validateFanAdjacency already checks it names a branch of its own fanout.
+func (f *Flow) rejectBranchEntry() error {
+	branchOwner := f.branchOwners()
+
+	for _, e := range f.Edges {
+		// The fanout reaches its branches through `branches`, never through an
+		// edge, so any edge into a branch is external — including one from the
+		// owning fanout itself, whose single edge must lead to the fanin.
+		if err := f.branchEntryError(branchOwner, e.From, "edge", e.To); err != nil {
+			return err
+		}
+	}
+
+	for i := range f.Nodes {
+		if err := f.rejectNodeBranchEntry(branchOwner, &f.Nodes[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// rejectNodeBranchEntry checks the routing a single node carries in its own
+// fields, as opposed to the flow's explicit edges.
+func (f *Flow) rejectNodeBranchEntry(branchOwner map[string]string, n *Node) error {
+	switch n.Type {
+	case NodeChoice:
+		for _, r := range n.Rules {
+			if err := f.branchEntryError(branchOwner, n.ID, "rule target", r.To); err != nil {
+				return err
+			}
+		}
+	case NodeSignal:
+		if n.OnTimeout != "" {
+			return f.branchEntryError(branchOwner, n.ID, "on_timeout", n.OnTimeout)
+		}
+	}
+
+	return nil
+}
+
+// branchEntryError reports the rejection when target names a fan-out branch, or
+// nil when it does not.
+func (f *Flow) branchEntryError(branchOwner map[string]string, from, field, target string) error {
+	owner, isBranch := branchOwner[target]
+	if !isBranch {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"flow %q: node %q: %s targets %q, a branch of fanout %q; a branch has no successor of its own, so the "+
+			"execution would stop there and report completed with the rest of the flow skipped — route to %q instead",
+		f.Name, from, field, target, owner, owner)
+}
+
+// rejectBranchExit refuses an outgoing edge from a fan-out branch.
+//
+// A branch never advances the execution — the fanin owns what happens after the
+// fan — so the edge is dead. It is rejected for the same reason a choice node's
+// outgoing edge is (see buildEdges): dead weight pollutes the reachability walk,
+// making a phantom target look reachable and masking the typo that reachability
+// check exists to catch. Silently ignoring it also reads, to the author, as a
+// branch that continues somewhere — which it does not.
+func (f *Flow) rejectBranchExit() error {
+	branchOwner := f.branchOwners()
+
+	for _, e := range f.Edges {
+		owner, isBranch := branchOwner[e.From]
+		if !isBranch {
+			continue
+		}
+
+		return fmt.Errorf(
+			"flow %q: node %q is a branch of fanout %q and has an outgoing edge to %q; a branch does not advance the "+
+				"execution (its fanin does), so the edge would never be taken — put it after the fanin instead",
+			f.Name, e.From, owner, e.To)
+	}
+
+	return nil
+}
+
 // rejectFanCycles refuses flows where a fanout or fanin node lies on a cycle.
 // Branch and join state is stored per execution, not per visit, so revisiting
 // a fanout would silently reuse the previous visit's settled branches instead
@@ -506,23 +693,51 @@ func (f *Flow) advanceSucc(id string) []string {
 }
 
 // validateTaskNode checks a task node's required transport and retry bounds.
+// validateRetryPolicy checks a task node's retry block: attempt bounds, a known
+// backoff kind, and that the two fields do not contradict each other.
+func (f *Flow) validateRetryPolicy(n *Node) error {
+	if n.Retry == nil {
+		return nil
+	}
+
+	if n.Retry.MaxAttempts < 0 || n.Retry.MaxAttempts > MaxRetryAttempts {
+		return fmt.Errorf("flow %q: task node %q: retry.max_attempts must be between 0 and %d",
+			f.Name, n.ID, MaxRetryAttempts)
+	}
+
+	backoff := strings.TrimSpace(n.Retry.Backoff)
+
+	switch backoff {
+	case "", BackoffFixed, BackoffLinear, BackoffExponential:
+	default:
+		return fmt.Errorf("flow %q: task node %q: unknown retry.backoff %q (want exponential, linear, or fixed)",
+			f.Name, n.ID, n.Retry.Backoff)
+	}
+
+	// A backoff with no max_attempts contradicts itself. attemptBudget reads
+	// max_attempts <= 0 as a single attempt, so the retry block disables the very
+	// retries it appears to configure — and it does so silently, at run time, on
+	// the first transient fault. The two statements cannot both be honoured, so
+	// neither is guessed at: defaulting the attempt count would be this engine
+	// inventing the caller's tolerance for re-running a node whose side effects
+	// it knows nothing about.
+	if backoff != "" && n.Retry.MaxAttempts == 0 {
+		return fmt.Errorf(
+			"flow %q: task node %q: retry declares backoff %q but no max_attempts, so it would run once and never "+
+				"retry; set retry.max_attempts (2 or more), or drop the retry block to accept the single attempt",
+			f.Name, n.ID, backoff)
+	}
+
+	return nil
+}
+
 func (f *Flow) validateTaskNode(n *Node) error {
 	if strings.TrimSpace(n.Subject) == "" && strings.TrimSpace(n.Target) == "" {
 		return fmt.Errorf("flow %q: task node %q: subject or target is required", f.Name, n.ID)
 	}
 
-	if n.Retry != nil && (n.Retry.MaxAttempts < 0 || n.Retry.MaxAttempts > MaxRetryAttempts) {
-		return fmt.Errorf("flow %q: task node %q: retry.max_attempts must be between 0 and %d",
-			f.Name, n.ID, MaxRetryAttempts)
-	}
-
-	if n.Retry != nil {
-		switch strings.TrimSpace(n.Retry.Backoff) {
-		case "", BackoffFixed, BackoffLinear, BackoffExponential:
-		default:
-			return fmt.Errorf("flow %q: task node %q: unknown retry.backoff %q (want exponential, linear, or fixed)",
-				f.Name, n.ID, n.Retry.Backoff)
-		}
+	if err := f.validateRetryPolicy(n); err != nil {
+		return err
 	}
 
 	// For the built-in nats-task kind the target becomes a NATS request

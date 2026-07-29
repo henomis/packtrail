@@ -280,6 +280,11 @@ func WithMaxDeliver(n int) Option { return func(c *config) { c.maxDeliver = n } 
 // naturally non-idempotent targets). Stragglers exceeding the window are cancelled
 // and their work redelivers. A hard crash is unaffected (it always relies on
 // redelivery). A non-positive value falls back to the 30s default.
+//
+// It bounds the whole graceful shutdown, not only the engine: [Server.Run] also
+// waits for the workers hosted by [WithAsyncInvoker] to drain, so this value is
+// applied to them as their default too. A kind that needs its own budget passes
+// asyncqueue.WithDrainTimeout to WithAsyncInvoker, which takes precedence.
 func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drainTimeout = d } }
 
 // WithMaxPayloadBytes caps the size of an execution's payload (default 512 KiB,
@@ -289,6 +294,12 @@ func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drain
 // KV write error. The default leaves headroom below NATS's 1 MiB max message
 // size for the rest of the execution document. Pass a negative value to disable
 // the guard; zero keeps the default.
+//
+// [New] reconciles the value against the connected server's max_payload, since a
+// cap above what the transport will carry disables the very guard it configures:
+// a value over that limit is rejected, and the *default* is tightened down to it
+// (the default states no intent — it assumes a stock 1 MiB server — so against a
+// smaller one it is simply too loose).
 func WithMaxPayloadBytes(n int) Option { return func(c *config) { c.maxPayloadBytes = n } }
 
 // WithMaxDocumentBytes caps the serialized size of an execution's control

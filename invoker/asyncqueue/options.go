@@ -91,16 +91,29 @@ func WithConcurrency(n int) Option {
 
 // WithActivityTimeout sets the ceiling/backstop for each invocation the Worker
 // runs (default 5m). A node's own per-call timeout tightens this when shorter;
-// the effective bound is min(node timeout, activityTimeout). A node timeout
-// longer than this ceiling is capped at it, so raise this when nodes legitimately
-// need longer calls. The ack window is extended by heartbeats for the whole
-// duration.
+// the effective bound is min(node timeout, activityTimeout). A node that
+// declares no timeout runs at the full ceiling. The ack window is extended by
+// heartbeats for the whole duration.
+//
+// A node timeout *longer* than this ceiling is a contradiction, not a request:
+// packtrail rejects it at New rather than capping it at run time, since the
+// silent cap turned a step that asked for an hour into a five-minute call and
+// said so only in a log line. Raise this ceiling when nodes legitimately need
+// longer calls.
 func WithActivityTimeout(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
 			c.activityTimeout = d
 		}
 	}
+}
+
+// ActivityTimeout reports the ceiling a set of options resolves to, including
+// the default when none of them set it. It lets the layer that owns both the
+// flow definitions and these options — packtrail.New — compare a node's declared
+// timeout against the ceiling it would run under, before anything runs.
+func ActivityTimeout(opts ...Option) time.Duration {
+	return newConfig(opts).activityTimeout
 }
 
 // WithAckWait sets the job ack window, extended by heartbeats while a job runs

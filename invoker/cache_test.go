@@ -270,6 +270,54 @@ func TestCacheDoesNotCacheTransportError(t *testing.T) {
 	}
 }
 
+// TestCacheDoesNotCacheRetry: an in-band StatusRetry must leave the attempt
+// re-invokable, exactly like a returned error.
+//
+// Caching it froze a transient fault for the entry's TTL: the redelivery that
+// exists to re-attempt the call was served the stored failure, so a blip that
+// would have cleared on the next try could not. It also split the two spellings
+// of "try again" — a returned error retried, an in-band retry did not.
+func TestCacheDoesNotCacheRetry(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-retry"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	delegate := invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
+		if calls.Add(1) == 1 {
+			return invoker.Result{Status: invoker.StatusRetry, Error: "agent unreachable"}, nil
+		}
+
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+	req := invoker.Request{ExecutionID: "exec-retry", NodeID: "n", Attempt: 0}
+
+	res, err := cache.Invoke(ctx, req)
+	if err != nil || res.Status != invoker.StatusRetry {
+		t.Fatalf("first call = (%+v, %v), want an in-band retry", res, err)
+	}
+
+	// Same attempt, as a redelivery would: the delegate must run again.
+	res, err = cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if res.Status != invoker.StatusOK {
+		t.Fatalf("second call status = %q, want ok — the retry was served from cache", res.Status)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("delegate called %d times, want 2 (retry not cached)", got)
+	}
+}
+
 // TestCacheConcurrentSameAttemptSingleDelegate covers the atomic miss path: many
 // concurrent callers for the same attempt must not all observe a miss and execute
 // side effects before any of them stores the result.

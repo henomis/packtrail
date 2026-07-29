@@ -40,6 +40,7 @@ import (
 	"github.com/nats-io/nuid"
 
 	"github.com/henomis/packtrail/internal/dsl"
+	"github.com/henomis/packtrail/internal/invocation"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/rules"
 	"github.com/henomis/packtrail/internal/scheduler"
@@ -123,6 +124,10 @@ type Config struct {
 	DefaultTimeout time.Duration // task timeout when a node omits one (default 30s)
 	MaxDeliver     int           // max deliveries of a work item before dead-lettering (default 10)
 	DrainTimeout   time.Duration // max time a graceful shutdown waits for in-flight work (default 30s)
+	// AsyncKinds names the invoker kinds that dispatch to a durable queue rather
+	// than running the call inline. DefaultTimeout is not substituted for those:
+	// see Engine.invoke.
+	AsyncKinds map[string]bool
 }
 
 // Engine processes executions for a set of flows.
@@ -140,6 +145,9 @@ type Engine struct {
 
 	onReconcileActive func(context.Context) error // optional cheap active-set reconcile hook
 	onReconcileFull   func(context.Context) error // optional authoritative full reconcile hook
+	// onResolveStartNode answers "where does this flow begin" for a flow this
+	// instance did not load. Optional; nil means only loaded flows can be started.
+	onResolveStartNode func(context.Context, string) (string, error)
 
 	sem chan struct{}
 
@@ -403,6 +411,38 @@ func (e *Engine) StartWithID(ctx context.Context, execID, flowName string, paylo
 	return e.start(ctx, execID, flowName, payload)
 }
 
+// startNode resolves the node a new execution of flowName begins at.
+//
+// It is the *only* thing starting an execution needs from a flow definition:
+// everything else — the payload, the archived-start check, the execution
+// document, its first work item, the CAS create — is flow-independent, and the
+// engine that later drives the execution reads the definition itself.
+//
+// A flow this instance loaded answers from memory. Otherwise the optional
+// resolver answers, which is what lets a process holding only a namespace start
+// a flow it does not have the source of; without one, an unloaded flow is
+// unknown, as it has always been.
+func (e *Engine) startNode(ctx context.Context, flowName string) (string, error) {
+	if flow, ok := e.flows[flowName]; ok {
+		return flow.StartNode(), nil
+	}
+
+	if e.onResolveStartNode == nil {
+		return "", fmt.Errorf("unknown flow %q", flowName)
+	}
+
+	node, err := e.onResolveStartNode(ctx, flowName)
+	if err != nil {
+		return "", err
+	}
+
+	if node == "" {
+		return "", fmt.Errorf("unknown flow %q", flowName)
+	}
+
+	return node, nil
+}
+
 // execIDPattern bounds caller-supplied execution ids to characters safe as a
 // single NATS subject token and KV key.
 var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -461,9 +501,9 @@ func requireObjectPayload(payload json.RawMessage) error {
 // (store.ErrAlreadyExists) is treated as idempotent success: the existing
 // execution's id is returned without re-creating or re-enqueueing it.
 func (e *Engine) start(ctx context.Context, id, flowName string, payload json.RawMessage) (string, error) {
-	flow, flowOK := e.flows[flowName]
-	if !flowOK {
-		return "", fmt.Errorf("unknown flow %q", flowName)
+	startNode, err := e.startNode(ctx, flowName)
+	if err != nil {
+		return "", err
 	}
 
 	payload, payloadHash, err := prepareStartPayload(payload)
@@ -493,7 +533,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 		ID:             id,
 		FlowName:       flowName,
 		InputHash:      payloadHash,
-		CurrentNode:    flow.StartNode(),
+		CurrentNode:    startNode,
 		Status:         store.StatusRunning,
 		NodeGeneration: 1,
 	}
@@ -834,6 +874,18 @@ func (e *Engine) OnReconcileActive(fn func(context.Context) error) { e.onReconci
 // ignored.
 func (e *Engine) OnReconcileFull(fn func(context.Context) error) { e.onReconcileFull = fn }
 
+// OnResolveStartNode registers the fallback that answers "which node does this
+// flow begin at" for a flow this instance did not load, so a process holding
+// only a namespace can still start one. Optional; if unset, starting an unloaded
+// flow fails as before.
+//
+// Starting is the only operation that needs the flow definition at all — and it
+// needs exactly this one field of it (see start). Every other write settles work
+// the engine that owns the flow is already driving.
+func (e *Engine) OnResolveStartNode(fn func(context.Context, string) (string, error)) {
+	e.onResolveStartNode = fn
+}
+
 // ScheduleReconcileActive installs the recurring active-set reconcile schedule
 // on the given 6-field cron expression ("sec min hour dom mon dow"), e.g.
 // "0 */5 * * * *". Pair it with OnReconcileActive.
@@ -849,18 +901,18 @@ func (e *Engine) ScheduleReconcileFull(ctx context.Context, cronExpr string) err
 }
 
 // assembleContext builds the invocation context an Invoker (or a choice rule)
-// sees — {"input": …, "results": {node: output, …}, "signals": {name: payload,
-// …}, "branches": {branch: output, …}, "last_node": "…"} — by reading the
-// execution's data-plane entries: the start input, every settled node output
-// (Outputs), and every received signal (LastSeq keys). A missing entry
-// (archived/pruned) is skipped rather than failing the assembly.
+// sees — an invocation.Context, re-exported as packtrail.InvocationContext — by
+// reading the execution's data-plane entries: the start input, every settled
+// node output (Outputs), and every received signal (LastSeq keys). A missing
+// entry (archived/pruned) is skipped rather than failing the assembly.
 //
-// Two navigation aids come with the raw maps, because results alone is
+// Three navigation aids come with the raw maps, because results alone is
 // unordered: last_node is the id of the most recently settled output (chain
-// flows read "the previous step's result" as results[last_node]), and branches
-// is the subset of results produced by the current fan's branches (a node
-// after a join reads its inputs there; whether the join just happened is
-// last_node ∈ branches).
+// flows read "the previous step's result" as results[last_node]); branches is
+// the subset of results produced by the fan currently being joined (a node after
+// a join reads its inputs there; whether the join just happened is last_node ∈
+// branches); and released_by names the signal that released the wait this node
+// followed, since a signal node has no output to be last_node.
 func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json.RawMessage, error) {
 	in, err := e.store.GetPayload(ctx, store.InputKey(ex.ID))
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -881,26 +933,77 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 		in = json.RawMessage("{}")
 	}
 
-	branches := map[string]json.RawMessage{}
-
-	for b := range ex.Branches {
-		if out, ok := results[b]; ok {
-			branches[b] = out
-		}
-	}
-
 	lastNode := ""
 	if len(ex.Outputs) > 0 {
 		lastNode = ex.Outputs[len(ex.Outputs)-1]
 	}
 
-	return json.Marshal(struct {
-		Input    json.RawMessage            `json:"input"`
-		Results  map[string]json.RawMessage `json:"results"`
-		Signals  map[string]json.RawMessage `json:"signals"`
-		Branches map[string]json.RawMessage `json:"branches"`
-		LastNode string                     `json:"last_node"`
-	}{Input: in, Results: results, Signals: signals, Branches: branches, LastNode: lastNode})
+	return json.Marshal(invocation.Context{
+		Input:      in,
+		Results:    results,
+		Signals:    signals,
+		Branches:   currentFanBranches(ex, results),
+		LastNode:   lastNode,
+		ReleasedBy: releasedBy(ex),
+	})
+}
+
+// currentFanBranches returns the outputs of the fan currently being joined,
+// keyed by branch node id.
+//
+// ex.Branches accumulates: ensurePendingBranches only ever adds entries, and
+// nothing removes a fan's entries once its join has settled — the engine still
+// consults them to recognise a late branch completion as stale. Copying the map
+// wholesale therefore handed a flow with two sequential fan-outs all four branch
+// outputs at the second join, with no way for the invoker to tell this fan's
+// replies from the previous fan's.
+//
+// The fan is identified by generation: every branch of one fan-out is seeded
+// with that fan-out's visit generation, and NodeGeneration only ever increases,
+// so the highest generation present is the most recent fan. That is the fan
+// being joined at the fanin and at the node after it, which is where branches is
+// read. Earlier fans stay reachable in full through results.
+func currentFanBranches(ex *store.Execution, results map[string]json.RawMessage) map[string]json.RawMessage {
+	branches := map[string]json.RawMessage{}
+
+	var current uint64
+
+	for _, bs := range ex.Branches {
+		if bs.Generation > current {
+			current = bs.Generation
+		}
+	}
+
+	for b, bs := range ex.Branches {
+		// Generation 0 predates per-branch generations (a document written by an
+		// older engine). Include those rather than hiding a live fan's outputs
+		// from an execution that is mid-flight across an upgrade.
+		if bs.Generation != current && bs.Generation != 0 {
+			continue
+		}
+
+		if out, ok := results[b]; ok {
+			branches[b] = out
+		}
+	}
+
+	return branches
+}
+
+// releasedBy returns the name of the signal that released the wait this node was
+// advanced from, or "" for every other node.
+//
+// Signal nodes contribute no output, so an awaiting node can never be last_node
+// and an invoker had no way to tell which signal released it — or whether one
+// did at all. The name is recorded with the generation it advanced to, so it is
+// reported only while that node is current: a later node reads "" rather than
+// inheriting a release it had nothing to do with.
+func releasedBy(ex *store.Execution) string {
+	if ex.ReleasedBy == "" || ex.ReleasedGeneration != ex.NodeGeneration {
+		return ""
+	}
+
+	return ex.ReleasedBy
 }
 
 func (e *Engine) loadOutputPayloads(
@@ -2447,6 +2550,36 @@ func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 // that know which node produced the failure should prefer failNode.
 func (e *Engine) fail(ctx context.Context, execID, reason string) error {
 	return e.failNode(ctx, execID, "", reason)
+}
+
+// FailActivity settles a parked asynchronous node as failed.
+//
+// It is the async counterpart of what deadLetter does for the engine's own work
+// consumer: before a poisoned item is dropped, the execution it was driving is
+// settled, so no drop can leave an execution parked on a completion that will
+// never arrive. An async worker calls it when it is about to dead-letter a job —
+// the delivery cap is spent, the completion is permanently rejected, or the job
+// goroutine panicked — since after the drop nothing else will ever settle that
+// node: the stall watchdog deliberately excludes async waits, because a
+// legitimate one may run arbitrarily long.
+//
+// Deliberately guarded on (node, generation, attempt): a Term for a job from an
+// earlier visit of a node the flow legally cycles through must not fail the
+// visit currently in flight. A guard miss is a silent no-op, as everywhere else.
+//
+// It does not consult the flow, which is what makes it work for the case that
+// produces most stranding: an engine that no longer knows the flow (renamed or
+// removed across a rolling deploy) rejects the completion as terminal, and
+// failing an execution needs no graph.
+//
+// The resulting state is failed rather than cancelled on purpose: a failed
+// execution is resumable, so an operator who fixes the deploy can Resume the
+// node with a fresh retry budget instead of only being able to Cancel and lose
+// the work.
+func (e *Engine) FailActivity(
+	ctx context.Context, execID, node string, generation uint64, attempt int, reason string,
+) error {
+	return e.failNodeGuarded(ctx, execID, node, generation, attempt, reason)
 }
 
 // maxFailReasonBytes caps the failure reason stored on the execution document.

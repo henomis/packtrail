@@ -29,14 +29,26 @@ import (
 	"github.com/henomis/packtrail/internal/store"
 )
 
-// FlowGraph is the static structure of a flow, for visualisation. It is
-// published to a KV registry at startup so observability tools can render a flow
-// without its source YAML.
+// FlowGraph is the static structure of a flow. It is published to a KV registry
+// at startup so a process without the source YAML can render a flow — and, via
+// Start, begin one.
 type FlowGraph struct {
-	Version string      `json:"version,omitempty"`
-	Name    string      `json:"name"`
-	Nodes   []GraphNode `json:"nodes"`
-	Edges   []GraphEdge `json:"edges"`
+	Version string `json:"version,omitempty"`
+	Name    string `json:"name"`
+	// Start is the node an execution of this flow begins at: the unique node
+	// with no inbound transition.
+	//
+	// It is published rather than left to be re-derived, because deriving it
+	// means reproducing the flow validator's notion of "inbound" — explicit
+	// edges plus fanout branches, fanin wait_for, choice rule targets and signal
+	// on_timeout — a copy that could silently disagree with the engine's. It is
+	// what lets a process that loaded no flows start one; see [Server.Start].
+	//
+	// Empty in registry entries written before this field existed. Every engine
+	// republishes its flows on startup, so those heal on the next restart.
+	Start string      `json:"start,omitempty"`
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
 }
 
 // GraphNode is one node of a FlowGraph. Fields are type-specific; empty ones are
@@ -109,7 +121,7 @@ func (s *Server) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 
 // buildFlowGraph projects a parsed flow into its public, serialisable graph.
 func buildFlowGraph(f *dsl.Flow) FlowGraph {
-	g := FlowGraph{Version: f.Version, Name: f.Name}
+	g := FlowGraph{Version: f.Version, Name: f.Name, Start: f.StartNode()}
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 

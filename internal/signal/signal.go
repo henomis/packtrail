@@ -52,6 +52,10 @@ type Signals struct {
 	stream    string
 	prefix    string // subject prefix, followed by "<execID>.<signalName>"
 	retention time.Duration
+	// managed records whether the embedder asked to control retention at all.
+	// Without it, "use the default" and "leave alone whatever is already there"
+	// are the same value — see EnsureStream for why that distinction matters.
+	managed bool
 }
 
 // New returns a Signals bound to the given JetStream context and namespace, with
@@ -62,14 +66,15 @@ func New(js jetstream.JetStream, n names.Names) *Signals {
 
 // SetRetention overrides the signals-stream MaxAge applied by EnsureStream. A
 // positive duration bounds how long an undelivered signal survives; a negative
-// value disables the age limit; zero keeps the current (default) value. Call
-// before EnsureStream.
+// value disables the age limit; zero leaves retention unmanaged, so EnsureStream
+// keeps whatever the stream already has (and applies the default only when
+// creating it). Call before EnsureStream.
 func (s *Signals) SetRetention(d time.Duration) {
 	switch {
 	case d > 0:
-		s.retention = d
+		s.retention, s.managed = d, true
 	case d < 0:
-		s.retention = 0 // no MaxAge
+		s.retention, s.managed = 0, true // no MaxAge
 	}
 }
 
@@ -77,16 +82,42 @@ func (s *Signals) SetRetention(d time.Duration) {
 func (s *Signals) Subject(execID, name string) string { return s.prefix + execID + "." + name }
 
 // EnsureStream creates the signals stream if it does not exist.
+//
+// Retention is only asserted when the embedder actually configured it. The
+// underlying call is CreateOrUpdate, so a process that never set a retention
+// would otherwise write the default MaxAge over a running engine's tuned one
+// every time it provisions — and every namespace-only client provisions, since
+// reading state, starting a flow and sending a signal all initialise the same
+// resources. The symptom is silent and delayed: a fleet configured to hold
+// undelivered signals for a month starts dropping them after the default, the
+// next time anyone runs a read-only command against its namespace. Unmanaged,
+// the existing MaxAge is carried forward; on creation there is nothing to carry,
+// so the default applies as before.
 func (s *Signals) EnsureStream(ctx context.Context) error {
-	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:       s.stream,
-		Subjects:   []string{s.prefix + ">"},
-		Storage:    jetstream.FileStorage,
-		Retention:  jetstream.LimitsPolicy,
-		MaxAge:     s.retention,
-		Duplicates: dedupWindow(s.retention),
-	})
-	if err != nil {
+	cfg := jetstream.StreamConfig{
+		Name:      s.stream,
+		Subjects:  []string{s.prefix + ">"},
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    s.retention,
+	}
+
+	if !s.managed {
+		existing, err := s.js.Stream(ctx, s.stream)
+
+		switch {
+		case err == nil:
+			cfg.MaxAge = existing.CachedInfo().Config.MaxAge
+		case !errors.Is(err, jetstream.ErrStreamNotFound):
+			return fmt.Errorf("signals stream: %w", err)
+		}
+	}
+
+	// Kept consistent with whichever MaxAge won: the dedup window must not
+	// outlive the messages it is deduplicating.
+	cfg.Duplicates = dedupWindow(cfg.MaxAge)
+
+	if _, err := s.js.CreateOrUpdateStream(ctx, cfg); err != nil {
 		return fmt.Errorf("signals stream: %w", err)
 	}
 

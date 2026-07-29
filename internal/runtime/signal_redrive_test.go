@@ -174,7 +174,7 @@ func TestGuardedAdvanceFlushFailureLeavesDurableOutbox(t *testing.T) {
 	realJS := eng.js
 	eng.js = &failPublishJS{JetStream: realJS}
 
-	if err := eng.guardedAdvance(ctx, "sig-flushfail-1", "gate", 0, "go", "work"); err == nil {
+	if err := eng.guardedAdvance(ctx, "sig-flushfail-1", "gate", 0, "go", "work", signalArrived); err == nil {
 		t.Fatal("guardedAdvance with broken publish returned nil, want the flush error surfaced")
 	}
 
@@ -236,7 +236,7 @@ func TestGuardedAdvanceRejectsStaleGeneration(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if err := eng.guardedAdvance(ctx, exec.ID, "gate", 1, "go", "work"); err != nil {
+	if err := eng.guardedAdvance(ctx, exec.ID, "gate", 1, "go", "work", signalArrived); err != nil {
 		t.Fatalf("stale guardedAdvance: %v", err)
 	}
 
@@ -252,7 +252,7 @@ func TestGuardedAdvanceRejectsStaleGeneration(t *testing.T) {
 		t.Fatalf("after stale guardedAdvance = %+v, want unchanged signal wait", afterStale)
 	}
 
-	if err = eng.guardedAdvance(ctx, exec.ID, "gate", 2, "go", "work"); err != nil {
+	if err = eng.guardedAdvance(ctx, exec.ID, "gate", 2, "go", "work", signalArrived); err != nil {
 		t.Fatalf("fresh guardedAdvance: %v", err)
 	}
 

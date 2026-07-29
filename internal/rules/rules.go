@@ -31,20 +31,17 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/vm"
+
+	"github.com/henomis/packtrail/internal/invocation"
 )
 
-// compileEnv declares the variables an expression may reference; they mirror
-// the top-level fields of the assembled invocation context document. last_node
-// is the id of the most recently settled output, so "the previous step's
-// result" is results[last_node]; branches holds the current fan's outputs.
+// compileEnv declares the variables an expression may reference. They are the
+// top-level fields of the assembled invocation context document, taken from the
+// one declaration of it (invocation.Env) rather than restated here — a rule
+// referencing a variable the document does not carry evaluates to nil, and a
+// nil comparison routes to the default branch silently.
 func compileEnv() map[string]any {
-	return map[string]any{
-		"input":     map[string]any{},
-		"results":   map[string]any{},
-		"signals":   map[string]any{},
-		"branches":  map[string]any{},
-		"last_node": "",
-	}
+	return invocation.Env()
 }
 
 // Program is a compiled choice expression.

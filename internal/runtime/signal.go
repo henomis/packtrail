@@ -126,7 +126,7 @@ func parkOrConsumeSignal(
 	// payload in the data plane) — consume it in this same CAS write
 	// instead of parking.
 	if ex.Signals[name] {
-		consumeSignal(ex, name, next)
+		consumeSignal(ex, name, next, signalArrived)
 
 		if next != "" {
 			ex.AppendWork(advanceItem)
@@ -270,7 +270,7 @@ func (e *Engine) onWaitTimeout(ctx context.Context, flow *dsl.Flow, exec *store.
 			"signal "+node.SignalName+" timed out")
 	}
 
-	return e.guardedAdvance(ctx, exec.ID, wi.Node, wi.Generation, wi.Signal, node.OnTimeout)
+	return e.guardedAdvance(ctx, exec.ID, wi.Node, wi.Generation, wi.Signal, node.OnTimeout, signalTimedOut)
 }
 
 func (e *Engine) failSignalTimeout(
@@ -310,14 +310,17 @@ func (e *Engine) failSignalTimeout(
 func (e *Engine) transitionFromSignal(
 	ctx context.Context, flow *dsl.Flow, execID, signalNodeID string, generation uint64, name string,
 ) error {
-	return e.guardedAdvance(ctx, execID, signalNodeID, generation, name, flow.Successor(signalNodeID))
+	return e.guardedAdvance(ctx, execID, signalNodeID, generation, name, flow.Successor(signalNodeID), signalArrived)
 }
 
 // guardedAdvance atomically advances an execution out of a signal wait, but only
 // if it is still waiting on (signalNodeID, name). This makes signal arrival and
 // timeout mutually exclusive: whichever applies first wins, the other no-ops.
+// outcome says which of the two won, so only an arrival is reported downstream
+// as the release.
 func (e *Engine) guardedAdvance(
 	ctx context.Context, execID, signalNodeID string, generation uint64, name, nextNode string,
+	outcome signalOutcome,
 ) error {
 	var item json.RawMessage
 
@@ -329,7 +332,7 @@ func (e *Engine) guardedAdvance(
 			return errSkip // guard failed: leave unchanged
 		}
 
-		consumeSignal(ex, name, nextNode)
+		consumeSignal(ex, name, nextNode, outcome)
 
 		if nextNode != "" {
 			data, itemErr := advanceWorkItem(execID, nextNode, ex.NodeGeneration, 0, time.Time{})
@@ -356,13 +359,24 @@ func (e *Engine) guardedAdvance(
 	return e.flushOutbox(ctx, updated)
 }
 
+// signalOutcome says why a signal wait ended. Both outcomes leave the node the
+// same way, but only an arrival is a *release*: a wait that timed out routes to
+// on_timeout carrying no payload, so reporting it as released_by would tell the
+// next node a signal it never received had arrived.
+type signalOutcome int
+
+const (
+	signalArrived signalOutcome = iota
+	signalTimedOut
+)
+
 // consumeSignal applies a stored signal to the execution within a Mutate
 // callback: it clears the wait state and the received-marker and advances to
 // nextNode (or completes the execution when nextNode is empty). The payload
 // itself lives in the data plane and stays readable (signals.<name> in the
 // assembled context). Shared by guardedAdvance (signal arrival / timeout) and
 // stepSignal's early-delivery consumption.
-func consumeSignal(ex *store.Execution, name, nextNode string) {
+func consumeSignal(ex *store.Execution, name, nextNode string, outcome signalOutcome) {
 	ex.WaitSignal = ""
 	ex.Attempt = 0
 	ex.Activity = nil        // see advanceTo: a stale stash must not survive the move
@@ -373,9 +387,18 @@ func consumeSignal(ex *store.Execution, name, nextNode string) {
 	if nextNode == "" {
 		ex.Status = store.StatusCompleted
 		ex.CurrentNode = ""
-	} else {
-		ex.Status = store.StatusRunning
-		ex.CurrentNode = nextNode
-		ex.NodeGeneration++
+
+		return
+	}
+
+	ex.Status = store.StatusRunning
+	ex.CurrentNode = nextNode
+	ex.NodeGeneration++
+
+	if outcome == signalArrived {
+		// Recorded against the generation just entered, so assembleContext
+		// reports it for this node only. Nothing has to clear it later.
+		ex.ReleasedBy = name
+		ex.ReleasedGeneration = ex.NodeGeneration
 	}
 }

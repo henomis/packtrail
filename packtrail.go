@@ -235,6 +235,12 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		return nil, err
 	}
 
+	// A node timeout above its invoker's ceiling contradicts itself: caught here
+	// rather than capped, silently, on the first call.
+	if err = validateNodeTimeouts(flows, &c); err != nil {
+		return nil, err
+	}
+
 	n := names.New(c.prefix)
 
 	return &Server{
@@ -281,11 +287,69 @@ func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 	return nil
 }
 
+// validateNodeTimeouts rejects a node whose declared timeout exceeds the
+// ceiling it would actually run under.
+//
+// The async worker used to cap such a node silently — a step asking for an hour
+// under a five-minute activity timeout ran for five minutes, announced only in a
+// log line at the moment of truncation. The two numbers live in different
+// layers (a flow definition and an invoker option) and nothing compared them,
+// so the author's stated intent could be reduced by an order of magnitude
+// without anything failing. They are both known here, before anything runs, and
+// a contradiction between them is a configuration error: the flow says one
+// thing, the invoker another, and no reading of the pair is safe to guess.
+func validateNodeTimeouts(flows map[string]*dsl.Flow, c *config) error {
+	ceilings := make(map[string]time.Duration, len(c.asyncInvokers))
+	for _, ai := range c.asyncInvokers {
+		ceilings[ai.kind] = asyncqueue.ActivityTimeout(ai.opts...)
+	}
+
+	for _, f := range flows {
+		for i := range f.Nodes {
+			n := &f.Nodes[i]
+
+			declared := n.Timeout.D()
+			if declared <= 0 {
+				continue // no timeout: the ceiling governs, nothing to contradict
+			}
+
+			ceiling, async := ceilings[n.InvokerKind()]
+			if !async || declared <= ceiling {
+				continue
+			}
+
+			return fmt.Errorf(
+				"flow %q: node %q declares timeout %s, above the %s activity timeout of invoker kind %q — "+
+					"it would be silently capped; raise WithActivityTimeout or lower the node timeout",
+				f.Name, n.ID, declared, ceiling, n.InvokerKind())
+		}
+	}
+
+	return nil
+}
+
 func validateConfig(c *config) error {
 	// The namespace prefixes every bucket, stream, subject and durable name; an
 	// unsafe one would otherwise fail much later with an opaque NATS error.
 	if c.prefix != "" && !resourceTokenPattern.MatchString(c.prefix) {
 		return fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
+	}
+
+	// The server validates a schedule only on the publish that installs it, and
+	// that publish happens inside the engine goroutine once the deployment is
+	// already up. Without this, a typo'd cron started fine and then took the
+	// engine down later with an opaque failure.
+	for _, rc := range []struct{ option, expr string }{
+		{"WithReconcileActive", c.reconcileActiveCron},
+		{"WithReconcileFull", c.reconcileFullCron},
+	} {
+		if rc.expr == "" {
+			continue
+		}
+
+		if err := ValidateCron(rc.expr); err != nil {
+			return fmt.Errorf("%s: %w", rc.option, err)
+		}
 	}
 
 	syncKinds := make(map[string]bool, len(c.invokers))
@@ -427,13 +491,14 @@ func (s *Server) Init(ctx context.Context) error {
 		DefaultTimeout: s.cfg.defaultTimeout,
 		MaxDeliver:     s.cfg.maxDeliver,
 		DrainTimeout:   s.cfg.drainTimeout,
+		AsyncKinds:     s.cfg.asyncKinds(),
 	})
 	if err != nil {
 		return err
 	}
 
-	// Publish each flow's graph to a KV registry so observability tools (e.g.
-	// packtrail-ui) can render flows without access to the source YAML.
+	// Publish each flow's graph to a KV registry so a process without the source
+	// YAML can render flows (packtrail-ui) and start them (see Server.Start).
 	flowsKV, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: s.names.BucketFlows})
 	if err != nil {
 		return fmt.Errorf("flows bucket: %w", err)
@@ -442,6 +507,13 @@ func (s *Server) Init(ctx context.Context) error {
 	if err = publishFlowGraphs(ctx, flowsKV, s.flowDefs); err != nil {
 		return err
 	}
+
+	// Starting a flow this instance did not load reads its start node from that
+	// same registry. The hook is installed unconditionally: an engine that loaded
+	// the flow answers from memory and never reaches it.
+	eng.OnResolveStartNode(func(ctx context.Context, name string) (string, error) {
+		return startNodeFromRegistry(ctx, flowsKV, name)
+	})
 
 	s.store = st
 	s.engine = eng
@@ -514,6 +586,85 @@ func compileChoiceRules(flows map[string]*dsl.Flow) error {
 
 // publishFlowGraphs writes each flow's graph to the KV registry so observability
 // tools (e.g. packtrail-ui) can render flows without access to the source YAML.
+// startNodeFromRegistry reads a flow's start node from the published flow
+// registry, for starting a flow this instance did not load.
+//
+// A flow absent from the registry is reported as unknown, matching what an
+// engine says about a flow it never loaded — a caller cannot tell (and need not
+// care) which of the two applies.
+func startNodeFromRegistry(ctx context.Context, flowsKV jetstream.KeyValue, name string) (string, error) {
+	entry, err := flowsKV.Get(ctx, name)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return "", fmt.Errorf("unknown flow %q", name)
+		}
+
+		return "", err
+	}
+
+	var g FlowGraph
+	if err = json.Unmarshal(entry.Value(), &g); err != nil {
+		return "", fmt.Errorf("flow %q: unreadable registry entry: %w", name, err)
+	}
+
+	if g.Start != "" {
+		return g.Start, nil
+	}
+
+	// The entry predates FlowGraph.Start. Derive it the way the validator does,
+	// so an upgrade does not have to wait for every engine to restart and
+	// republish. The published graph carries every transition kind the derivation
+	// needs.
+	return deriveStartNode(g)
+}
+
+// deriveStartNode finds the unique node with no inbound transition, mirroring
+// dsl.Flow.determineStartNode over a published graph. It exists only for
+// registry entries written before the start node was published; a graph that
+// does not yield exactly one start node is reported rather than guessed at,
+// since starting at the wrong node would run the flow from the middle.
+func deriveStartNode(g FlowGraph) (string, error) {
+	inbound := make(map[string]bool, len(g.Nodes))
+
+	for _, e := range g.Edges {
+		inbound[e.To] = true
+	}
+
+	for _, n := range g.Nodes {
+		for _, b := range n.Branches {
+			inbound[b] = true
+		}
+
+		for _, w := range n.WaitFor {
+			inbound[w] = true
+		}
+
+		for _, r := range n.Rules {
+			inbound[r.To] = true
+		}
+
+		if n.OnTimeout != "" {
+			inbound[n.OnTimeout] = true
+		}
+	}
+
+	var starts []string
+
+	for _, n := range g.Nodes {
+		if !inbound[n.ID] {
+			starts = append(starts, n.ID)
+		}
+	}
+
+	if len(starts) != 1 {
+		return "", fmt.Errorf(
+			"flow %q: cannot determine the start node from the published graph (found %v); "+
+				"restart an engine that loads this flow to republish it", g.Name, starts)
+	}
+
+	return starts[0], nil
+}
+
 func publishFlowGraphs(ctx context.Context, flowsKV jetstream.KeyValue, flows map[string]*dsl.Flow) error {
 	for name, f := range flows {
 		data, marshalErr := json.Marshal(buildFlowGraph(f))
@@ -586,6 +737,23 @@ func (s *Server) Handle(ctx context.Context, subject string, h Handler) error {
 // returns its (freshly minted) id. The payload must be a JSON object (the keyed
 // context that task/branch/signal results merge into); nil or empty defaults to
 // {}, and a non-object is rejected with an error.
+//
+// It does not require this Server to have loaded the flow. A Server built with
+// only [WithNamespace] — the client shape, the one packtrail-ui uses — reads the
+// flow's start node from the published registry, writes the execution and
+// commits its first work item; whatever engine is running the namespace picks it
+// up from the durable work stream. So an application, a CLI or a UI can launch a
+// flow it holds no definition for, without a request/reply front door of its own
+// and without the duplicate-start hazard one brings (every replica answering the
+// same broadcast, each minting a different id, so idempotency cannot collapse
+// them).
+//
+// The trade for a client is when it learns of a bad flow name. A name in neither
+// the local set nor the registry fails here, as before. A name that is in the
+// registry but that no running engine knows — a flow removed while its entry is
+// still published — starts: the execution is created and its first work item
+// dead-letters, settling the execution as failed with "unknown flow" rather than
+// erroring at the call.
 func (s *Server) Start(ctx context.Context, flow string, payload json.RawMessage) (string, error) {
 	if err := s.Init(ctx); err != nil {
 		return "", err
@@ -621,7 +789,14 @@ func (s *Server) StartWithID(ctx context.Context, execID, flow string, payload j
 // zone. Ticks that would have fired while the NATS server was down are skipped,
 // not replayed — after recovery the schedule resumes at its next occurrence, so
 // downtime spanning N ticks starts zero executions for them, never N.
+//
+// A malformed cron expression is rejected here as [ErrInvalidArgument], rather
+// than being accepted by the publish and dropped by the server.
 func (s *Server) ScheduleFlow(ctx context.Context, name, flow, cronExpr string, payload json.RawMessage) error {
+	if err := ValidateCron(cronExpr); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return err
 	}
@@ -689,6 +864,34 @@ func (s *Server) Resume(ctx context.Context, execID string) error {
 	return s.engine.Resume(ctx, execID)
 }
 
+// FailActivity settles a parked asynchronous node as failed, guarded on the node
+// visit (generation) and attempt the caller was working on.
+//
+// It exists for an asynchronous worker that is about to drop a job it can never
+// complete: after the drop, nothing else settles that node — the stall watchdog
+// excludes async waits, because a legitimate one may run arbitrarily long — so
+// the execution would stay `waiting` forever, never completing, never failing,
+// and visible only as a permanently in-flight row. The built-in asyncqueue
+// worker calls this automatically before dead-lettering; it is exported so a
+// worker hosted outside this process can uphold the same guarantee.
+//
+// The execution is left failed, not cancelled, so it stays resumable: fix
+// whatever made the job undeliverable and [Server.Resume] re-runs the node with
+// a fresh retry budget.
+//
+// A stale call — for an earlier visit of a node the flow legally cycles through,
+// or for an execution that has since moved on or gone terminal — is a no-op, not
+// an error.
+func (s *Server) FailActivity(
+	ctx context.Context, execID, node string, generation uint64, attempt int, reason string,
+) error {
+	if err := s.Init(ctx); err != nil {
+		return err
+	}
+
+	return s.engine.FailActivity(ctx, execID, node, generation, attempt, reason)
+}
+
 // Cancel transitions a running or waiting execution to the terminal cancelled
 // state with an optional reason (stored on the execution's error field). It is
 // idempotent and stale-safe: cancelling an already-terminal execution is a
@@ -725,11 +928,10 @@ func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
 	return &e, nil
 }
 
-// Results assembles an execution's data-plane view — {"input": <start
-// payload>, "results": {<node>: <output>, …}, "signals": {<name>: <payload>,
-// …}} — the same context document invokers and choice rules see. Entries of an
-// archived execution are dropped by the archive sweep, so Results of an
-// archived id returns only what remains.
+// Results assembles an execution's data-plane view: the same context document
+// invokers and choice rules see, decodable with [DecodeContext] into an
+// [InvocationContext]. Entries of an archived execution are dropped by the
+// archive sweep, so Results of an archived id returns only what remains.
 func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, error) {
 	if !validExecID(execID) {
 		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)

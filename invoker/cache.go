@@ -296,7 +296,24 @@ func (c *Cache) invokeAndStore(ctx context.Context, key string, claimRev uint64,
 		return res, err
 	}
 
-	// Cache all non-error results including StatusPending. Caching Pending is
+	// A retry is not an outcome, so it is never cached: the claim is expired
+	// exactly as for a returned error, leaving a redelivery free to re-invoke.
+	//
+	// The cache exists to stop a redelivery repeating work that already happened,
+	// which presumes the stored result *is* what happened. StatusRetry says the
+	// opposite: nothing settled, try again. Storing it froze a transient fault
+	// for the entry's whole TTL, so the redelivery that exists to re-attempt the
+	// call was served the cached failure instead and a blip that would have
+	// cleared could not. It also made the two spellings of a transient fault
+	// behave differently — an invoker returning an error retried, an invoker
+	// reporting StatusRetry in band did not — for no reason a caller could see.
+	if res.Status == StatusRetry {
+		c.expireClaim(ctx, key, claimRev)
+
+		return res, nil
+	}
+
+	// Every settled result is cached, including StatusPending. Caching Pending is
 	// intentional: a work item redelivered after a crash would otherwise
 	// re-invoke the node and dispatch a second async activity. The cached
 	// Pending causes re-parking instead, and the outstanding CompleteActivity

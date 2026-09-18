@@ -2486,6 +2486,13 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 
 		ex.Status = store.StatusRunning
 		ex.Attempt = 0
+
+		// Resume re-runs the same node visit under a fresh generation; a signal
+		// release recorded for that visit moves with it (see releasedBy).
+		if ex.ReleasedGeneration == ex.NodeGeneration {
+			ex.ReleasedGeneration++
+		}
+
 		ex.NodeGeneration++
 		ex.Error = ""
 		ex.Activity = nil

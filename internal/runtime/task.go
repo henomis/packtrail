@@ -50,10 +50,7 @@ func (e *Engine) invoke(
 	ctx context.Context, node *dsl.Node, execID string,
 	payload json.RawMessage, generation uint64, attempt int,
 ) (res invoker.Result, err error) {
-	timeout := node.Timeout.D()
-	if timeout <= 0 {
-		timeout = e.cfg.DefaultTimeout
-	}
+	timeout, deadline := e.callBudget(node)
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -80,8 +77,44 @@ func (e *Engine) invoke(
 		Payload:     payload,
 		Generation:  generation,
 		Attempt:     attempt,
-		Deadline:    time.Now().Add(timeout),
+		Deadline:    deadline,
 	})
+}
+
+// callBudget resolves the two deadlines an invocation carries: the local one
+// bounding this engine goroutine, and the one advertised to the invoker as
+// Request.Deadline.
+//
+// They differ for asynchronous kinds. DefaultTimeout answers "how long may a
+// node's call run when it declares no timeout" — a question that belongs to a
+// call the engine is waiting on. An async kind does not run the call here at
+// all: the engine publishes a job and parks, and the real budget is the async
+// worker's own ceiling (asyncqueue's WithActivityTimeout). Substituting
+// DefaultTimeout into the advertised deadline stamped the engine's 30s answer
+// onto that job before dispatch, and the worker can only tighten a deadline it
+// is handed — so WithActivityTimeout was unreachable for every node that omitted
+// a timeout, and every such node ran capped at 30s however the worker was
+// configured. For async work — an agent call, a long report — that is far below
+// any realistic budget, and nothing in either configuration said so.
+//
+// Leaving the advertised deadline zero for those kinds encodes what is actually
+// true, that this node declares no timeout, and lets the worker apply its
+// ceiling — which is what the worker's own documentation always claimed. The
+// local ctx is still bounded by DefaultTimeout, because the dispatch itself (a
+// JetStream publish) must not hang the engine.
+func (e *Engine) callBudget(node *dsl.Node) (local time.Duration, advertised time.Time) {
+	declared := node.Timeout.D()
+
+	local = declared
+	if local <= 0 {
+		local = e.cfg.DefaultTimeout
+	}
+
+	if declared <= 0 && e.cfg.AsyncKinds[node.InvokerKind()] {
+		return local, time.Time{}
+	}
+
+	return local, time.Now().Add(local)
 }
 
 // stepTask invokes a task node. A synchronous Invoker settles the node now

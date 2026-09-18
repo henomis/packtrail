@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/henomis/packtrail/internal/dsl"
+	"github.com/henomis/packtrail/internal/invocation"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/internal/scheduler"
@@ -171,19 +172,17 @@ func (h *asyncHarness) nextReq(t *testing.T) invoker.Request {
 }
 
 // ctxDoc is the unpacked shape of an assembled invocation context — what an
-// Invoker's Request.Payload (and Engine.Results) carries.
-type ctxDoc struct {
-	Input   json.RawMessage            `json:"input"`
-	Results map[string]json.RawMessage `json:"results"`
-	Signals map[string]json.RawMessage `json:"signals"`
-}
+// Invoker's Request.Payload (and Engine.Results) carries. It is the shipped
+// type, not a test-local mirror: a mirror would keep passing after a field
+// rename, which is the failure mode the shared declaration exists to prevent.
+type ctxDoc = invocation.Context
 
 // parseCtx unpacks an assembled context document.
 func parseCtx(t *testing.T, doc json.RawMessage) ctxDoc {
 	t.Helper()
 
-	var c ctxDoc
-	if err := json.Unmarshal(doc, &c); err != nil {
+	c, err := invocation.Decode(doc)
+	if err != nil {
 		t.Fatalf("context doc %s: %v", doc, err)
 	}
 

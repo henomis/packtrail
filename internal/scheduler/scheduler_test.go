@@ -24,6 +24,37 @@ import (
 	"github.com/henomis/packtrail/internal/scheduler"
 )
 
+// TestConsumeFiredSetsServerMaxDeliverBackstop verifies the fired consumer is
+// created with a server-side MaxDeliver above the client cap, so a persistent
+// msg.Metadata() failure cannot Nak-loop forever.
+func TestConsumeFiredSetsServerMaxDeliverBackstop(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+	n := names.New("")
+
+	sched := scheduler.New(srv.JS, n)
+	if err := sched.EnsureStream(ctx); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	cc, err := sched.ConsumeFired(ctx, "test-maxdeliver", 10, nil,
+		func(string, []byte, string) error { return nil })
+	if err != nil {
+		t.Fatalf("consume fired: %v", err)
+	}
+
+	t.Cleanup(cc.Stop)
+
+	cons, err := srv.JS.Consumer(ctx, n.StreamSchedule, "test-maxdeliver")
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+
+	if got := cons.CachedInfo().Config.MaxDeliver; got != 30 {
+		t.Fatalf("MaxDeliver = %d, want 30 (client cap 10 × 3)", got)
+	}
+}
+
 type fired struct {
 	key     string
 	payload []byte
@@ -162,5 +193,56 @@ func TestReclaimFiredPurgesAcked(t *testing.T) {
 	case <-ch:
 	case <-time.After(fireTimeout):
 		t.Fatal("scheduling broken after reclaim")
+	}
+}
+
+// TestReclaimFiredCountIgnoresDefinitions verifies the purged count reflects only
+// fire.> messages, so a cron definition coexisting in the same stream does not
+// distort it (L6).
+func TestReclaimFiredCountIgnoresDefinitions(t *testing.T) {
+	ctx, sched, ch := setup(t)
+
+	// A cron definition sits on sched.cron.* and stays in the stream; it must not
+	// be counted as purged fire work.
+	if err := sched.Cron(ctx, "nightly", "cron-key", "0 0 * * * *", []byte(`{}`)); err != nil {
+		t.Fatalf("cron: %v", err)
+	}
+
+	const n = 2
+	for range n {
+		if err := sched.After(ctx, "k", 10*time.Millisecond, []byte(`{}`)); err != nil {
+			t.Fatalf("after: %v", err)
+		}
+	}
+
+	for i := range n {
+		select {
+		case <-ch:
+		case <-time.After(fireTimeout):
+			t.Fatalf("firing %d not delivered", i)
+		}
+	}
+
+	var purged uint64
+
+	deadline := time.Now().Add(fireTimeout)
+	for time.Now().Before(deadline) {
+		p, err := sched.ReclaimFired(ctx, "test-fired")
+		if err != nil {
+			t.Fatalf("reclaim: %v", err)
+		}
+
+		purged += p
+		if purged > 0 {
+			break
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Exactly the fired one-shots below the ack floor are counted — never the cron
+	// definition (which would have made an unfiltered total-Msgs count wrong).
+	if purged == 0 || purged > n {
+		t.Fatalf("purged = %d, want 1..%d (fire.> only, excluding the cron definition)", purged, n)
 	}
 }

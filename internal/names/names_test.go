@@ -84,6 +84,31 @@ func TestNewCustomPrefixAppliedEverywhere(t *testing.T) {
 	}
 }
 
+func TestNewPanicsOnInvalidPrefix(t *testing.T) {
+	for _, prefix := range []string{
+		"has space", "has.dot", "has/slash", "wild*", "has>gt",
+		strings.Repeat("x", 65),
+	} {
+		t.Run(prefix, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("New(%q) did not panic; want rejection of invalid prefix", prefix)
+				}
+			}()
+
+			New(prefix)
+		})
+	}
+}
+
+func TestNewAcceptsValidPrefix(t *testing.T) {
+	for _, prefix := range []string{"a", "myapp", "my-app_2", strings.Repeat("x", 64)} {
+		if got := New(prefix); got.Prefix != prefix {
+			t.Errorf("New(%q).Prefix = %q, want %q", prefix, got.Prefix, prefix)
+		}
+	}
+}
+
 func TestNewNamesAreUnique(t *testing.T) {
 	n := New(Default)
 

@@ -24,6 +24,52 @@ import (
 // no inbound transition at all is already caught by start-node detection, so
 // the interesting case is an island: nodes referencing each other but detached
 // from the start node.
+// TestValidateRejectsChoiceOutgoingEdge: a choice node routes solely via its
+// rules, so an outgoing edge is dead weight that would make a phantom target
+// look reachable and mask the very typo the reachability check exists to catch.
+func TestValidateRejectsChoiceOutgoingEdge(t *testing.T) {
+	_, err := Parse([]byte(`
+name: choice-edge-ghost
+nodes:
+  - {id: start, type: task, subject: "s"}
+  - {id: route, type: choice, rules: [{when: 'input.x == 1', to: a}, {default: true, to: b}]}
+  - {id: a, type: task, subject: "a"}
+  - {id: b, type: task, subject: "b"}
+edges:
+  - {from: start, to: route}
+  - {from: route, to: a}
+`))
+	if err == nil || !strings.Contains(err.Error(), "choice") {
+		t.Fatalf("err = %v, want choice-outgoing-edge rejection", err)
+	}
+}
+
+// TestValidateRejectsUnknownPlaceholder: only {execution_id} is a supported
+// subject placeholder; a typo like {exec_id} would become a literal subject
+// shared by every execution.
+func TestValidateRejectsUnknownPlaceholder(t *testing.T) {
+	_, err := Parse([]byte(`
+name: bad-placeholder
+nodes:
+  - {id: a, type: task, subject: "tasks.notify.{exec_id}"}
+`))
+	if err == nil || !strings.Contains(err.Error(), "unknown placeholder") {
+		t.Fatalf("err = %v, want unknown-placeholder rejection", err)
+	}
+}
+
+// TestValidateAllowsExecutionIDPlaceholder confirms the one supported
+// placeholder still passes.
+func TestValidateAllowsExecutionIDPlaceholder(t *testing.T) {
+	if _, err := Parse([]byte(`
+name: good-placeholder
+nodes:
+  - {id: a, type: task, subject: "tasks.notify.{execution_id}"}
+`)); err != nil {
+		t.Fatalf("err = %v, want {execution_id} accepted", err)
+	}
+}
+
 // TestValidateRejectsMultipleDefaults: two default rules silently last-win at
 // runtime, so validation must reject the ambiguity at load time.
 func TestValidateRejectsMultipleDefaults(t *testing.T) {
@@ -218,6 +264,14 @@ nodes:
 	}
 }
 
+// TestValidateRejectsNodeReachableOnlyViaBranchEdge: an edge out of a fan-out
+// branch is never taken, so a node hanging off one is dead.
+//
+// This used to be caught downstream, as `unreachable node(s) [ghost]` — true,
+// but it names the victim rather than the mistake. rejectBranchExit now refuses
+// the edge itself, which is where the author has something to fix. The
+// unreachable check still guards a genuinely disconnected node (see the
+// "island" case above).
 func TestValidateRejectsNodeReachableOnlyViaBranchEdge(t *testing.T) {
 	_, err := Parse([]byte(`
 name: dead-via-branch-edge
@@ -240,8 +294,8 @@ edges:
   - from: b1
     to: ghost
 `))
-	if err == nil || !strings.Contains(err.Error(), "unreachable node(s) [ghost]") {
-		t.Fatalf("err = %v, want unreachable ghost rejection", err)
+	if err == nil || !strings.Contains(err.Error(), `node "b1" is a branch of fanout "fo" and has an outgoing edge`) {
+		t.Fatalf("err = %v, want branch-exit rejection", err)
 	}
 }
 

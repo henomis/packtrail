@@ -36,6 +36,13 @@ const (
 // The trace is observability, not operational truth — the execution document
 // and the events stream stay authoritative.
 func (s *Store) EnableHistory(ctx context.Context, retention time.Duration) error {
+	// Normalize a negative retention to 0 ("unlimited"), mirroring
+	// Signals.SetRetention, so a stream's MaxAge is never set to a negative
+	// (invalid) duration by a direct internal caller.
+	if retention < 0 {
+		retention = 0
+	}
+
 	duplicates := eventDedupWindow
 	if retention > 0 && retention < duplicates {
 		duplicates = retention

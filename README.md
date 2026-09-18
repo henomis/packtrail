@@ -493,6 +493,20 @@ to the same NATS cluster, reads execution state and the **flow registry** (every
 flow's graph is published to a KV bucket at startup), and tails the live event
 stream — so it needs no access to your flow source or engine process.
 
+> **No built-in authentication.** `packtrail-ui` serves every execution's
+> payloads, history, errors and dead-letters to anyone who can reach its HTTP
+> address — there is no login, token, or access control of any kind. Bind it to
+> a loopback or private address, or put an authenticating reverse proxy in
+> front, before exposing it beyond a network you already trust.
+
+> **Enable archival for the list view.** The unfiltered `GET /api/executions`
+> ("all executions") is an O(N) scan of the hot bucket with no pagination, so its
+> cost grows with the number of non-archived executions. Run the observed
+> deployment with archival (`WithArchive`, see the Durability model section) so
+> completed work leaves the hot bucket, or drive the dashboard with the
+> `?status=` / `?flow=` filters, which are answered from the visibility index
+> without a full scan.
+
 ```sh
 go run ./cmd/packtrail-ui --namespace packtrail --addr :8088   # NATS_URL honoured
 ```
@@ -506,7 +520,7 @@ backing API is also usable directly:
 |----------|---------|
 | `GET /api/flows` | flow names |
 | `GET /api/flows/{name}` | flow graph (`FlowGraph`) |
-| `GET /api/executions[?status=&flow=]` | execution summaries |
+| `GET /api/executions[?status=&flow=]` | execution summaries (filtered = indexed lookup; unfiltered = full hot-bucket scan) |
 | `GET /api/executions/{id}` | execution control-state snapshot |
 | `GET /api/executions/{id}/results` | assembled `{input, results, signals, branches, last_node}` context |
 | `GET /api/executions/{id}/history` | ordered transition trace (`?limit=`; empty unless `WithHistory`) |

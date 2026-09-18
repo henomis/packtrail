@@ -40,7 +40,11 @@ const (
 
 func main() {
 	var (
-		addr      = flag.String("addr", envOr("PACKTRAIL_UI_ADDR", ":8088"), "HTTP listen address [$PACKTRAIL_UI_ADDR]")
+		addr = flag.String("addr", envOr("PACKTRAIL_UI_ADDR", ":8088"),
+			"HTTP listen address [$PACKTRAIL_UI_ADDR]. There is no built-in authentication: "+
+				"anything reachable at this address can read every execution's payloads, "+
+				"history, errors and dead-letters. Bind to a loopback/private address, or "+
+				"put a reverse proxy with auth in front, before exposing beyond a trusted network.")
 		namespace = flag.String(
 			"namespace",
 			envOr("PACKTRAIL_NAMESPACE", "packtrail"),
@@ -86,6 +90,9 @@ func main() {
 		_ = httpSrv.Shutdown(sh)
 	}()
 
+	slog.Warn("packtrail-ui has no built-in authentication; anything that can reach addr can read " +
+		"every execution's payloads, history, errors and dead-letters. Bind to a loopback/private " +
+		"address or put an authenticating reverse proxy in front before exposing it beyond a trusted network.")
 	slog.Info("packtrail-ui listening", "addr", *addr, "namespace", *namespace, "nats", url)
 
 	err = httpSrv.ListenAndServe()

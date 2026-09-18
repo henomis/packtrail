@@ -158,6 +158,50 @@ func TestByFlow(t *testing.T) {
 	}
 }
 
+// TestByFlowRejectsWildcard proves a NATS wildcard-shaped flow name is
+// rejected before it ever reaches kv.Watch, instead of being turned into a
+// broadened subject filter ("*.>") that would match every flow in the bucket.
+// Reproduces the exact cross-flow leak found in review: an unfiltered "*"
+// used to return every indexed execution regardless of its real flow.
+func TestByFlowRejectsWildcard(t *testing.T) {
+	ctx, st, ix := setup(t)
+	a := mkExec(t, st, "alpha")
+	b := mkExec(t, st, "bravo")
+
+	waitIndex(t, ix, store.StatusRunning, a.ID, true)
+	waitIndex(t, ix, store.StatusRunning, b.ID, true)
+
+	if _, err := ix.ByFlow(ctx, "*"); err == nil {
+		t.Fatal("ByFlow(*) err = nil, want rejection")
+	}
+
+	if evs, err := ix.ByFlowEvents(ctx, "*"); err == nil {
+		t.Fatalf("ByFlowEvents(*) = %v, err = nil, want rejection (leaked %d cross-flow entries)", evs, len(evs))
+	}
+
+	if _, err := ix.ByFlow(ctx, ">"); err == nil {
+		t.Fatal("ByFlow(>) err = nil, want rejection")
+	}
+}
+
+// TestByStatusRejectsWildcard is TestByFlowRejectsWildcard for the status
+// dimension: status must be one of the closed set of execution statuses.
+func TestByStatusRejectsWildcard(t *testing.T) {
+	ctx, _, ix := setup(t)
+
+	if _, err := ix.ByStatus(ctx, "*"); err == nil {
+		t.Fatal("ByStatus(*) err = nil, want rejection")
+	}
+
+	if evs, err := ix.ByStatusEvents(ctx, "*"); err == nil {
+		t.Fatalf("ByStatusEvents(*) = %v, err = nil, want rejection", evs)
+	}
+
+	if _, err := ix.ByStatus(ctx, "not-a-real-status"); err == nil {
+		t.Fatal("ByStatus(not-a-real-status) err = nil, want rejection")
+	}
+}
+
 func TestIndexCleansPreviousFlowMembership(t *testing.T) {
 	ctx, st, ix := setup(t)
 	ex := mkExec(t, st, "oldflow")

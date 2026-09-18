@@ -110,10 +110,29 @@ func WithInvoker(kind string, inv invoker.Invoker) Option {
 // (invoked, but not yet settled and acked) runs exec again. For a target whose
 // side effects must not fire twice, enable WithResultCache — it dedups the
 // worker's execution as well — or make the target idempotent.
+// A node selecting an async kind and declaring no timeout of its own runs at
+// that kind's activity timeout (asyncqueue's WithActivityTimeout, 5m by
+// default), not at WithDefaultTimeout — which governs calls the engine waits on
+// inline. See Engine.callBudget.
 func WithAsyncInvoker(kind string, exec invoker.Invoker, opts ...asyncqueue.Option) Option {
 	return func(c *config) {
 		c.asyncInvokers = append(c.asyncInvokers, asyncInvoker{kind: kind, exec: exec, opts: opts})
 	}
+}
+
+// asyncKinds is the set of registered asynchronous invoker kinds, for the
+// engine's per-node timeout decision.
+func (c *config) asyncKinds() map[string]bool {
+	if len(c.asyncInvokers) == 0 {
+		return nil
+	}
+
+	kinds := make(map[string]bool, len(c.asyncInvokers))
+	for _, ai := range c.asyncInvokers {
+		kinds[ai.kind] = true
+	}
+
+	return kinds
 }
 
 // WithResultCache enables idempotent invocation: every node result is cached by
@@ -176,6 +195,8 @@ func WithStallRedrive(d time.Duration) Option {
 // is independent of accumulated terminal executions, so it is safe to run
 // often. It fixes the common drift where a finished execution is still indexed
 // as active, but cannot recover an execution missing from the index entirely.
+//
+// A malformed expression fails [New]; see [ValidateCron].
 func WithReconcileActive(cronExpr string) Option {
 	return func(c *config) { c.reconcileActiveCron = cronExpr }
 }
@@ -187,6 +208,8 @@ func WithReconcileActive(cronExpr string) Option {
 // consumed scheduler firings; its cost grows with total execution volume, so
 // schedule it well below the active cadence. Without either option the indexer
 // still runs but no periodic reconcile is scheduled.
+//
+// A malformed expression fails [New]; see [ValidateCron].
 func WithReconcileFull(cronExpr string) Option {
 	return func(c *config) { c.reconcileFullCron = cronExpr }
 }
@@ -205,9 +228,15 @@ func WithArchive(retention time.Duration) Option {
 // WithSignalRetention sets how long the signals stream retains messages (its
 // MaxAge) — the window during which an undelivered signal survives an engine
 // outage before it is dropped. A positive duration sets that window; a negative
-// value disables the age limit (retain until the stream's other limits); zero
-// keeps the default (7 days). Raise it if executions may wait for a signal
-// through a longer outage than a week.
+// value disables the age limit (retain until the stream's other limits). Raise
+// it if executions may wait for a signal through a longer outage than a week.
+//
+// Omitting the option (or passing zero) leaves retention unmanaged rather than
+// asserting a value: an existing signals stream keeps the MaxAge it already has,
+// and a newly created one gets the 7-day default. That distinction matters
+// because provisioning is a CreateOrUpdate that every participant performs — a
+// namespace-only client, which has no reason to hold this option, must not
+// silently retune the retention of the engine it is only observing.
 func WithSignalRetention(d time.Duration) Option {
 	return func(c *config) { c.signalRetention = d }
 }
@@ -250,7 +279,12 @@ func WithMaxDeliver(n int) Option { return func(c *config) { c.maxDeliver = n } 
 // not abandon in-flight invocations to redelivery (which would double-fire
 // naturally non-idempotent targets). Stragglers exceeding the window are cancelled
 // and their work redelivers. A hard crash is unaffected (it always relies on
-// redelivery).
+// redelivery). A non-positive value falls back to the 30s default.
+//
+// It bounds the whole graceful shutdown, not only the engine: [Server.Run] also
+// waits for the workers hosted by [WithAsyncInvoker] to drain, so this value is
+// applied to them as their default too. A kind that needs its own budget passes
+// asyncqueue.WithDrainTimeout to WithAsyncInvoker, which takes precedence.
 func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drainTimeout = d } }
 
 // WithMaxPayloadBytes caps the size of an execution's payload (default 512 KiB,
@@ -260,6 +294,12 @@ func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drain
 // KV write error. The default leaves headroom below NATS's 1 MiB max message
 // size for the rest of the execution document. Pass a negative value to disable
 // the guard; zero keeps the default.
+//
+// [New] reconciles the value against the connected server's max_payload, since a
+// cap above what the transport will carry disables the very guard it configures:
+// a value over that limit is rejected, and the *default* is tightened down to it
+// (the default states no intent — it assumes a stock 1 MiB server — so against a
+// smaller one it is simply too loose).
 func WithMaxPayloadBytes(n int) Option { return func(c *config) { c.maxPayloadBytes = n } }
 
 // WithMaxDocumentBytes caps the serialized size of an execution's control

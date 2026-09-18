@@ -182,6 +182,52 @@ func TestCacheKeyedSeparatesKeyspaces(t *testing.T) {
 	}
 }
 
+// TestCacheKeyedNoBoundaryCollision reproduces the exact key-join collision a
+// missing prefix/id delimiter used to allow: with plain concatenation, prefix
+// "w." + ExecutionID "42" produced the same string as prefix "" + ExecutionID
+// "w" ("w.42.<gen>.<attempt>"), so one execution's worker-cached result could
+// be read back as an unrelated execution's dispatch-cache entry.
+func TestCacheKeyedNoBoundaryCollision(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-boundary"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var dispatches, execs atomic.Int32
+
+	// Unprefixed dispatch cache for a short execution id "w".
+	dispatch := invoker.NewCache(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		dispatches.Add(1)
+		return invoker.Result{Status: invoker.StatusPending}, nil
+	}))
+	dispatchReq := invoker.Request{ExecutionID: "w", NodeID: "42", Generation: 7, Attempt: 0}
+
+	// Prefixed worker cache ("w.") for an unrelated execution "42".
+	work := invoker.NewCacheKeyed(kv, invoker.Func(func(context.Context, invoker.Request) (invoker.Result, error) {
+		execs.Add(1)
+		return invoker.Result{Status: invoker.StatusOK, Payload: json.RawMessage(`{"done":true}`)}, nil
+	}), "w.")
+	workReq := invoker.Request{ExecutionID: "42", NodeID: "7", Generation: 0, Attempt: 0}
+
+	if res, invokeErr := work.Invoke(ctx, workReq); invokeErr != nil || res.Status != invoker.StatusOK {
+		t.Fatalf("work: res=%+v err=%v, want ok", res, invokeErr)
+	}
+
+	// Before the fix this read the worker's cached OK result for a completely
+	// unrelated execution instead of invoking its own delegate.
+	res, invokeErr := dispatch.Invoke(ctx, dispatchReq)
+	if invokeErr != nil || res.Status != invoker.StatusPending {
+		t.Fatalf("dispatch: res=%+v err=%v, want its own pending (cross-execution collision?)", res, invokeErr)
+	}
+
+	if d, e := dispatches.Load(), execs.Load(); d != 1 || e != 1 {
+		t.Fatalf("dispatches=%d execs=%d, want 1/1 (no cross-execution cache hit)", d, e)
+	}
+}
+
 // TestCacheDoesNotCacheTransportError ensures a transport failure is not cached,
 // so a redelivery retries the call rather than replaying the error.
 func TestCacheDoesNotCacheTransportError(t *testing.T) {
@@ -221,6 +267,54 @@ func TestCacheDoesNotCacheTransportError(t *testing.T) {
 
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("delegate called %d times, want 2 (error not cached)", got)
+	}
+}
+
+// TestCacheDoesNotCacheRetry: an in-band StatusRetry must leave the attempt
+// re-invokable, exactly like a returned error.
+//
+// Caching it froze a transient fault for the entry's TTL: the redelivery that
+// exists to re-attempt the call was served the stored failure, so a blip that
+// would have cleared on the next try could not. It also split the two spellings
+// of "try again" — a returned error retried, an in-band retry did not.
+func TestCacheDoesNotCacheRetry(t *testing.T) {
+	ctx := context.Background()
+	srv := natstest.Start(t)
+
+	kv, err := srv.JS.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "test-cache-retry"})
+	if err != nil {
+		t.Fatalf("kv: %v", err)
+	}
+
+	var calls atomic.Int32
+
+	delegate := invoker.Func(func(_ context.Context, _ invoker.Request) (invoker.Result, error) {
+		if calls.Add(1) == 1 {
+			return invoker.Result{Status: invoker.StatusRetry, Error: "agent unreachable"}, nil
+		}
+
+		return invoker.Result{Status: invoker.StatusOK}, nil
+	})
+	cache := invoker.NewCache(kv, delegate)
+	req := invoker.Request{ExecutionID: "exec-retry", NodeID: "n", Attempt: 0}
+
+	res, err := cache.Invoke(ctx, req)
+	if err != nil || res.Status != invoker.StatusRetry {
+		t.Fatalf("first call = (%+v, %v), want an in-band retry", res, err)
+	}
+
+	// Same attempt, as a redelivery would: the delegate must run again.
+	res, err = cache.Invoke(ctx, req)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if res.Status != invoker.StatusOK {
+		t.Fatalf("second call status = %q, want ok — the retry was served from cache", res.Status)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("delegate called %d times, want 2 (retry not cached)", got)
 	}
 }
 

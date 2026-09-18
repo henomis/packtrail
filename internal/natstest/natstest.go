@@ -81,3 +81,20 @@ func Start(t testing.TB) *Server {
 
 	return s
 }
+
+// Connect opens a second, independent connection to the same server, closed when
+// the test ends. Use it where the point under test is that two separate
+// processes share only a NATS cluster: reusing s.NC would hide a dependency on
+// in-process state that a real deployment does not have.
+func (s *Server) Connect(t testing.TB) *nats.Conn {
+	t.Helper()
+
+	nc, err := nats.Connect(s.NS.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	t.Cleanup(nc.Close)
+
+	return nc
+}

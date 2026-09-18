@@ -32,6 +32,8 @@ import (
 const (
 	nakDelay         = 2 * time.Second
 	heartbeatDivisor = 3
+	// minHeartbeatInterval floors the heartbeat ticker; see heartbeat's doc comment.
+	minHeartbeatInterval = 100 * time.Millisecond
 )
 
 // Worker consumes jobs for one async invoker kind and runs the embedder's
@@ -171,12 +173,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 				"exec", j.ExecID, "node", j.Node,
 				"panic", r, "stack", string(debug.Stack()))
 
-			if w.cfg.deadLetterSink != nil {
-				w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node,
-					fmt.Sprintf("job panic: %v", r), numDelivered(msg))
-			}
-
-			_ = msg.Term()
+			w.deadLetter(ctx, msg, j, fmt.Sprintf("job panic: %v", r))
 		}
 	}()
 
@@ -193,11 +190,7 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 		if isTerminal(err) || deliveriesExhausted(msg, w.cfg.maxDeliver) {
 			w.log.Warn("dead-lettering job", "exec", j.ExecID, "node", j.Node, "err", err)
 
-			if w.cfg.deadLetterSink != nil {
-				w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node, err.Error(), numDelivered(msg))
-			}
-
-			_ = msg.Term()
+			w.deadLetter(ctx, msg, j, err.Error())
 
 			return
 		}
@@ -213,6 +206,90 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 
 	if ackErr := msg.Ack(); ackErr != nil {
 		w.log.Warn("ack job", "exec", j.ExecID, "node", j.Node, "err", ackErr)
+	}
+}
+
+// deadLetterHardCapMult bounds how long deadLetter keeps redelivering when it
+// cannot settle the execution. Past maxDeliver × this multiple the job is
+// dropped anyway — but only after the durable trace is emitted, so the drop is
+// always observable. Until the cap it keeps retrying, so a transient store/NATS
+// blip never strands an execution. It mirrors the engine's own dead-letter cap.
+const deadLetterHardCapMult = 3
+
+// deadLetter drops a job the Worker can never complete, settling the execution
+// it was owed a completion for first.
+//
+// The ordering is the whole point. An asynchronous node is parked `waiting` and
+// nothing but a completion settles it: the stall watchdog deliberately excludes
+// async waits, since a legitimate one may run arbitrarily long. So a job dropped
+// without settling leaves its execution parked forever — never completing, never
+// failing, not redriven, invisible except as a permanently in-flight row, and
+// not even resumable, because Resume applies only to failed executions. Failing
+// the node first turns that into an ordinary failure an operator can see and
+// Resume.
+//
+// When the settle itself fails the job is *not* dropped: it Naks and the
+// redelivery tries again, so an outage that makes the engine briefly unreachable
+// costs a retry rather than an execution. Only past deadLetterHardCapMult ×
+// maxDeliver is it dropped regardless — with the trace emitted first, so a drop
+// that could not be recorded on the execution is still observable.
+//
+// This mirrors Engine.deadLetter, which applies the same discipline to the
+// engine's own work consumer. A completer that does not implement activityFailer
+// keeps the old behaviour: trace, then drop.
+func (w *Worker) deadLetter(ctx context.Context, msg jetstream.Msg, j job, reason string) {
+	failer, canFail := w.completer.(activityFailer)
+	if !canFail {
+		w.emitDeadLetter(ctx, msg, j, reason)
+		w.term(msg, j)
+
+		return
+	}
+
+	// A guard miss (the execution moved on, went terminal, or this job belongs to
+	// an earlier visit of a node the flow cycles through) returns nil: there is
+	// nothing parked on this job, so dropping it is already correct.
+	err := failer.FailActivity(ctx, j.ExecID, j.Node, j.Generation, j.Attempt, reason)
+	if err == nil {
+		w.emitDeadLetter(ctx, msg, j, reason)
+		w.term(msg, j)
+
+		return
+	}
+
+	if numDelivered(msg) >= uint64(w.cfg.maxDeliver)*deadLetterHardCapMult { //nolint:gosec // small positive config value
+		w.log.Error("dropping job after persistent settle failure",
+			"exec", j.ExecID, "node", j.Node, "err", err, "reason", reason)
+		w.emitDeadLetter(ctx, msg, j,
+			"execution could not be failed (persistent): "+reason)
+		w.term(msg, j)
+
+		return
+	}
+
+	w.log.Error("dead-letter: could not fail execution; will retry",
+		"exec", j.ExecID, "node", j.Node, "err", err)
+
+	if nakErr := msg.NakWithDelay(nakDelay); nakErr != nil {
+		w.log.Warn("nak job", "exec", j.ExecID, "node", j.Node, "err", nakErr)
+	}
+}
+
+// emitDeadLetter records the durable trace for a dropped job, if a sink is
+// configured.
+func (w *Worker) emitDeadLetter(ctx context.Context, msg jetstream.Msg, j job, reason string) {
+	if w.cfg.deadLetterSink != nil {
+		w.cfg.deadLetterSink(ctx, j.ExecID+"/"+j.Node, reason, numDelivered(msg))
+	}
+}
+
+// term drops a poisoned job (no redelivery). A failed Term is logged rather than
+// swallowed: the message will redeliver despite the intended terminal
+// disposition, so the warning is the operator's only signal that the dead-letter
+// did not actually take and duplicate records/log noise may follow.
+func (w *Worker) term(msg jetstream.Msg, j job) {
+	if err := msg.Term(); err != nil {
+		w.log.Warn("term job failed; will redeliver", "exec", j.ExecID, "node", j.Node, "err", err)
 	}
 }
 
@@ -278,10 +355,14 @@ func (w *Worker) invoke(ctx context.Context, j job) (res invoker.Result) {
 // effectiveTimeout bounds an invocation by min(node timeout, activityTimeout):
 // the worker's activityTimeout is the ceiling/backstop, and a node that sets a
 // shorter timeout tightens it. A node with no timeout (j.Timeout == 0) runs at
-// the full activityTimeout. A node timeout longer than the backstop is capped at
-// it — raise WithActivityTimeout if longer calls are required. The cap is logged:
-// silently truncating a 2h node timeout to a 5m backstop turns into inexplicable
-// retry/fail loops otherwise, so the mismatch must be diagnosable from the logs.
+// the full activityTimeout — the engine leaves the dispatched deadline unset for
+// async kinds precisely so this branch is reachable (see Engine.callBudget).
+//
+// A node timeout longer than the backstop is capped at it. packtrail.New rejects
+// that combination outright, so this path is now reachable only for a job
+// published by an external Dispatcher caller. It stays as a backstop and is
+// logged: silently truncating a 2h node timeout to a 5m ceiling otherwise
+// surfaces as inexplicable retry/fail loops.
 func (w *Worker) effectiveTimeout(j job) time.Duration {
 	timeout := w.cfg.activityTimeout
 	if j.Timeout > 0 && j.Timeout < timeout {
@@ -332,8 +413,26 @@ func numDelivered(msg jetstream.Msg) uint64 {
 	return 0
 }
 
+// heartbeat runs on its own goroutine (spawned via `go w.heartbeat(...)` in
+// handle). handle's own panic-recovering defer only guards handle's stack, not
+// a child goroutine's, so an unrecovered panic here — e.g. from time.NewTicker
+// on a non-positive interval, or from msg.InProgress — would otherwise crash
+// the entire hosting process. minHeartbeatInterval is a backstop alongside
+// WithAckWait's floor: ackWait/heartbeatDivisor can only be non-positive if a
+// config is built without going through WithAckWait.
 func (w *Worker) heartbeat(ctx context.Context, msg jetstream.Msg) {
-	t := time.NewTicker(w.cfg.ackWait / heartbeatDivisor)
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("heartbeat panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	interval := w.cfg.ackWait / heartbeatDivisor
+	if interval <= 0 {
+		interval = minHeartbeatInterval
+	}
+
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	for {

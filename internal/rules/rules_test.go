@@ -17,7 +17,6 @@ package rules
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -104,6 +103,21 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 			code:    "sort(input.items) != nil",
 			wantErr: "function calls other than len() are not allowed",
 		},
+		{
+			name:    "string concatenation",
+			code:    `input.name + input.name + input.name != ""`,
+			wantErr: "concatenation and slicing are not allowed",
+		},
+		{
+			name:    "numeric addition",
+			code:    "input.x + input.y > 0",
+			wantErr: "concatenation and slicing are not allowed",
+		},
+		{
+			name:    "slicing",
+			code:    "input.items[1:2] != nil",
+			wantErr: "concatenation and slicing are not allowed",
+		},
 	}
 
 	for _, tt := range cases {
@@ -119,6 +133,20 @@ func TestCompileRejectsUnboundedExpressions(t *testing.T) {
 func TestCompileAllowsLenAndMembership(t *testing.T) {
 	if _, err := Compile(`len(input.items) > 0 && input.tier in ["pro", "team"]`); err != nil {
 		t.Fatalf("compile bounded expression: %v", err)
+	}
+}
+
+// TestCompileAllowsRegexMatch: `matches` stays allowed — Go's RE2 regexp is
+// linear-time and the input is size-capped, so it is not a DoS vector like `+`.
+func TestCompileAllowsRegexMatch(t *testing.T) {
+	p, err := Compile(`input.name matches "^acme-"`)
+	if err != nil {
+		t.Fatalf("compile regex predicate: %v", err)
+	}
+
+	got, err := p.Match(json.RawMessage(`{"input":{"name":"acme-corp"}}`))
+	if err != nil || !got {
+		t.Fatalf("match = %v, %v; want true, nil", got, err)
 	}
 }
 
@@ -173,11 +201,6 @@ func largeArrayPredicate(entries int) string {
 		}
 
 		b.WriteString("input.x")
-
-		if i%10 == 0 {
-			b.WriteString(" + ")
-			b.WriteString(strconv.Itoa(i))
-		}
 	}
 
 	b.WriteString("] != nil")

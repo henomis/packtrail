@@ -92,7 +92,7 @@ func TestConsumeSignalClearsActivityStash(t *testing.T) {
 		Activity: &store.ActivityResult{Node: "work", Attempt: 0, Status: string(invoker.StatusOK)},
 	}
 
-	consumeSignal(ex, "go", "work")
+	consumeSignal(ex, "go", "work", signalArrived)
 
 	if ex.Activity != nil {
 		t.Fatalf("Activity stash survived signal consumption: %+v", ex.Activity)

@@ -31,20 +31,17 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/vm"
+
+	"github.com/henomis/packtrail/internal/invocation"
 )
 
-// compileEnv declares the variables an expression may reference; they mirror
-// the top-level fields of the assembled invocation context document. last_node
-// is the id of the most recently settled output, so "the previous step's
-// result" is results[last_node]; branches holds the current fan's outputs.
+// compileEnv declares the variables an expression may reference. They are the
+// top-level fields of the assembled invocation context document, taken from the
+// one declaration of it (invocation.Env) rather than restated here — a rule
+// referencing a variable the document does not carry evaluates to nil, and a
+// nil comparison routes to the default branch silently.
 func compileEnv() map[string]any {
-	return map[string]any{
-		"input":     map[string]any{},
-		"results":   map[string]any{},
-		"signals":   map[string]any{},
-		"branches":  map[string]any{},
-		"last_node": "",
-	}
+	return invocation.Env()
 }
 
 // Program is a compiled choice expression.
@@ -80,9 +77,17 @@ func Compile(code string) (*Program, error) {
 }
 
 // validateBudgetedProgram keeps choice predicates in a bounded routing subset.
-// Expr has no interruptible VM deadline, so reject constructs that can loop over
-// caller-controlled data or allocate arbitrarily; the remaining bytecode is a
-// straight-line predicate over a size-limited execution document.
+// Expr has no interruptible VM deadline and vm.VM.MemoryBudget only instruments
+// a subset of opcodes (OpRange/OpArray/OpMap/OpCallSafe/OpSort growth) — string
+// concatenation (OpAdd) and slicing (OpSlice) allocate without ever calling
+// memGrow, so a budgeted VM does not bound them: a handful of chained `+`
+// operators over a large payload field can allocate hundreds of megabytes and
+// run for seconds despite passing MemoryBudget. Reject those. The remaining
+// bytecode is a straight-line predicate over a size-limited execution document.
+//
+// Regex matching (`matches`) is intentionally NOT rejected: Go's regexp is RE2
+// (linear-time, no catastrophic backtracking) and the input is capped by
+// WithMaxPayloadBytes, so a match is bounded — unlike string concatenation.
 func validateBudgetedProgram(code string, prog *vm.Program) error {
 	for ip, op := range prog.Bytecode {
 		//nolint:exhaustive // Validation only rejects disallowed opcodes; the rest are allowed.
@@ -91,6 +96,8 @@ func validateBudgetedProgram(code string, prog *vm.Program) error {
 			return fmt.Errorf("rules: compile %q: range expressions are not allowed in choice rules", code)
 		case vm.OpJumpBackward:
 			return fmt.Errorf("rules: compile %q: iteration expressions are not allowed in choice rules", code)
+		case vm.OpAdd, vm.OpSlice:
+			return fmt.Errorf("rules: compile %q: concatenation and slicing are not allowed in choice rules", code)
 		case vm.OpCall, vm.OpCall0, vm.OpCall1, vm.OpCall2, vm.OpCall3,
 			vm.OpCallN, vm.OpCallFast, vm.OpCallSafe, vm.OpCallTyped:
 			return fmt.Errorf("rules: compile %q: function calls other than len() are not allowed in choice rules", code)

@@ -112,6 +112,48 @@ func TestServeHandlerErrorIsRetry(t *testing.T) {
 	}
 }
 
+// TestServeRecoversHandlerPanic proves a panicking Handler settles the request
+// as StatusError instead of crashing the process. Serve's QueueSubscribe
+// callback runs on the NATS client library's own delivery goroutine, which has
+// no recover above it, so before the fix this would have taken down the whole
+// test binary rather than failing an assertion.
+func TestServeRecoversHandlerPanic(t *testing.T) {
+	srv := natstest.Start(t)
+
+	sub, err := protocol.Serve(context.Background(), srv.NC, "tasks.panic.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	resp := request(t, srv, "tasks.panic.x", protocol.TaskRequest{ExecutionID: "exec-panic"})
+	if resp.Status != protocol.StatusError {
+		t.Fatalf("status = %q, want error", resp.Status)
+	}
+
+	if !strings.Contains(resp.Error, "handler panic") {
+		t.Fatalf("error = %q, want handler-panic explanation", resp.Error)
+	}
+
+	// The subscription (and process) must still be alive for a follow-up request.
+	sub2, err := protocol.Serve(context.Background(), srv.NC, "tasks.after-panic.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		return protocol.TaskResponse{Status: protocol.StatusOK}, nil
+	})
+	if err != nil {
+		t.Fatalf("serve after panic: %v", err)
+	}
+
+	t.Cleanup(func() { _ = sub2.Unsubscribe() })
+
+	resp2 := request(t, srv, "tasks.after-panic.x", protocol.TaskRequest{ExecutionID: "exec-after"})
+	if resp2.Status != protocol.StatusOK {
+		t.Fatalf("status after panic = %q, want ok (process should still be alive)", resp2.Status)
+	}
+}
+
 func TestServeRejectsInvalidStatus(t *testing.T) {
 	srv := natstest.Start(t)
 

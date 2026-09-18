@@ -29,14 +29,26 @@ import (
 	"github.com/henomis/packtrail/internal/store"
 )
 
-// FlowGraph is the static structure of a flow, for visualisation. It is
-// published to a KV registry at startup so observability tools can render a flow
-// without its source YAML.
+// FlowGraph is the static structure of a flow. It is published to a KV registry
+// at startup so a process without the source YAML can render a flow — and, via
+// Start, begin one.
 type FlowGraph struct {
-	Version string      `json:"version,omitempty"`
-	Name    string      `json:"name"`
-	Nodes   []GraphNode `json:"nodes"`
-	Edges   []GraphEdge `json:"edges"`
+	Version string `json:"version,omitempty"`
+	Name    string `json:"name"`
+	// Start is the node an execution of this flow begins at: the unique node
+	// with no inbound transition.
+	//
+	// It is published rather than left to be re-derived, because deriving it
+	// means reproducing the flow validator's notion of "inbound" — explicit
+	// edges plus fanout branches, fanin wait_for, choice rule targets and signal
+	// on_timeout — a copy that could silently disagree with the engine's. It is
+	// what lets a process that loaded no flows start one; see [Server.Start].
+	//
+	// Empty in registry entries written before this field existed. Every engine
+	// republishes its flows on startup, so those heal on the next restart.
+	Start string      `json:"start,omitempty"`
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
 }
 
 // GraphNode is one node of a FlowGraph. Fields are type-specific; empty ones are
@@ -109,7 +121,7 @@ func (s *Server) RecentDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 
 // buildFlowGraph projects a parsed flow into its public, serialisable graph.
 func buildFlowGraph(f *dsl.Flow) FlowGraph {
-	g := FlowGraph{Version: f.Version, Name: f.Name}
+	g := FlowGraph{Version: f.Version, Name: f.Name, Start: f.StartNode()}
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 
@@ -269,6 +281,10 @@ func (s *Server) ByStatusEvents(ctx context.Context, status string) ([]Event, er
 // Since KV keys have no inherent order the cap yields an arbitrary subset, not
 // an ordered page; it is a guardrail against an unbounded transfer.
 func (s *Server) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]Event, error) {
+	if !validStatus(status) {
+		return nil, fmt.Errorf("%w: unknown status %q", ErrInvalidArgument, status)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -290,6 +306,10 @@ func (s *Server) ByFlowEvents(ctx context.Context, flow string) ([]Event, error)
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (0 = no cap). The
 // same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("%w: flow name %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, flow)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -308,7 +328,7 @@ func (s *Server) ByFlowEventsLimit(ctx context.Context, flow string, limit int) 
 // retention.
 func (s *Server) History(ctx context.Context, execID string, limit int) ([]Event, error) {
 	if !validExecID(execID) {
-		return nil, fmt.Errorf("invalid execution id %q: must match [A-Za-z0-9_-]{1,128}", execID)
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
 	}
 
 	if err := s.Init(ctx); err != nil {

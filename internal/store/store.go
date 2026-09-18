@@ -34,14 +34,21 @@ import (
 )
 
 const (
-	execBucketHistory  = 64
-	eventsMaxAge       = 24 * time.Hour
-	deadLetterMaxAge   = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
-	deadLetterReadWait = 500 * time.Millisecond
-	defaultDLQReadCap  = 100
-	casBackoffBase     = 250 * time.Microsecond
-	casBackoffCap      = 5 * time.Millisecond
-	eventDedupWindow   = 2 * time.Minute
+	execBucketHistory = 64
+	eventsMaxAge      = 24 * time.Hour
+	deadLetterMaxAge  = 30 * 24 * time.Hour // dead-letter records expire after ~30 days
+	// deadLetterDedupWindow collapses re-emissions of the same (kind, key)
+	// dead-letter. A consumer that gives up on poisoned work fails the execution
+	// and then emits — but if the process crashes (or the Term ack is lost)
+	// between emit and Term, the work redelivers and, because failing an
+	// already-failed execution is a no-op success, emits again. The MsgID +
+	// this window make that idempotent so one poisoned item leaves one record.
+	deadLetterDedupWindow = 2 * time.Minute
+	deadLetterReadWait    = 500 * time.Millisecond
+	defaultDLQReadCap     = 100
+	casBackoffBase        = 250 * time.Microsecond
+	casBackoffCap         = 5 * time.Millisecond
+	eventDedupWindow      = 2 * time.Minute
 	// workDedupWindow is set explicitly (rather than relying on NATS's implicit
 	// ~2m default) so the outbox's per-item msg-id dedup — which makes a
 	// re-flushed work item idempotent within the window — is self-documenting and
@@ -107,8 +114,9 @@ type Store struct {
 
 	historyEnabled atomic.Bool // set by EnableHistory; EmitEvent mirrors events into the history stream
 
-	leaseObsMu sync.Mutex
-	leaseObs   map[string]leaseObservation
+	leaseObsMu    sync.Mutex
+	leaseObs      map[string]leaseObservation
+	leaseObsCalls uint64 // triggers a periodic sweep of stale leaseObs entries
 }
 
 // Open ensures every bucket and stream exists, under the given namespace, and
@@ -170,11 +178,12 @@ func Open(ctx context.Context, js jetstream.JetStream, n names.Names) (*Store, e
 	}
 
 	if _, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      n.StreamDeadLetter,
-		Subjects:  []string{n.SubjDeadLetterPrefix + ">"},
-		MaxAge:    deadLetterMaxAge,
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
+		Name:       n.StreamDeadLetter,
+		Subjects:   []string{n.SubjDeadLetterPrefix + ">"},
+		MaxAge:     deadLetterMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: deadLetterDedupWindow,
 	}); err != nil {
 		return nil, fmt.Errorf("deadletter stream: %w", err)
 	}
@@ -220,8 +229,17 @@ func (s *Store) EmitDeadLetter(ctx context.Context, dl DeadLetter) error {
 		return err
 	}
 
-	if _, err = s.js.Publish(ctx, s.names.SubjDeadLetterPrefix+dl.Kind, data); err != nil {
+	// MsgID = kind/key (not deliveries) so a redelivered emit of the same
+	// poisoned item collapses within deadLetterDedupWindow regardless of its
+	// delivery count, leaving exactly one durable record.
+	ack, err := s.js.Publish(ctx, s.names.SubjDeadLetterPrefix+dl.Kind, data,
+		jetstream.WithMsgID(dl.Kind+"/"+dl.Key))
+	if err != nil {
 		return err
+	}
+
+	if ack.Duplicate {
+		return nil // already recorded within the dedup window; don't double-count
 	}
 
 	s.deadLetters.Add(1)
@@ -791,6 +809,18 @@ func (s *Store) collectArchivable(ctx context.Context) ([]archiveCandidate, erro
 		data, marshalErr := s.archivedExecutionData(ctx, e)
 		if marshalErr != nil {
 			return marshalErr
+		}
+
+		// The archived form adds InputHash/ArchivedRevision to a hot document
+		// that already passed the size guard, so it can (barely) exceed the
+		// limit. Skip it — leaving it hot and readable — rather than letting
+		// archive.Create fail with an opaque NATS error and abort the sweep for
+		// every following execution.
+		if s.maxDocBytes > 0 && len(data) > s.maxDocBytes {
+			slog.Warn("archive: skipping oversized execution",
+				"exec", e.ID, "bytes", len(data), "limit", s.maxDocBytes)
+
+			return nil
 		}
 
 		pending = append(pending, archiveCandidate{id: e.ID, data: data, rev: e.Revision})

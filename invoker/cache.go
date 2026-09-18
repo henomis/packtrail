@@ -80,12 +80,27 @@ func NewCacheKeyed(kv jetstream.KeyValue, delegate Invoker, prefix string) *Cach
 
 func (c *Cache) key(req Request) string {
 	// KV keys allow [-/_=.a-zA-Z0-9]; execution/node ids are token-safe.
+	rest := req.ExecutionID + "." + req.NodeID + "."
 	if req.Generation != 0 {
-		return c.prefix + req.ExecutionID + "." + req.NodeID + "." +
-			strconv.FormatUint(req.Generation, 10) + "." + strconv.Itoa(req.Attempt)
+		rest += strconv.FormatUint(req.Generation, 10) + "."
 	}
 
-	return c.prefix + req.ExecutionID + "." + req.NodeID + "." + strconv.Itoa(req.Attempt)
+	rest += strconv.Itoa(req.Attempt)
+
+	if c.prefix == "" {
+		return rest
+	}
+
+	// The prefix is length-prefixed ("<len>=<prefix>", netstring-style) rather
+	// than simply concatenated: two Cache layers sharing one bucket with
+	// different prefixes (e.g. "" and "w.") must never collide on the same key
+	// for different (execution, node) tuples. A fixed delimiter can't guarantee
+	// that for an arbitrary prefix/execution-id combination — e.g. prefix "w."
+	// with ExecutionID "42" and prefix "" with ExecutionID "w" both used to
+	// produce the key "w.42.<gen>.<attempt>" under plain concatenation. A
+	// length prefix makes the prefix/rest boundary unambiguous regardless of
+	// what characters the prefix or the ids contain.
+	return strconv.Itoa(len(c.prefix)) + "=" + c.prefix + rest
 }
 
 // Invoke returns a cached Result for this (execution, node, attempt) if present;
@@ -204,6 +219,18 @@ func (c *Cache) stealExpiredClaim(ctx context.Context, key string, revision uint
 	return c.kv.Update(ctx, key, data, revision)
 }
 
+// claimUntil is the wall-clock instant after which a claim is considered
+// abandoned and stealable by another attempt. It is the call's deadline plus a
+// small grace, so a claimant that finishes within its own deadline always
+// publishes its result before the claim becomes stealable.
+//
+// The grace bounds — but does not eliminate — the double-invocation window: a
+// delegate that keeps running past deadline+grace (i.e. ignores context
+// cancellation) can have its claim stolen and the work re-invoked concurrently.
+// The cache therefore guarantees single-invocation only for delegates that
+// honour cancellation; the engine's contract remains at-least-once, so handlers
+// with external side effects must still be idempotent. A well-behaved delegate
+// that returns promptly on ctx.Done() is never double-invoked here.
 func claimUntil(ctx context.Context, req Request) time.Time {
 	deadline := req.Deadline
 	if deadline.IsZero() {
@@ -269,7 +296,24 @@ func (c *Cache) invokeAndStore(ctx context.Context, key string, claimRev uint64,
 		return res, err
 	}
 
-	// Cache all non-error results including StatusPending. Caching Pending is
+	// A retry is not an outcome, so it is never cached: the claim is expired
+	// exactly as for a returned error, leaving a redelivery free to re-invoke.
+	//
+	// The cache exists to stop a redelivery repeating work that already happened,
+	// which presumes the stored result *is* what happened. StatusRetry says the
+	// opposite: nothing settled, try again. Storing it froze a transient fault
+	// for the entry's whole TTL, so the redelivery that exists to re-attempt the
+	// call was served the cached failure instead and a blip that would have
+	// cleared could not. It also made the two spellings of a transient fault
+	// behave differently — an invoker returning an error retried, an invoker
+	// reporting StatusRetry in band did not — for no reason a caller could see.
+	if res.Status == StatusRetry {
+		c.expireClaim(ctx, key, claimRev)
+
+		return res, nil
+	}
+
+	// Every settled result is cached, including StatusPending. Caching Pending is
 	// intentional: a work item redelivered after a crash would otherwise
 	// re-invoke the node and dispatch a second async activity. The cached
 	// Pending causes re-parking instead, and the outstanding CompleteActivity
@@ -286,7 +330,10 @@ func (c *Cache) invokeAndStore(ctx context.Context, key string, claimRev uint64,
 	}
 
 	if _, putErr := c.kv.Update(ctx, key, data, claimRev); putErr != nil {
-		slog.Debug("invoker cache: store result", "key", key, "err", putErr)
+		// Losing the stored result reopens the double-fire window for a later
+		// redelivery of this attempt, so surface it at Warn (Info is a common
+		// production level) rather than hiding the degradation at Debug.
+		slog.Warn("invoker cache: store result failed; dedup window reopened", "key", key, "err", putErr)
 	}
 
 	return res, nil

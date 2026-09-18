@@ -56,6 +56,24 @@ edges:
 	}
 }
 
+// TestValidateRejectsDuplicateWaitFor: the same wait_for id listed twice in
+// one fanin would double-count that branch's completion toward quorum/all.
+func TestValidateRejectsDuplicateWaitFor(t *testing.T) {
+	_, err := Parse([]byte(`
+name: dup-wait-for
+nodes:
+  - {id: fo, type: fanout, branches: [b1, b2]}
+  - {id: b1, type: task, subject: "x"}
+  - {id: b2, type: task, subject: "y"}
+  - {id: j, type: fanin, wait_for: [b1, b1, b2], join_policy: "quorum:2"}
+edges:
+  - {from: fo, to: j}
+`))
+	if err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("err = %v, want duplicate wait_for rejection", err)
+	}
+}
+
 // TestValidateRejectsOrphanWaitFor: a fanin waiting on a node no fanout
 // dispatches would never settle.
 func TestValidateRejectsOrphanWaitFor(t *testing.T) {

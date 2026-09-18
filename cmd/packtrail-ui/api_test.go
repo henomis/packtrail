@@ -183,6 +183,30 @@ func TestAPIFlowsAndExecutions(t *testing.T) {
 	}
 }
 
+func TestRejectsMalformedInputWith400(t *testing.T) {
+	s := newTestServer(t)
+	h := newAPI(s).routes()
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"malformed exec id", "/api/executions/bad!id"},
+		{"malformed exec id results", "/api/executions/bad!id/results"},
+		{"malformed exec id history", "/api/executions/bad!id/history"},
+		{"unknown status filter", "/api/executions?status=bogus"},
+		{"malformed flow filter", "/api/executions?flow=bad!flow"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if code := doGetCode(t, h, tc.path); code != http.StatusBadRequest {
+				t.Errorf("GET %s = %d, want 400", tc.path, code)
+			}
+		})
+	}
+}
+
 func TestServesDashboard(t *testing.T) {
 	s := newTestServer(t)
 	h := newAPI(s).routes()

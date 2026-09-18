@@ -60,6 +60,20 @@ type generationCompleter interface {
 	) error
 }
 
+// activityFailer settles a parked node as failed without going through a normal
+// completion. A Worker uses it when it is about to drop a job it can never
+// complete, so the execution the job was owed a completion for is failed rather
+// than left parked forever. *packtrail.Server satisfies it.
+//
+// It is an optional interface rather than part of Completer so an embedder
+// hosting its own worker against a hand-written Completer keeps compiling — it
+// simply does not get the settle, exactly as before.
+type activityFailer interface {
+	FailActivity(
+		ctx context.Context, execID, node string, generation uint64, attempt int, reason string,
+	) error
+}
+
 // job is the durable work item a Dispatcher publishes and a Worker consumes. It
 // carries only generic invoker.Request fields — nothing about the kind of work.
 type job struct {

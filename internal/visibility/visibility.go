@@ -31,6 +31,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,6 +54,25 @@ const (
 var allStatuses = []string{
 	store.StatusRunning, store.StatusWaiting, store.StatusCompleted, store.StatusFailed,
 	store.StatusCancelled,
+}
+
+// flowNamePattern mirrors internal/dsl's flow-name token rule. It is restated
+// here rather than imported so this package's public By*/By*Events methods can
+// validate a caller-supplied flow name before using it to build a NATS KV
+// Watch subject filter (kv.Watch(flow+sep+">", ...)): an unvalidated value
+// containing '*' or '>' would otherwise widen the filter to match every flow
+// (or every execution) in the bucket instead of erroring.
+var flowNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func validFlowName(flow string) bool {
+	return flowNamePattern.MatchString(flow)
+}
+
+// validExecStatus reports whether status is one of the closed set of execution
+// statuses, for the same reason flowNamePattern exists: status is used to
+// build a NATS KV Watch subject filter and must never contain wildcards.
+func validExecStatus(status string) bool {
+	return slices.Contains(allStatuses, status)
 }
 
 // Indexer projects domain events into the visibility indexes and answers
@@ -191,7 +212,7 @@ func (ix *Indexer) tryIndex(ctx context.Context, ev store.Event) (bool, error) {
 	}
 
 	if exists && prev.Status != "" && prev.Status != ev.Status {
-		_ = ix.idxStatus.Delete(ctx, prev.Status+sep+ev.ExecID) // best-effort cleanup
+		ix.bestEffortDelete(ctx, ix.idxStatus, prev.Status+sep+ev.ExecID)
 	}
 
 	if _, putErr := ix.idxFlow.Put(ctx, ev.FlowName+sep+ev.ExecID, val); putErr != nil {
@@ -234,7 +255,7 @@ func (ix *Indexer) reassertIndexedEvent(ctx context.Context, prev, stale store.E
 	}
 
 	if prev.Status != stale.Status {
-		_ = ix.idxStatus.Delete(ctx, stale.Status+sep+stale.ExecID)
+		ix.bestEffortDelete(ctx, ix.idxStatus, stale.Status+sep+stale.ExecID)
 	}
 
 	if prev.FlowName != stale.FlowName {
@@ -406,7 +427,7 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 
 	for _, s := range allStatuses {
 		if s != ex.Status {
-			_ = ix.idxStatus.Delete(ctx, s+sep+ex.ID)
+			ix.bestEffortDelete(ctx, ix.idxStatus, s+sep+ex.ID)
 		}
 	}
 
@@ -430,7 +451,14 @@ func (ix *Indexer) reassert(ctx context.Context, ex *store.Execution) error {
 var errStop = errors.New("stop")
 
 // gcCandidate is a terminal index entry GC will check against the store.
-type gcCandidate struct{ flow, status, id string }
+// metaRev is the revision of the bookkeeping (meta) entry at collection time;
+// GC guards the meta delete on it so a re-Start that recreated the id between
+// the absence check and the delete (which rewrites the meta entry to a new
+// revision) is detected and its fresh index entries are left intact.
+type gcCandidate struct {
+	flow, status, id string
+	metaRev          uint64
+}
 
 // GC prunes index entries whose execution no longer exists in either the hot
 // bucket or the cold archive — orphans left behind when an archived terminal
@@ -466,14 +494,36 @@ func (ix *Indexer) GC(ctx context.Context, staleAfter time.Duration) (int, error
 			return pruned, getErr
 		}
 
-		_ = ix.idxFlow.Delete(ctx, c.flow+sep+c.id)
-		_ = ix.idxStatus.Delete(ctx, c.status+sep+c.id)
-		_ = ix.idxFlow.Delete(ctx, metaKey(c.id))
-		_ = ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff) // sweep stale data-plane orphans the archive sweep missed
+		// The meta entry is the commit point: delete it guarded on the revision
+		// observed at collection. A re-Start that recreated this id in the window
+		// since the absence check rewrote the meta entry to a newer revision, so
+		// the guarded delete fails and we skip the membership/payload deletes,
+		// leaving the recreated execution's fresh index entries untouched.
+		if delErr := ix.idxFlow.Delete(ctx, metaKey(c.id), jetstream.LastRevision(c.metaRev)); delErr != nil {
+			slog.Debug("visibility GC: meta delete skipped (recreated or already gone)", "exec", c.id, "err", delErr)
+			continue
+		}
+
+		ix.bestEffortDelete(ctx, ix.idxFlow, c.flow+sep+c.id)
+		ix.bestEffortDelete(ctx, ix.idxStatus, c.status+sep+c.id)
+
+		if sweepErr := ix.store.DeletePayloadsOlderThan(ctx, c.id, cutoff); sweepErr != nil {
+			slog.Debug("visibility GC: sweep payloads", "exec", c.id, "err", sweepErr)
+		}
+
 		pruned++
 	}
 
 	return pruned, nil
+}
+
+// bestEffortDelete removes a key, tolerating a missing key but logging any other
+// failure so a sustained connectivity problem during cleanup is not silent
+// (the entry self-heals on the next full reconcile regardless).
+func (ix *Indexer) bestEffortDelete(ctx context.Context, kv jetstream.KeyValue, key string) {
+	if err := kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		slog.Debug("visibility: best-effort delete failed", "key", key, "err", err)
+	}
 }
 
 // gcCandidates scans the bookkeeping records for terminal entries older than
@@ -497,7 +547,9 @@ func (ix *Indexer) gcCandidates(ctx context.Context, staleAfter time.Duration) (
 			return nil
 		}
 
-		out = append(out, gcCandidate{ev.FlowName, ev.Status, ev.ExecID})
+		out = append(out, gcCandidate{
+			flow: ev.FlowName, status: ev.Status, id: ev.ExecID, metaRev: entry.Revision(),
+		})
 
 		return nil
 	})
@@ -515,11 +567,19 @@ func isTerminal(status string) bool {
 
 // ByStatus returns the ids of executions currently indexed under status.
 func (ix *Indexer) ByStatus(ctx context.Context, status string) ([]string, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectIDs(ctx, ix.idxStatus, status+sep, 0)
 }
 
 // ByFlow returns the ids of executions belonging to flow.
 func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectIDs(ctx, ix.idxFlow, flow+sep, 0)
 }
 
@@ -528,11 +588,19 @@ func (ix *Indexer) ByFlow(ctx context.Context, flow string) ([]string, error) {
 // can build summaries (including the error message) without a per-execution
 // round-trip.
 func (ix *Indexer) ByStatusEvents(ctx context.Context, status string) ([]store.Event, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectEvents(ctx, ix.idxStatus, status+sep, 0)
 }
 
 // ByFlowEvents returns the index entries for all executions belonging to flow.
 func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectEvents(ctx, ix.idxFlow, flow+sep, 0)
 }
 
@@ -541,12 +609,20 @@ func (ix *Indexer) ByFlowEvents(ctx context.Context, flow string) ([]store.Event
 // arbitrary subset, not an ordered page; it is a guardrail against transferring
 // an unbounded result set, not a pagination cursor.
 func (ix *Indexer) ByStatusEventsLimit(ctx context.Context, status string, limit int) ([]store.Event, error) {
+	if !validExecStatus(status) {
+		return nil, fmt.Errorf("visibility: invalid status %q", status)
+	}
+
 	return collectEvents(ctx, ix.idxStatus, status+sep, limit)
 }
 
 // ByFlowEventsLimit is ByFlowEvents capped at limit entries (limit <= 0 means no
 // cap). The same arbitrary-subset caveat as ByStatusEventsLimit applies.
 func (ix *Indexer) ByFlowEventsLimit(ctx context.Context, flow string, limit int) ([]store.Event, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("visibility: invalid flow name %q", flow)
+	}
+
 	return collectEvents(ctx, ix.idxFlow, flow+sep, limit)
 }
 

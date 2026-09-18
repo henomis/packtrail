@@ -31,6 +31,12 @@ const (
 	defaultDrainTimeout    = 30 * time.Second
 	defaultMaxQueuedJobs   = 10_000
 	defaultMaxQueuedBytes  = 1 << 30
+	// minAckWait floors WithAckWait. The heartbeat ticker interval is derived
+	// from ackWait (ackWait/heartbeatDivisor); a caller passing a tiny or
+	// accidental raw-nanosecond Duration (e.g. WithAckWait(2) meaning "2s") must
+	// not be able to push that interval towards zero, since time.NewTicker
+	// panics on a non-positive duration.
+	minAckWait = 1 * time.Second
 	// defaultDedupWindow must exceed the maximum expected lag between a
 	// Dispatcher publishing a job and a Worker consuming it, so a redelivered
 	// dispatch of the same attempt is collapsed.
@@ -85,10 +91,15 @@ func WithConcurrency(n int) Option {
 
 // WithActivityTimeout sets the ceiling/backstop for each invocation the Worker
 // runs (default 5m). A node's own per-call timeout tightens this when shorter;
-// the effective bound is min(node timeout, activityTimeout). A node timeout
-// longer than this ceiling is capped at it, so raise this when nodes legitimately
-// need longer calls. The ack window is extended by heartbeats for the whole
-// duration.
+// the effective bound is min(node timeout, activityTimeout). A node that
+// declares no timeout runs at the full ceiling. The ack window is extended by
+// heartbeats for the whole duration.
+//
+// A node timeout *longer* than this ceiling is a contradiction, not a request:
+// packtrail rejects it at New rather than capping it at run time, since the
+// silent cap turned a step that asked for an hour into a five-minute call and
+// said so only in a log line. Raise this ceiling when nodes legitimately need
+// longer calls.
 func WithActivityTimeout(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
@@ -97,13 +108,28 @@ func WithActivityTimeout(d time.Duration) Option {
 	}
 }
 
+// ActivityTimeout reports the ceiling a set of options resolves to, including
+// the default when none of them set it. It lets the layer that owns both the
+// flow definitions and these options — packtrail.New — compare a node's declared
+// timeout against the ceiling it would run under, before anything runs.
+func ActivityTimeout(opts ...Option) time.Duration {
+	return newConfig(opts).activityTimeout
+}
+
 // WithAckWait sets the job ack window, extended by heartbeats while a job runs
 // (default 30s). A worker that dies mid-job has its job redelivered after this.
+// Non-positive values keep the default; values below 1s are floored to 1s.
 func WithAckWait(d time.Duration) Option {
 	return func(c *config) {
-		if d > 0 {
-			c.ackWait = d
+		if d <= 0 {
+			return
 		}
+
+		if d < minAckWait {
+			d = minAckWait
+		}
+
+		c.ackWait = d
 	}
 }
 

@@ -316,6 +316,53 @@ func TestWorkerRunsExecAndCompletes(t *testing.T) {
 	}
 }
 
+// TestWorkerSurvivesTinyAckWait proves a pathologically small WithAckWait
+// (e.g. an accidental raw-nanosecond Duration meant to be seconds) cannot crash
+// the worker via its heartbeat ticker. Before the fix, the heartbeat goroutine's
+// time.NewTicker(ackWait/heartbeatDivisor) would panic on a non-positive
+// interval with no recover above it, killing the whole test process; a hang or
+// process-level panic here (not a t.Error) is the regression signal.
+func TestWorkerSurvivesTinyAckWait(t *testing.T) {
+	srv := natstest.Start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const prefix, kind = "t", "tinyackwait"
+	if err := asyncqueue.EnsureStream(ctx, srv.JS, prefix, kind); err != nil {
+		t.Fatalf("ensure stream: %v", err)
+	}
+
+	// Long enough to span several heartbeat ticks at the floored interval.
+	exec := invoker.Func(func(_ context.Context, req invoker.Request) (invoker.Result, error) {
+		time.Sleep(250 * time.Millisecond)
+		return invoker.Result{Status: invoker.StatusOK, Payload: req.Payload}, nil
+	})
+
+	completer := newFakeCompleter()
+	w := asyncqueue.NewWorker(srv.JS, prefix, kind, exec, completer, asyncqueue.WithAckWait(1))
+
+	go func() { _ = w.Run(ctx) }()
+
+	d := asyncqueue.NewDispatcher(srv.JS, prefix, kind)
+	if _, err := d.Invoke(ctx, invoker.Request{
+		ExecutionID: "e1", NodeID: "n1", Attempt: 0, Target: "agentA", Payload: []byte(`"hello"`),
+	}); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	select {
+	case <-completer.ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for CompleteActivity")
+	}
+
+	calls := completer.snapshot()
+	if len(calls) != 1 || calls[0].res.Status != invoker.StatusOK {
+		t.Fatalf("completion: got %+v, want one StatusOK completion", calls)
+	}
+}
+
 func TestWorkerResultCacheAvoidsReinvokeAfterCompletionFailure(t *testing.T) {
 	srv := natstest.Start(t)
 

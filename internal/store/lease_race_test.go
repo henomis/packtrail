@@ -17,11 +17,46 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+// TestLeaseObsPrunesStaleEntries proves leaseObs does not grow unbounded for
+// executions this process only ever observes (via LeaseHeld's read-only stall
+// check) but never itself acquires/renews/releases — the only paths that call
+// clearLeaseObservation. leaseRevisionStale is pure in-memory bookkeeping, so a
+// bare Store (no NATS) exercises it directly.
+func TestLeaseObsPrunesStaleEntries(t *testing.T) {
+	s := &Store{}
+
+	now := time.Now()
+	s.leaseObs = map[string]leaseObservation{
+		"stale": {revision: 1, at: now.Add(-2 * leaseObsPruneAge)},
+		"fresh": {revision: 1, at: now},
+	}
+
+	// Drive leaseObsPruneEvery calls for distinct execution ids to trigger the
+	// periodic sweep without waiting leaseObsPruneAge of real time.
+	for i := range leaseObsPruneEvery {
+		s.leaseRevisionStale("driver-"+strconv.Itoa(i), 1, time.Minute)
+	}
+
+	s.leaseObsMu.Lock()
+	_, staleStillThere := s.leaseObs["stale"]
+	_, freshStillThere := s.leaseObs["fresh"]
+	s.leaseObsMu.Unlock()
+
+	if staleStillThere {
+		t.Error("stale leaseObs entry was not pruned by the periodic sweep")
+	}
+
+	if !freshStillThere {
+		t.Error("fresh leaseObs entry was incorrectly pruned")
+	}
+}
 
 // raceKV wraps the leases bucket and runs a hook once, just before the first
 // Update — the window between AcquireLease's read and its CAS write.

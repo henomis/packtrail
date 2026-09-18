@@ -39,6 +39,7 @@ package packtrail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -123,6 +124,12 @@ const (
 // ErrNotFound is returned by Get when an execution does not exist.
 var ErrNotFound = store.ErrNotFound
 
+// ErrInvalidArgument wraps rejections of caller-supplied identifiers (execution
+// IDs, flow names, statuses) that fail validation before any lookup. It lets a
+// transport layer distinguish a client input mistake (map to 400) from a
+// server-side fault (500), via errors.Is.
+var ErrInvalidArgument = errors.New("packtrail: invalid argument")
+
 // defaultResultCacheTTL bounds the result-cache bucket: an entry is only ever
 // read during the redelivery window of its own attempt (ack wait × delivery
 // cap, i.e. minutes), so 24h is a generous ceiling that keeps the bucket from
@@ -138,6 +145,22 @@ var resourceTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 var execIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validExecID(id string) bool { return execIDPattern.MatchString(id) }
+
+// validFlowName reuses the exec-id token rule: flow names share the same
+// [A-Za-z0-9_-]{1,128} shape and, like exec ids, must never carry NATS subject
+// wildcards when a read API turns them into KV Watch filters.
+func validFlowName(name string) bool { return execIDPattern.MatchString(name) }
+
+// validStatus reports whether status is one of the closed set of execution
+// statuses accepted by the By*/By*Events read APIs.
+func validStatus(status string) bool {
+	switch status {
+	case ExecRunning, ExecWaiting, ExecCompleted, ExecFailed, ExecCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // Server is an embeddable packtrail engine instance: it runs the work consumer,
 // visibility indexer and (optionally) reconciliation, and can host built-in
@@ -212,6 +235,19 @@ func New(nc *nats.Conn, opts ...Option) (*Server, error) {
 		return nil, err
 	}
 
+	// A node timeout above its invoker's ceiling contradicts itself: caught here
+	// rather than capped, silently, on the first call.
+	if err = validateNodeTimeouts(flows, &c); err != nil {
+		return nil, err
+	}
+
+	// The payload cap is only meaningful relative to what the connection can
+	// actually carry, which is knowable only from a live connection — so this is
+	// the first point at which the pair can be compared.
+	if err = reconcilePayloadCap(nc, &c); err != nil {
+		return nil, err
+	}
+
 	n := names.New(c.prefix)
 
 	return &Server{
@@ -258,11 +294,123 @@ func validateInvokerKinds(flows map[string]*dsl.Flow, c *config) error {
 	return nil
 }
 
+// reconcilePayloadCap squares the configured per-entry payload cap with what
+// the connected server will actually accept.
+//
+// The cap exists so an over-large entry fails fast with an actionable error
+// instead of an opaque KV write near the transport limit. A cap set *above* that
+// limit therefore disables the guard it configures: an entry under the cap but
+// over the server's max_payload produces exactly the failure the setting was
+// meant to replace, at the worst possible moment — when a task returns a large
+// result, deep inside a running execution.
+//
+// The two cases are not the same and are not treated the same:
+//
+//   - An explicitly configured cap above the server's limit is a contradiction
+//     between two deliberate numbers, like a node timeout above its invoker's
+//     ceiling (see validateNodeTimeouts). It is rejected here rather than
+//     quietly adjusted, because adjusting it would substitute this package's
+//     guess for the caller's stated intent.
+//   - The *default* cap states no intent — it is this package's own guess at a
+//     safe value under a stock 1 MiB server. Against a server configured lower,
+//     it is simply too loose, so it is tightened to the server's limit. That can
+//     only turn an opaque write failure into a clear ErrPayloadTooLarge; it
+//     never rejects an entry the server would have accepted.
+func reconcilePayloadCap(nc *nats.Conn, c *config) error {
+	// A connection with no negotiated limit (not yet connected, or a server that
+	// advertises none) tells us nothing to reconcile against.
+	limit := nc.MaxPayload()
+	if limit <= 0 {
+		return nil
+	}
+
+	// A non-positive value is the documented way to switch the guard off
+	// entirely. That is a decision, not an absence of one, so it is left alone —
+	// tightening it here would silently re-enable a guard the caller disabled.
+	if c.maxPayloadBytes != 0 {
+		if int64(c.maxPayloadBytes) > limit {
+			return fmt.Errorf(
+				"%w: WithMaxPayloadBytes(%d) exceeds this server's max_payload (%d), which disables the guard it "+
+					"configures: an entry between the two would fail as an opaque write error instead of a clear one — "+
+					"lower it to at most %d",
+				ErrInvalidArgument, c.maxPayloadBytes, limit, limit)
+		}
+
+		return nil
+	}
+
+	if limit < store.DefaultMaxPayloadBytes {
+		c.maxPayloadBytes = int(limit)
+	}
+
+	return nil
+}
+
+// validateNodeTimeouts rejects a node whose declared timeout exceeds the
+// ceiling it would actually run under.
+//
+// The async worker used to cap such a node silently — a step asking for an hour
+// under a five-minute activity timeout ran for five minutes, announced only in a
+// log line at the moment of truncation. The two numbers live in different
+// layers (a flow definition and an invoker option) and nothing compared them,
+// so the author's stated intent could be reduced by an order of magnitude
+// without anything failing. They are both known here, before anything runs, and
+// a contradiction between them is a configuration error: the flow says one
+// thing, the invoker another, and no reading of the pair is safe to guess.
+func validateNodeTimeouts(flows map[string]*dsl.Flow, c *config) error {
+	ceilings := make(map[string]time.Duration, len(c.asyncInvokers))
+	for _, ai := range c.asyncInvokers {
+		ceilings[ai.kind] = asyncqueue.ActivityTimeout(ai.opts...)
+	}
+
+	for _, f := range flows {
+		for i := range f.Nodes {
+			n := &f.Nodes[i]
+
+			declared := n.Timeout.D()
+			if declared <= 0 {
+				continue // no timeout: the ceiling governs, nothing to contradict
+			}
+
+			ceiling, async := ceilings[n.InvokerKind()]
+			if !async || declared <= ceiling {
+				continue
+			}
+
+			return fmt.Errorf(
+				"flow %q: node %q declares timeout %s, above the %s activity timeout of invoker kind %q — "+
+					"it would be silently capped; raise WithActivityTimeout or lower the node timeout",
+				f.Name, n.ID, declared, ceiling, n.InvokerKind())
+		}
+	}
+
+	return nil
+}
+
 func validateConfig(c *config) error {
 	// The namespace prefixes every bucket, stream, subject and durable name; an
 	// unsafe one would otherwise fail much later with an opaque NATS error.
-	if c.prefix != "" && !resourceTokenPattern.MatchString(c.prefix) {
-		return fmt.Errorf("invalid namespace %q: must match [A-Za-z0-9_-]{1,64}", c.prefix)
+	// Shared with the exported ValidateNamespace so an embedder pre-checking its
+	// own configuration cannot end up enforcing a different rule than this one.
+	if err := ValidateNamespace(c.prefix); err != nil {
+		return err
+	}
+
+	// The server validates a schedule only on the publish that installs it, and
+	// that publish happens inside the engine goroutine once the deployment is
+	// already up. Without this, a typo'd cron started fine and then took the
+	// engine down later with an opaque failure.
+	for _, rc := range []struct{ option, expr string }{
+		{"WithReconcileActive", c.reconcileActiveCron},
+		{"WithReconcileFull", c.reconcileFullCron},
+	} {
+		if rc.expr == "" {
+			continue
+		}
+
+		if err := ValidateCron(rc.expr); err != nil {
+			return fmt.Errorf("%s: %w", rc.option, err)
+		}
 	}
 
 	syncKinds := make(map[string]bool, len(c.invokers))
@@ -404,13 +552,14 @@ func (s *Server) Init(ctx context.Context) error {
 		DefaultTimeout: s.cfg.defaultTimeout,
 		MaxDeliver:     s.cfg.maxDeliver,
 		DrainTimeout:   s.cfg.drainTimeout,
+		AsyncKinds:     s.cfg.asyncKinds(),
 	})
 	if err != nil {
 		return err
 	}
 
-	// Publish each flow's graph to a KV registry so observability tools (e.g.
-	// packtrail-ui) can render flows without access to the source YAML.
+	// Publish each flow's graph to a KV registry so a process without the source
+	// YAML can render flows (packtrail-ui) and start them (see Server.Start).
 	flowsKV, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: s.names.BucketFlows})
 	if err != nil {
 		return fmt.Errorf("flows bucket: %w", err)
@@ -419,6 +568,13 @@ func (s *Server) Init(ctx context.Context) error {
 	if err = publishFlowGraphs(ctx, flowsKV, s.flowDefs); err != nil {
 		return err
 	}
+
+	// Starting a flow this instance did not load reads its start node from that
+	// same registry. The hook is installed unconditionally: an engine that loaded
+	// the flow answers from memory and never reaches it.
+	eng.OnResolveStartNode(func(ctx context.Context, name string) (string, error) {
+		return startNodeFromRegistry(ctx, flowsKV, name)
+	})
 
 	s.store = st
 	s.engine = eng
@@ -491,6 +647,85 @@ func compileChoiceRules(flows map[string]*dsl.Flow) error {
 
 // publishFlowGraphs writes each flow's graph to the KV registry so observability
 // tools (e.g. packtrail-ui) can render flows without access to the source YAML.
+// startNodeFromRegistry reads a flow's start node from the published flow
+// registry, for starting a flow this instance did not load.
+//
+// A flow absent from the registry is reported as unknown, matching what an
+// engine says about a flow it never loaded — a caller cannot tell (and need not
+// care) which of the two applies.
+func startNodeFromRegistry(ctx context.Context, flowsKV jetstream.KeyValue, name string) (string, error) {
+	entry, err := flowsKV.Get(ctx, name)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return "", fmt.Errorf("unknown flow %q", name)
+		}
+
+		return "", err
+	}
+
+	var g FlowGraph
+	if err = json.Unmarshal(entry.Value(), &g); err != nil {
+		return "", fmt.Errorf("flow %q: unreadable registry entry: %w", name, err)
+	}
+
+	if g.Start != "" {
+		return g.Start, nil
+	}
+
+	// The entry predates FlowGraph.Start. Derive it the way the validator does,
+	// so an upgrade does not have to wait for every engine to restart and
+	// republish. The published graph carries every transition kind the derivation
+	// needs.
+	return deriveStartNode(g)
+}
+
+// deriveStartNode finds the unique node with no inbound transition, mirroring
+// dsl.Flow.determineStartNode over a published graph. It exists only for
+// registry entries written before the start node was published; a graph that
+// does not yield exactly one start node is reported rather than guessed at,
+// since starting at the wrong node would run the flow from the middle.
+func deriveStartNode(g FlowGraph) (string, error) {
+	inbound := make(map[string]bool, len(g.Nodes))
+
+	for _, e := range g.Edges {
+		inbound[e.To] = true
+	}
+
+	for _, n := range g.Nodes {
+		for _, b := range n.Branches {
+			inbound[b] = true
+		}
+
+		for _, w := range n.WaitFor {
+			inbound[w] = true
+		}
+
+		for _, r := range n.Rules {
+			inbound[r.To] = true
+		}
+
+		if n.OnTimeout != "" {
+			inbound[n.OnTimeout] = true
+		}
+	}
+
+	var starts []string
+
+	for _, n := range g.Nodes {
+		if !inbound[n.ID] {
+			starts = append(starts, n.ID)
+		}
+	}
+
+	if len(starts) != 1 {
+		return "", fmt.Errorf(
+			"flow %q: cannot determine the start node from the published graph (found %v); "+
+				"restart an engine that loads this flow to republish it", g.Name, starts)
+	}
+
+	return starts[0], nil
+}
+
 func publishFlowGraphs(ctx context.Context, flowsKV jetstream.KeyValue, flows map[string]*dsl.Flow) error {
 	for name, f := range flows {
 		data, marshalErr := json.Marshal(buildFlowGraph(f))
@@ -563,6 +798,23 @@ func (s *Server) Handle(ctx context.Context, subject string, h Handler) error {
 // returns its (freshly minted) id. The payload must be a JSON object (the keyed
 // context that task/branch/signal results merge into); nil or empty defaults to
 // {}, and a non-object is rejected with an error.
+//
+// It does not require this Server to have loaded the flow. A Server built with
+// only [WithNamespace] — the client shape, the one packtrail-ui uses — reads the
+// flow's start node from the published registry, writes the execution and
+// commits its first work item; whatever engine is running the namespace picks it
+// up from the durable work stream. So an application, a CLI or a UI can launch a
+// flow it holds no definition for, without a request/reply front door of its own
+// and without the duplicate-start hazard one brings (every replica answering the
+// same broadcast, each minting a different id, so idempotency cannot collapse
+// them).
+//
+// The trade for a client is when it learns of a bad flow name. A name in neither
+// the local set nor the registry fails here, as before. A name that is in the
+// registry but that no running engine knows — a flow removed while its entry is
+// still published — starts: the execution is created and its first work item
+// dead-letters, settling the execution as failed with "unknown flow" rather than
+// erroring at the call.
 func (s *Server) Start(ctx context.Context, flow string, payload json.RawMessage) (string, error) {
 	if err := s.Init(ctx); err != nil {
 		return "", err
@@ -598,7 +850,14 @@ func (s *Server) StartWithID(ctx context.Context, execID, flow string, payload j
 // zone. Ticks that would have fired while the NATS server was down are skipped,
 // not replayed — after recovery the schedule resumes at its next occurrence, so
 // downtime spanning N ticks starts zero executions for them, never N.
+//
+// A malformed cron expression is rejected here as [ErrInvalidArgument], rather
+// than being accepted by the publish and dropped by the server.
 func (s *Server) ScheduleFlow(ctx context.Context, name, flow, cronExpr string, payload json.RawMessage) error {
+	if err := ValidateCron(cronExpr); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return err
 	}
@@ -607,6 +866,21 @@ func (s *Server) ScheduleFlow(ctx context.Context, name, flow, cronExpr string, 
 }
 
 // Signal sends an external signal to an execution.
+//
+// **An unknown execID is not an error here**, unlike [Server.Cancel] and
+// [Server.Resume]. A signal is allowed to race ahead of the [Server.Start] that
+// creates its target: the consumer redelivers it until the execution appears,
+// which is what makes "signal the order as soon as the webhook fires" safe
+// without coordinating against the start. Requiring existence at publish time
+// would trade that away.
+//
+// The cost is that a mistyped id also returns nil. It is not silently dropped —
+// after the delivery cap it lands in the dead-letter stream keyed
+// "<execID>/<name>", visible via [Server.RecentDeadLetters] — but the report is
+// asynchronous. A caller whose ids come from a human, rather than from a
+// concurrent Start, should [Server.Get] the execution first and decide for
+// itself; that check is a policy this package cannot make on its behalf without
+// breaking the race tolerance above.
 func (s *Server) Signal(ctx context.Context, execID, name string, payload json.RawMessage) error {
 	if err := s.Init(ctx); err != nil {
 		return err
@@ -618,6 +892,7 @@ func (s *Server) Signal(ctx context.Context, execID, name string, payload json.R
 // SignalWithID sends an external signal with a caller-supplied idempotency key.
 // Reusing the same key for the same execution/signal within the signal stream's
 // duplicate window collapses ambiguous publish retries into one stream entry.
+// Like [Server.Signal], it accepts an execution that does not exist yet.
 func (s *Server) SignalWithID(
 	ctx context.Context, execID, name, idempotencyKey string, payload json.RawMessage,
 ) error {
@@ -666,6 +941,34 @@ func (s *Server) Resume(ctx context.Context, execID string) error {
 	return s.engine.Resume(ctx, execID)
 }
 
+// FailActivity settles a parked asynchronous node as failed, guarded on the node
+// visit (generation) and attempt the caller was working on.
+//
+// It exists for an asynchronous worker that is about to drop a job it can never
+// complete: after the drop, nothing else settles that node — the stall watchdog
+// excludes async waits, because a legitimate one may run arbitrarily long — so
+// the execution would stay `waiting` forever, never completing, never failing,
+// and visible only as a permanently in-flight row. The built-in asyncqueue
+// worker calls this automatically before dead-lettering; it is exported so a
+// worker hosted outside this process can uphold the same guarantee.
+//
+// The execution is left failed, not cancelled, so it stays resumable: fix
+// whatever made the job undeliverable and [Server.Resume] re-runs the node with
+// a fresh retry budget.
+//
+// A stale call — for an earlier visit of a node the flow legally cycles through,
+// or for an execution that has since moved on or gone terminal — is a no-op, not
+// an error.
+func (s *Server) FailActivity(
+	ctx context.Context, execID, node string, generation uint64, attempt int, reason string,
+) error {
+	if err := s.Init(ctx); err != nil {
+		return err
+	}
+
+	return s.engine.FailActivity(ctx, execID, node, generation, attempt, reason)
+}
+
 // Cancel transitions a running or waiting execution to the terminal cancelled
 // state with an optional reason (stored on the execution's error field). It is
 // idempotent and stale-safe: cancelling an already-terminal execution is a
@@ -673,6 +976,11 @@ func (s *Server) Resume(ctx context.Context, execID string) error {
 // an async activity later settled via CompleteActivity — no-ops once the
 // execution is cancelled. A cancelled execution is terminal and, unlike a failed
 // one, cannot be resumed.
+//
+// An execID naming no execution returns [ErrNotFound]. That idempotence is about
+// *state*, not about the id: "already terminal, nothing to do" and "this id
+// names nothing" are opposite answers, and returning success for the second told
+// an operator their runaway execution had been stopped when it had not.
 func (s *Server) Cancel(ctx context.Context, execID, reason string) error {
 	if err := s.Init(ctx); err != nil {
 		return err
@@ -684,6 +992,10 @@ func (s *Server) Cancel(ctx context.Context, execID, reason string) error {
 // Get returns a snapshot of an execution, or ErrNotFound. The execution KV is
 // the source of truth; read it (not the indexes) for correctness decisions.
 func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -698,12 +1010,15 @@ func (s *Server) Get(ctx context.Context, execID string) (*Execution, error) {
 	return &e, nil
 }
 
-// Results assembles an execution's data-plane view — {"input": <start
-// payload>, "results": {<node>: <output>, …}, "signals": {<name>: <payload>,
-// …}} — the same context document invokers and choice rules see. Entries of an
-// archived execution are dropped by the archive sweep, so Results of an
-// archived id returns only what remains.
+// Results assembles an execution's data-plane view: the same context document
+// invokers and choice rules see, decodable with [DecodeContext] into an
+// [InvocationContext]. Entries of an archived execution are dropped by the
+// archive sweep, so Results of an archived id returns only what remains.
 func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -714,6 +1029,10 @@ func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, e
 // ByStatus returns the ids of executions currently indexed under status. The
 // index is eventually consistent (best-effort visibility).
 func (s *Server) ByStatus(ctx context.Context, status string) ([]string, error) {
+	if !validStatus(status) {
+		return nil, fmt.Errorf("%w: unknown status %q", ErrInvalidArgument, status)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -723,6 +1042,10 @@ func (s *Server) ByStatus(ctx context.Context, status string) ([]string, error) 
 
 // ByFlow returns the ids of executions belonging to flow.
 func (s *Server) ByFlow(ctx context.Context, flow string) ([]string, error) {
+	if !validFlowName(flow) {
+		return nil, fmt.Errorf("%w: flow name %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, flow)
+	}
+
 	if err := s.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -996,7 +1319,7 @@ func (s *Server) startAsyncWorkers(ctx context.Context) *sync.WaitGroup {
 			exec = invoker.NewCacheKeyed(s.resultCacheKV, ai.exec, "w.")
 		}
 
-		w := asyncqueue.NewWorker(js, s.prefix, ai.kind, exec, s, append(ai.opts, asyncSink)...)
+		w := asyncqueue.NewWorker(js, s.prefix, ai.kind, exec, s, s.workerOptions(ai.opts, asyncSink)...)
 
 		wg.Add(1)
 
@@ -1010,6 +1333,32 @@ func (s *Server) startAsyncWorkers(ctx context.Context) *sync.WaitGroup {
 	}
 
 	return &wg
+}
+
+// workerOptions builds the option list for a hosted worker: this Server's own
+// derived defaults first, then the caller's options for the kind, then the
+// options the Server must own outright.
+//
+// Order carries the policy. Options are applied in sequence and last write wins,
+// so a value seeded here is a default the caller can override by passing the
+// same option to WithAsyncInvoker, while anything appended after ai.opts is not
+// negotiable.
+func (s *Server) workerOptions(kindOpts []asyncqueue.Option, owned ...asyncqueue.Option) []asyncqueue.Option {
+	opts := make([]asyncqueue.Option, 0, len(kindOpts)+len(owned)+1)
+
+	// A drain budget set on this Server governs the whole graceful shutdown, and
+	// the worker is part of that shutdown: Run waits for the workers to drain
+	// before returning (see the deferred wg.Wait), so a worker left on the
+	// package default outlasts the budget the caller set and Run returns late by
+	// however much the two differ. The caller configured one number for one
+	// shutdown; hosting two clocks for it is this package's problem, not theirs.
+	if s.cfg.drainTimeout > 0 {
+		opts = append(opts, asyncqueue.WithDrainTimeout(s.cfg.drainTimeout))
+	}
+
+	opts = append(opts, kindOpts...)
+
+	return append(opts, owned...)
 }
 
 // Close drains any registered task workers. It does not close the NATS

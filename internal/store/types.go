@@ -83,11 +83,18 @@ type Execution struct {
 	// received-but-unconsumed markers, per signal_name
 	Signals    map[string]bool `json:"signals,omitempty"`
 	WaitSignal string          `json:"wait_signal,omitempty"` // signal_name currently awaited
-	Activity   *ActivityResult `json:"activity,omitempty"`    //nolint:lll // async completion that arrived before the task parked
-	Error      string          `json:"error,omitempty"`
-	RetryAt    time.Time       `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
-	Outbox     []OutboxItem    `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
-	OutboxSeq  uint64          `json:"outbox_seq,omitempty"`
+	// ReleasedBy is the signal_name whose consumption advanced the execution to
+	// ReleasedGeneration, exposed to that node's invocation as released_by. A
+	// signal node produces no output, so without this an invoker cannot tell
+	// which signal released it. Scoped by generation rather than cleared, so a
+	// later node does not inherit it and no extra write is needed to retire it.
+	ReleasedBy         string          `json:"released_by,omitempty"`
+	ReleasedGeneration uint64          `json:"released_generation,omitempty"`
+	Activity           *ActivityResult `json:"activity,omitempty"` //nolint:lll // async completion that arrived before the task parked
+	Error              string          `json:"error,omitempty"`
+	RetryAt            time.Time       `json:"retry_at,omitzero"` //nolint:lll // when the scheduled retry of CurrentNode fires (running + Attempt > 0)
+	Outbox             []OutboxItem    `json:"outbox,omitempty"`  //nolint:lll // follow-on messages committed with the last transition, pending publish
+	OutboxSeq          uint64          `json:"outbox_seq,omitempty"`
 	// ArchivedRevision is persisted only in cold archive records so archived
 	// reconciliation can preserve event ordering from the original hot bucket.
 	ArchivedRevision uint64    `json:"archived_revision,omitempty"`

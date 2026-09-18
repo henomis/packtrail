@@ -172,7 +172,7 @@
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--choice"></span>Conditional routing</h3>
-      <p><code>choice</code> nodes evaluate <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr-lang</a> expressions over the assembled context — <code>input</code>, <code>results</code>, <code>signals</code> — first match wins, expressions compiled at startup, not at runtime.</p>
+      <p><code>choice</code> nodes evaluate <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr-lang</a> expressions over the assembled context — <code>input</code>, <code>results</code>, <code>signals</code>, <code>branches</code>, <code>last_node</code>, <code>released_by</code> — first match wins, expressions compiled at startup, not at runtime.</p>
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--signal"></span>External signals</h3>
@@ -180,7 +180,7 @@
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--task"></span>Async activities</h3>
-      <p>Slow nodes never hold a work slot. The built-in <code>asyncqueue</code> invoker makes any ordinary Invoker durable and asynchronous — dispatch to a work-queue, run on a worker pool, settle via <code>CompleteActivity</code>, at-least-once. Or return <code>StatusPending</code> yourself.</p>
+      <p>Slow nodes never hold a work slot. The built-in <code>asyncqueue</code> invoker makes any ordinary Invoker durable and asynchronous — dispatch to a work-queue, run on a worker pool, settle via <code>CompleteActivityWithGeneration</code>, at-least-once. Or return <code>StatusPending</code> yourself.</p>
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--fan"></span>Cron &amp; timers</h3>
@@ -280,6 +280,10 @@
         <code>packtrail-history</code>
         <span>stream · per-exec trace (opt-in)</span>
       </div>
+      <div class="store store--stream">
+        <code>packtrail-async-&lt;kind&gt;</code>
+        <span>stream · async work-queue (per kind)</span>
+      </div>
       <div class="store store--proj">
         <code>packtrail-idx-status</code>
         <span>KV · projection</span>
@@ -366,7 +370,9 @@
 <span class="cm">// Request carries everything the Invoker needs:</span>
 <span class="cm">//   req.Target      → agent name, URL, subject …</span>
 <span class="cm">//   req.ExecutionID → owning execution</span>
-<span class="cm">//   req.Payload     → assembled {input, results, signals} context</span>
+<span class="cm">//   req.Payload     → assembled context: {input, results, signals,</span>
+<span class="cm">//                     branches, last_node, released_by}</span>
+<span class="cm">//                     — decode with packtrail.DecodeContext</span>
 <span class="cm">//   req.Attempt     → 0-based retry counter</span>
 <span class="cm">//   req.Deadline    → per-node timeout</span>
 
@@ -587,7 +593,7 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
     <h2>Dispatch now. Settle later.</h2>
     <p class="section__sub">
       An Invoker that returns <code>StatusPending</code> parks the execution without blocking
-      a work slot; the worker calls <code>CompleteActivity</code> when done —
+      a work slot; the worker calls <code>CompleteActivityWithGeneration</code> when done —
       idempotent, stale-safe, for task nodes and fan-out branches alike. The built-in
       <code>invoker/asyncqueue</code> package does all of this for you — the manual
       mechanism is shown here.
@@ -607,7 +613,7 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
 ) (packtrail.Result, <span class="kw">error</span>) {
     <span class="cm">// Enqueue into your durable queue (DB, NATS, SQS …)</span>
     <span class="fn">enqueueJob</span>(req.ExecutionID, req.NodeID,
-                req.Attempt, req.Payload)
+                req.Generation, req.Attempt, req.Payload)
 
     <span class="cm">// Engine parks the execution (status=waiting) and</span>
     <span class="cm">// frees its work slot immediately.</span>
@@ -615,16 +621,16 @@ srv, _ := packtrail.<span class="fn">New</span>(nc,
 }
 
 <span class="cm">// later, from the worker that finished the job:</span>
-srv.<span class="fn">CompleteActivity</span>(ctx,
-    execID, nodeID, attempt,
+srv.<span class="fn">CompleteActivityWithGeneration</span>(ctx,
+    execID, nodeID, generation, attempt,
     packtrail.Result{
         Status:  packtrail.<span class="ok">StatusOK</span>,
         Payload: out,
     })
 
-<span class="cm">// CompleteActivity is idempotent and stale-safe:</span>
-<span class="cm">// a duplicate call or one that arrives for the wrong</span>
-<span class="cm">// attempt is a silent no-op — safe for at-least-once workers.</span></code></pre>
+<span class="cm">// Completion is idempotent and stale-safe: a duplicate call,</span>
+<span class="cm">// or one for an earlier visit or the wrong attempt, is a</span>
+<span class="cm">// silent no-op — safe for at-least-once workers.</span></code></pre>
     </div>
 
     <div class="api__envelopes" style="display:flex;flex-direction:column;gap:1.1rem">
@@ -638,7 +644,7 @@ srv.<span class="fn">CompleteActivity</span>(ctx,
       </article>
       <article class="choice-card reveal">
         <h4>Idempotent settlement</h4>
-        <p><code>CompleteActivity</code> is keyed by <code>(execution, node, attempt)</code> — and <code>CompleteActivityWithGeneration</code> also fences the node-visit generation, for flows with legal cycles or <code>Resume</code>. A duplicate or stale completion from an at-least-once worker is a silent no-op. A completion that races ahead of the parking step is stashed and consumed on arrival.</p>
+        <p><code>CompleteActivityWithGeneration</code> is keyed by <code>(execution, node, generation, attempt)</code>, so a completion from an earlier visit — a legal cycle or <code>Resume</code> — can never settle a later one. A job that can never complete fails its node (resumable) instead of leaving the execution <code>waiting</code> forever. A duplicate or stale completion from an at-least-once worker is a silent no-op. A completion that races ahead of the parking step is stashed and consumed on arrival.</p>
       </article>
       <article class="choice-card reveal">
         <h4>Works for fan-out branches</h4>
@@ -688,7 +694,7 @@ srv.<span class="fn">Handle</span>(ctx, <span class="s">"tasks.notify.*"</span>,
 id, _ := srv.<span class="fn">Start</span>(ctx, <span class="s">"agent-pipeline"</span>, payload)
 srv.<span class="fn">Signal</span>(ctx, id, <span class="s">"approval"</span>, data)
 ex, _ := srv.<span class="fn">Get</span>(ctx, id)       <span class="cm">// control-state snapshot</span>
-res, _ := srv.<span class="fn">Results</span>(ctx, id)  <span class="cm">// assembled {input, results, signals}</span>
+res, _ := srv.<span class="fn">Results</span>(ctx, id)  <span class="cm">// assembled context (DecodeContext)</span>
 
 <span class="cm">// Schedule a flow on a cron expression:</span>
 srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, <span class="s">"agent-pipeline"</span>,
@@ -712,7 +718,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
         <div class="optlist__row"><code>WithArchive(retention)</code><span>Sweep terminal non-resumable executions into a cold archive bucket to bound the hot store</span></div>
         <div class="optlist__row"><code>WithStallRedrive(d)</code><span>Stall-watchdog quiet-time threshold (default 5× ack wait; negative disables)</span></div>
         <div class="optlist__row"><code>WithMaxConcurrency(n)</code><span>Cap concurrent work items per instance (default 64)</span></div>
-        <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Timeout for nodes that omit one (default 30 s)</span></div>
+        <div class="optlist__row"><code>WithDefaultTimeout(d)</code><span>Timeout for synchronous nodes that omit one (default 30 s); async kinds use their activity timeout</span></div>
         <div class="optlist__row"><code>WithMaxDeliver(n)</code><span>Deliveries before a poisoned message is dead-lettered instead of retried forever (default 10)</span></div>
         <div class="optlist__row"><code>WithDrainTimeout(d)</code><span>Graceful-shutdown window for in-flight work to settle (default 30 s)</span></div>
         <div class="optlist__row"><code>WithMaxPayloadBytes(n)</code><span>Cap per data-plane entry — start input, node output, signal payload (default 512 KiB)</span></div>
@@ -794,7 +800,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
           <tr><td>GET /api/flows/{name}</td><td>Full flow graph (nodes + edges) as <code>FlowGraph</code></td></tr>
           <tr><td>GET /api/executions</td><td>Execution summaries; filter with <code>?status=</code> or <code>?flow=</code></td></tr>
           <tr><td>GET /api/executions/{id}</td><td><code>Execution</code> control-state snapshot including branches and signals</td></tr>
-          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals}</code> context (data plane)</td></tr>
+          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals, branches, last_node}</code> context (data plane)</td></tr>
           <tr><td>GET /api/executions/{id}/history</td><td>Ordered transition trace (empty unless <code>WithHistory</code>)</td></tr>
           <tr><td>GET /api/deadletters</td><td>Dead-letter count and recent dead-letter records</td></tr>
           <tr><td>GET /api/events</td><td>Live Server-Sent Events stream of every execution transition</td></tr>

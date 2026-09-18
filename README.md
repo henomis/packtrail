@@ -33,7 +33,7 @@ Requires Go 1.26+ and a running **NATS Server 2.12+** with JetStream enabled
 (2.12) for every timer (retry backoff, signal timeouts, cron). Tests embed a
 real NATS server — no external server needed to run them.
 
-> **Upgrading across v0.0.x releases:** the on-NATS layout (bucket and stream
+> **Upgrading across pre-1.0 releases:** the on-NATS layout (bucket and stream
 > shapes) may change between pre-1.0 versions with no migration tooling. Drain
 > in-flight executions before upgrading, or start the new version under a fresh
 > namespace.
@@ -164,15 +164,43 @@ and choice-node `OnError`).
   any edge, choice rule, fanout branch or `on_timeout` route is rejected — dead
   graph configuration is almost always a typo'd target.
 - A `nats-task` subject must be publishable: whitespace or wildcard characters
-  (`*`, `>`) are rejected at load; the `{execution_id}` placeholder is legal.
+  (`*`, `>`) are rejected at load. `{execution_id}` is the only placeholder — any
+  other `{…}` token (a typo like `{exec_id}`) is rejected rather than sent as a
+  literal subject shared by every execution.
+- **Exactly one start node.** The start node is the single node with no inbound
+  transition. When every node is routed into (typically a retry loop back to the
+  first node), the error names the reference that consumed each node, so you can
+  loop back to a later node instead.
+- **Choice nodes route only by their rules.** An outgoing edge from a choice
+  node is rejected, since it would never be taken.
+- **A retry block must be able to retry.** A `retry.backoff` without
+  `retry.max_attempts` is rejected: it would run the node once and never retry.
+- **A node timeout must fit its invoker.** A node selecting an async kind (see
+  [Async activities](#async-activities-long-running-work)) may not declare a
+  `timeout` above that kind's activity timeout — `New` rejects it rather than
+  capping the call silently.
 
 ## Node types
 
 ### `task`
 
-Invokes an Invoker with the assembled context — `{"input": <start payload>,
-"results": {<node>: <output>, …}, "signals": {<name>: <payload>, …}}` — and
-stores whatever it returns as this node's output. The most common node type.
+Invokes an Invoker with the assembled context and stores whatever it returns as
+this node's output. The most common node type. The context is:
+
+```jsonc
+{
+  "input":       {},  // the start payload
+  "results":     {},  // every settled node's output, keyed by node id
+  "signals":     {},  // every received signal payload, keyed by signal name
+  "branches":    {},  // outputs of the fan currently being joined
+  "last_node":   "",  // id of the most recently settled output
+  "released_by": ""   // signal that released the wait just before this node (else omitted)
+}
+```
+
+Decode it with `packtrail.DecodeContext(req.Payload)` into a
+`packtrail.InvocationContext` rather than a hand-written mirror struct, so a
+renamed field fails to compile instead of silently reading as empty.
 
 ```yaml
 - id: step
@@ -211,7 +239,9 @@ evaluated against the assembled context:
   node's output, keyed by node id), `signals` (received signal payloads, keyed
   by signal name), `branches` (the current fan's outputs) and `last_node` (the
   id of the most recently settled output — "the previous step's result" is
-  `results[last_node]`). Reach into them with dotted paths:
+  `results[last_node]`) and `released_by` (the signal that released the wait
+  immediately before this node; empty everywhere else). Reach into them with
+  dotted paths:
   `results.triage.risk_score`, `input.user.tier`, `signals.approval.granted`.
 - **First match wins.** Rules are evaluated top to bottom. Order from most to least
   specific.
@@ -250,7 +280,12 @@ Dispatch multiple branches in parallel and join them back:
   edge must lead to a fanin (that is where the execution parks and the join is
   evaluated), and that fanin may only wait for branches of its own fanout —
   waiting on a subset is fine (join on the critical branches, let the rest
-  settle in the background).
+  settle in the background), but not the same branch twice.
+- A branch is reached only through its fanout. An edge, choice rule or
+  `on_timeout` routed into a branch is rejected (the execution would run that
+  one node and report `completed` with the rest of the flow skipped), and so is
+  an outgoing edge from a branch (the fanin, not the branch, advances the
+  execution — put the edge after the fanin).
 
 ### `signal`
 
@@ -273,15 +308,20 @@ srv.SignalWithID(ctx, execID, "approval", "request-123", json.RawMessage(`{"appr
 ```
 
 The signal payload is stored in the data plane — downstream nodes and choice
-rules see it as `signals.approval` — and execution resumes at the next node. If `timeout` elapses first, the execution advances to `on_timeout`
-instead. An `on_timeout` without a positive `timeout` is rejected at load — the
+rules see it as `signals.approval` — and execution resumes at the next node,
+which sees `released_by: "approval"` in its context (a signal node produces no
+output of its own, so `last_node` does not name it). If `timeout` elapses first,
+the execution advances to `on_timeout` instead and `released_by` stays empty. An `on_timeout` without a positive `timeout` is rejected at load — the
 route could never fire.
 
 Signals are durable and forgiving about ordering: a signal sent before the
 execution reaches its signal node is stored and consumed on arrival, and one
 sent just before the execution is created is redelivered until the execution
-exists. A genuinely orphaned signal (e.g. a typo'd execution id) is
-dead-lettered after the delivery cap instead of vanishing silently. Timeouts
+exists. That is why `Signal` does not reject an unknown execution id: a
+genuinely orphaned signal (e.g. a typo'd execution id) returns nil and is
+dead-lettered after the delivery cap instead of vanishing silently. When the id
+comes from a human rather than a concurrent `Start`, `Get` the execution first.
+Timeouts
 are evaluated by the NATS Message Scheduler at roughly one-second granularity,
 so sub-second `timeout` values fire at the next tick. Use `SignalWithID` when a
 caller needs an idempotency key for ambiguous publish retries; duplicate
@@ -331,9 +371,21 @@ srv, _ := packtrail.New(nc,
 )
 ```
 
-Each kind gets its own work-queue stream, so many workers — in or out of process —
-can share it to scale horizontally; the low-level `asyncqueue.Dispatcher` and
-`asyncqueue.Worker` are exported for out-of-process workers.
+Each kind gets its own work-queue stream (`<ns>-async-<kind>`), so many workers —
+in or out of process — can share it to scale horizontally; the low-level
+`asyncqueue.Dispatcher` and `asyncqueue.Worker` are exported for out-of-process
+workers.
+
+An async node that declares no `timeout` runs under the kind's activity timeout
+(`asyncqueue.WithActivityTimeout`, 5m by default), not `WithDefaultTimeout`. A
+node that declares a longer timeout than that ceiling is rejected by `New` —
+raise `WithActivityTimeout` for the kind instead.
+
+A job the worker can never complete (it exhausted its deliveries) settles its
+node as **failed** via `Server.FailActivity` before it is dead-lettered, so the
+execution does not stay `waiting` forever — and, being failed rather than
+cancelled, it can be `Resume`d once the cause is fixed. The built-in worker does
+this automatically; an out-of-process worker should call `FailActivity` itself.
 
 ### Doing it by hand
 
@@ -364,10 +416,18 @@ for the namespace picks up the resumed work.
 err := srv.Resume(ctx, execID)
 ```
 
+`Cancel(ctx, execID, reason)` moves a running or waiting execution to the
+terminal `cancelled` status, which `Resume` cannot revive. Cancelling an
+execution that is already terminal is a no-op, but an id that names no
+execution at all returns `ErrNotFound` — "nothing left to cancel" and "you
+cancelled nothing" are different answers.
+
 ## Cron scheduling
 
 Start a flow on a recurring schedule with `ScheduleFlow`. The cron expression is
-6-field (`sec min hour dom mon dow`):
+6-field (`sec min hour dom mon dow`), or one of `@yearly`/`@annually`,
+`@monthly`, `@weekly`, `@daily`/`@midnight`, `@hourly`, `@every <duration>` or
+`@at <time>`:
 
 ```go
 // trigger "daily-report" at 08:00 every day
@@ -375,6 +435,10 @@ srv.ScheduleFlow(ctx, "daily-report-schedule", "daily-report", "0 0 8 * * *", ni
 ```
 
 Calling `ScheduleFlow` again with the same name replaces the existing schedule.
+A malformed expression is rejected with `ErrInvalidArgument` (and one passed to
+`WithReconcileActive`/`WithReconcileFull` fails `New`), rather than being
+accepted and failing later inside the engine. `packtrail.ValidateCron(expr)`
+runs the same check for expressions coming from your own configuration.
 
 To also run periodic visibility reconciliation, configure it at startup. There
 are two independent, durable schedules: a cheap active-set pass over in-flight
@@ -430,8 +494,9 @@ type Invoker interface {
 }
 ```
 
-`Request` carries the resolved `Target`, the shared `Payload` (opaque JSON),
-the node-visit `Generation`, the `Attempt` number and a `Deadline`. Return
+`Request` carries the resolved `Target`, the assembled context as `Payload`
+(decode it with `packtrail.DecodeContext` — see [`task`](#task)), the
+node-visit `Generation`, the `Attempt` number and a `Deadline`. Return
 `Result{Status: StatusOK, Payload: out}` to advance with a new node output,
 `StatusError` to fail the node, or `StatusRetry` (or a non-nil error) to retry
 per the node's policy.
@@ -459,6 +524,47 @@ dispatching a second job) and the async worker's execution of your Invoker
 (under a separate keyspace in the same bucket, so a job redelivered after a
 worker crash serves the completed result instead of re-firing the side effect).
 
+## Clients and higher-level layers
+
+A `Server` built with only `WithNamespace` is a **client**: it loads no flows and
+runs no engine, but can read, signal, cancel — and **start** — executions of a
+running deployment. `Start`/`StartWithID` read the flow's start node from the
+flow registry (published by every engine at startup), write the execution and
+commit its first work item for whichever engine runs the namespace. A flow name
+in neither the local set nor the registry fails at the call; a name still
+published but known to no running engine starts, then fails with
+`unknown flow` once its first work item dead-letters.
+
+```go
+client, _ := packtrail.New(nc, packtrail.WithNamespace("acme"))
+
+// Provisioning is lazy, so any call on a Server creates the namespace's
+// resources. Check first when the namespace comes from a human:
+ok, err := packtrail.Exists(ctx, nc, "acme")
+if err != nil {
+    return err
+}
+if !ok {
+    return fmt.Errorf("no packtrail deployment for namespace %q", "acme")
+}
+id, _ := client.Start(ctx, "agent-pipeline", payload)
+```
+
+For layers that compile their own configuration into packtrail (a CLI, a
+different flow syntax, a platform), the package exports the rules it enforces
+so they can be checked early and never drift:
+
+| Helper | Purpose |
+|--------|---------|
+| `Exists(ctx, nc, namespace)` | Report whether a namespace was ever provisioned, without provisioning it |
+| `ValidateNamespace(ns)` | The `WithNamespace` rule (`[A-Za-z0-9_-]{1,64}`); validate the composed string |
+| `ValidateCron(expr)` | The cron grammar `ScheduleFlow` and the reconcile options accept |
+| `DecodeContext(doc)` / `InvocationContext` | Decode `Request.Payload` or `Server.Results` into the typed context |
+| `VarInput`, `VarResults`, `VarSignals`, `VarBranches`, `VarLastNode`, `VarReleasedBy` | The variable names a choice `when` expression can reference |
+| `FlowSchemaVersion` | The `version` a `FlowDef` must carry for this build |
+| `ErrInvalidArgument` | Wraps rejected caller input (ids, flow names, statuses, cron, namespace); map it to a 400 with `errors.Is` |
+| `Server.FailActivity(ctx, execID, node, gen, attempt, reason)` | Settle a parked async node as failed — for an out-of-process worker about to drop a job |
+
 ## Server options
 
 | Option | Default | Description |
@@ -475,14 +581,14 @@ worker crash serves the completed result instead of re-firing the side effect).
 | `WithStallRedrive(d)` | 5× ack wait | Stall watchdog threshold: an active execution quiet past `d` — outside any retry backoff and not lease-held — gets its work item re-driven (heals lost work after a crash); negative disables |
 | `WithReconcileFull(cronExpr)` | — | Schedule the authoritative full reconcile; also runs fired-schedule reclaim, archival sweep and index GC. Keep it well below the active cadence |
 | `WithArchive(retention)` | disabled | Sweep completed executions into a cold archive bucket retained for `retention`; bounds the hot bucket while keeping retained archive records queryable/idempotent. Runs on the full-reconcile schedule |
-| `WithSignalRetention(d)` | `7d` | Signal stream retention and dedupe-window ceiling; raise if executions may wait through a longer outage |
+| `WithSignalRetention(d)` | `7d` | Signal stream retention and dedupe-window ceiling; raise if executions may wait through a longer outage. Omitted, an existing stream keeps its current retention (so a namespace-only client never retunes the engine's) |
 | `WithOwnerID(id)` | random | Stable per-instance lease owner id |
 | `WithLeaseTTL(d)` | `30s` | Ownership lease TTL; a contender may take over after observing the same foreign lease revision unchanged for roughly this long |
 | `WithMaxConcurrency(n)` | `64` | Max work items processed concurrently per instance |
-| `WithDefaultTimeout(d)` | `30s` | Invocation timeout for nodes that omit one |
+| `WithDefaultTimeout(d)` | `30s` | Invocation timeout for synchronous nodes that omit one (async kinds use their activity timeout) |
 | `WithMaxDeliver(n)` | `10` | Deliveries of a work item, fired schedule or signal before it is dead-lettered instead of retried forever; non-positive values are treated as the default (the cap cannot be disabled) |
-| `WithDrainTimeout(d)` | `30s` | Graceful-shutdown window for in-flight work to settle before stragglers are abandoned to redelivery |
-| `WithMaxPayloadBytes(n)` | `512 KiB` | Cap on a single payload entry (start input, one node's output, one signal); an over-limit output fails its node with a clear reason (negative disables) |
+| `WithDrainTimeout(d)` | `30s` | Graceful-shutdown window for in-flight work to settle before stragglers are abandoned to redelivery; also the default drain budget of hosted async workers (`asyncqueue.WithDrainTimeout` overrides per kind) |
+| `WithMaxPayloadBytes(n)` | `512 KiB` | Cap on a single payload entry (start input, one node's output, one signal); an over-limit output fails its node with a clear reason (negative disables). A value above the server's `max_payload` fails `New`; the default is lowered to it on a smaller server |
 | `WithMaxDocumentBytes(n)` | `768 KiB` | Cap on the execution control document; protects very wide fanouts or large outboxes from opaque NATS size errors (negative disables) |
 | `WithHistory(retention)` | disabled | Durable per-execution transition trace in a `<ns>-history` stream, queryable via `Server.History` for `retention` |
 
@@ -526,6 +632,9 @@ backing API is also usable directly:
 | `GET /api/executions/{id}/history` | ordered transition trace (`?limit=`; empty unless `WithHistory`) |
 | `GET /api/deadletters` | dead-letter count + recent records |
 | `GET /api/events` | live transitions (Server-Sent Events) |
+
+A malformed execution id, flow name or `status` is answered with `400`
+(`ErrInvalidArgument`); an unknown flow or execution with `404`.
 
 The same data is available programmatically via `Server`:
 

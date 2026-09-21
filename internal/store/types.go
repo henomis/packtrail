@@ -19,6 +19,7 @@ package store
 
 import (
 	"encoding/json"
+	"slices"
 	"time"
 )
 
@@ -190,13 +191,14 @@ func (e *Execution) OutputVersion(node string) string {
 	return e.OutputVersions[node]
 }
 
+// appendOutput records node as the most recently settled output. Outputs is in
+// settle order and last_node is its final element, so a node settling again —
+// a revisit in a cycle — moves to the end rather than keeping the position of
+// its first visit. Keeping that position made last_node name whichever node
+// had first settled last, so the step after a loop was handed an older node's
+// output as "the previous step".
 func (e *Execution) appendOutput(node string) {
-	for _, n := range e.Outputs {
-		if n == node {
-			return
-		}
-	}
-
+	e.Outputs = slices.DeleteFunc(e.Outputs, func(n string) bool { return n == node })
 	e.Outputs = append(e.Outputs, node)
 }
 

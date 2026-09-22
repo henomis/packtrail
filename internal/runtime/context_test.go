@@ -17,6 +17,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -348,4 +349,61 @@ func TestVisitsCountEntriesNotAttempts(t *testing.T) {
 	}
 
 	h.waitStatus(t, id, store.StatusCompleted, 15*time.Second)
+}
+
+// loopFlow cycles work → gate → retry → work until work reports round 2. The
+// gate routes on results[last_node], so it only ever exits if last_node names
+// work on the revisit, not retry (which settled after work's first visit).
+const loopFlow = `
+name: loop
+nodes:
+  - {id: start, type: task, subject: "tasks.start.{execution_id}"}
+  - {id: work, type: task, subject: "tasks.work.{execution_id}"}
+  - id: gate
+    type: choice
+    on_error: fail
+    rules:
+      - {when: 'results[last_node].round >= 2', to: done}
+      - {default: true, to: retry}
+  - {id: retry, type: task, subject: "tasks.retry.{execution_id}"}
+  - {id: done, type: task, subject: "tasks.done.{execution_id}"}
+edges:
+  - {from: start, to: work}
+  - {from: work, to: gate}
+  - {from: retry, to: work}
+`
+
+// TestLastNodeFollowsRevisits: after a cycle, last_node names the node that
+// settled most recently, not the one whose first visit came last.
+func TestLastNodeFollowsRevisits(t *testing.T) {
+	h := newHarness(t, loopFlow, Config{})
+
+	h.serve(t, "tasks.start.*", passthrough)
+
+	rounds := 0
+
+	h.serve(t, "tasks.work.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		rounds++
+
+		return protocol.TaskResponse{
+			Status:  protocol.StatusOK,
+			Payload: json.RawMessage(fmt.Sprintf(`{"round":%d}`, rounds)),
+		}, nil
+	})
+	h.serve(t, "tasks.retry.*", passthrough)
+
+	done := newCapture("done")
+	h.serve(t, "tasks.done.*", done.handler(t))
+
+	id, err := h.engine.Start(context.Background(), "loop", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	got := done.wait(t)
+	if got.LastNode != "work" {
+		t.Errorf("done saw last_node = %q, want work (the node that settled just before the gate)", got.LastNode)
+	}
+
+	h.waitStatus(t, id, store.StatusCompleted, 5*time.Second)
 }

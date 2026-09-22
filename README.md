@@ -194,7 +194,8 @@ this node's output. The most common node type. The context is:
   "signals":     {},  // every received signal payload, keyed by signal name
   "branches":    {},  // outputs of the fan currently being joined
   "last_node":   "",  // id of the most recently settled output
-  "released_by": ""   // signal that released the wait just before this node (else omitted)
+  "released_by": "",  // signal that released the wait just before this node (else omitted)
+  "visits":      {}   // times each node has been entered, keyed by node id
 }
 ```
 
@@ -239,10 +240,27 @@ evaluated against the assembled context:
   node's output, keyed by node id), `signals` (received signal payloads, keyed
   by signal name), `branches` (the current fan's outputs) and `last_node` (the
   id of the most recently settled output — "the previous step's result" is
-  `results[last_node]`) and `released_by` (the signal that released the wait
-  immediately before this node; empty everywhere else). Reach into them with
+  `results[last_node]`), `released_by` (the signal that released the wait
+  immediately before this node; empty everywhere else) and `visits` (how many
+  times each node has been entered, keyed by node id). Reach into them with
   dotted paths:
-  `results.triage.risk_score`, `input.user.tier`, `signals.approval.granted`.
+  `results.triage.risk_score`, `input.user.tier`, `signals.approval.granted`,
+  `visits.verify`.
+- **Bounding a loop.** `visits` counts node *entries*, not attempts: a node
+  retried three times on one visit counts once, and a `Resume` re-enters the
+  node it failed on. It is what lets a cycle stop itself without every node
+  keeping its own tally:
+
+  ```yaml
+  - id: gate
+    type: choice
+    rules:
+      - {when: 'results.verify.pass == true', to: publish}
+      - {when: 'visits.verify >= 3', to: escalate}
+      - {default: true, to: fix}
+  ```
+
+  A fan-out branch is counted too, though it never becomes the current node.
 - **First match wins.** Rules are evaluated top to bottom. Order from most to least
   specific.
 - **`default` is required.** Validation rejects a choice node without a
@@ -475,7 +493,7 @@ Two design rules make crashes boring:
   with payload bytes, and a flow's size is bounded per-output (see
   `WithMaxPayloadBytes`), not per-flow. Read the assembled view with
   `Server.Results(ctx, id)` — the same
-  `{input, results, signals, branches, last_node}` document invokers and choice
+  `{input, results, signals, branches, last_node, visits}` document invokers and choice
   rules see.
 - **Transactional outbox.** Every state transition commits its follow-on work
   (the next work item, a retry timer, a join re-evaluation) *in the same CAS
@@ -633,7 +651,7 @@ backing API is also usable directly:
 | `GET /api/flows/{name}` | flow graph (`FlowGraph`) |
 | `GET /api/executions[?status=&flow=]` | execution summaries (filtered = indexed lookup; unfiltered = full hot-bucket scan) |
 | `GET /api/executions/{id}` | execution control-state snapshot |
-| `GET /api/executions/{id}/results` | assembled `{input, results, signals, branches, last_node}` context |
+| `GET /api/executions/{id}/results` | assembled `{input, results, signals, branches, last_node, visits}` context |
 | `GET /api/executions/{id}/history` | ordered transition trace (`?limit=`; empty unless `WithHistory`) |
 | `GET /api/deadletters` | dead-letter count + recent records |
 | `GET /api/events` | live transitions (Server-Sent Events) |

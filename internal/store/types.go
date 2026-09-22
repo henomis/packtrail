@@ -75,6 +75,10 @@ type Execution struct {
 	NodeGeneration uint64 `json:"node_generation,omitempty"`
 	// attempts spent on CurrentNode (task retries)
 	Attempt int `json:"attempt"`
+	// how many times each node has been entered, keyed by node id. Counts
+	// visits, not attempts: a node retried three times on one visit counts
+	// once. Bounded by the flow's node count, not by how long it runs.
+	Visits map[string]uint64 `json:"visits,omitempty"`
 	// node ids with a stored output, in settle order
 	Outputs        []string               `json:"outputs,omitempty"`
 	OutputVersions map[string]string      `json:"output_versions,omitempty"` // committed versioned output keys, per node
@@ -101,6 +105,37 @@ type Execution struct {
 	Revision         uint64    `json:"-"` // current KV revision, for CAS (not persisted in hot values)
 	UpdatedAt        time.Time `json:"updated_at"`
 }
+
+// EnterNode moves the execution onto node: it becomes CurrentNode, the visit
+// generation advances, and the node's visit count goes up. Call inside the
+// Mutate callback that commits the transition.
+//
+// A cycle revisits a node, and a Resume re-enters the one it failed on, so this
+// is the one place that knows a visit happened — nothing else can reconstruct
+// the count afterwards, since the document keeps no per-node history.
+func (e *Execution) EnterNode(node string) {
+	e.CurrentNode = node
+	e.NodeGeneration++
+	e.CountVisit(node)
+}
+
+// CountVisit records a visit to node without moving the execution onto it: a
+// fan-out branch runs as a node but never becomes CurrentNode, and would
+// otherwise be the one node kind with no visit count.
+func (e *Execution) CountVisit(node string) {
+	if node == "" {
+		return
+	}
+
+	if e.Visits == nil {
+		e.Visits = make(map[string]uint64, 1)
+	}
+
+	e.Visits[node]++
+}
+
+// Visit returns how many times node has been entered, 0 if never.
+func (e *Execution) Visit(node string) uint64 { return e.Visits[node] }
 
 // AddOutput records that node's legacy output exists in the data plane. Call
 // inside the Mutate callback that commits the settle; idempotent per node.

@@ -536,6 +536,7 @@ func (e *Engine) start(ctx context.Context, id, flowName string, payload json.Ra
 		CurrentNode:    startNode,
 		Status:         store.StatusRunning,
 		NodeGeneration: 1,
+		Visits:         map[string]uint64{startNode: 1},
 	}
 
 	// The first work item is committed in the same write that creates the
@@ -945,6 +946,7 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 		Branches:   currentFanBranches(ex, results),
 		LastNode:   lastNode,
 		ReleasedBy: releasedBy(ex),
+		Visits:     visits(ex),
 	})
 }
 
@@ -963,6 +965,21 @@ func (e *Engine) assembleContext(ctx context.Context, ex *store.Execution) (json
 // so the highest generation present is the most recent fan. That is the fan
 // being joined at the fanin and at the node after it, which is where branches is
 // read. Earlier fans stay reachable in full through results.
+// visits copies the per-node visit counts into the assembled document, so a
+// node reading it cannot reach the live execution state behind it.
+func visits(ex *store.Execution) map[string]uint64 {
+	if len(ex.Visits) == 0 {
+		return nil
+	}
+
+	out := make(map[string]uint64, len(ex.Visits))
+	for node, n := range ex.Visits {
+		out[node] = n
+	}
+
+	return out
+}
+
 func currentFanBranches(ex *store.Execution, results map[string]json.RawMessage) map[string]json.RawMessage {
 	branches := map[string]json.RawMessage{}
 
@@ -1959,8 +1976,7 @@ func (e *Engine) advanceToGenerationAttempt(
 			ex.CurrentNode = ""
 		} else {
 			ex.Status = store.StatusRunning
-			ex.CurrentNode = nextNode
-			ex.NodeGeneration++
+			ex.EnterNode(nextNode)
 			ex.AppendWork(item)
 		}
 
@@ -2493,7 +2509,8 @@ func (e *Engine) Resume(ctx context.Context, execID string) error {
 			ex.ReleasedGeneration++
 		}
 
-		ex.NodeGeneration++
+		// A resume re-enters the node it failed on: another visit of the same node.
+		ex.EnterNode(ex.CurrentNode)
 		ex.Error = ""
 		ex.Activity = nil
 		ex.RetryAt = time.Time{}

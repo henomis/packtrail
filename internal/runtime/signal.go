@@ -401,8 +401,7 @@ func consumeSignal(ex *store.Execution, name, nextNode string, outcome signalOut
 	}
 
 	ex.Status = store.StatusRunning
-	ex.CurrentNode = nextNode
-	ex.NodeGeneration++
+	ex.EnterNode(nextNode)
 
 	if outcome == signalArrived {
 		// Recorded against the generation just entered, so assembleContext

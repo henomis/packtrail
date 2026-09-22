@@ -39,6 +39,7 @@ const (
 	VarBranches   = "branches"
 	VarLastNode   = "last_node"
 	VarReleasedBy = "released_by"
+	VarVisits     = "visits"
 )
 
 // Context is the assembled invocation document.
@@ -74,6 +75,17 @@ type Context struct {
 	// inherit it, so it cannot be mistaken for "some signal arrived at some
 	// point" — that question is answered by Signals.
 	ReleasedBy string `json:"released_by,omitempty"`
+	// Visits counts how many times each node has been entered so far, keyed by
+	// node id, including the node being invoked (so its own count is at least
+	// 1). It counts visits, not attempts: a node retried three times on one
+	// visit counts once.
+	//
+	// It exists so a cycle can bound itself. A flow that loops until something
+	// passes has no other way to ask "how many times have I been here?" — the
+	// engine knows, the document did not say, and every caller re-invented the
+	// count in its own node outputs, which breaks as soon as a flow has two
+	// loops.
+	Visits map[string]uint64 `json:"visits,omitempty"`
 }
 
 // Decode parses an assembled document, tolerating an empty one (which yields a
@@ -104,5 +116,6 @@ func Env() map[string]any {
 		VarBranches:   map[string]any{},
 		VarLastNode:   "",
 		VarReleasedBy: "",
+		VarVisits:     map[string]any{},
 	}
 }

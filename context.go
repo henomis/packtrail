@@ -71,4 +71,7 @@ const (
 	// VarReleasedBy is the signal that released the wait immediately before this
 	// node, and empty at every other node.
 	VarReleasedBy = invocation.VarReleasedBy
+	// VarVisits maps node id to how many times that node has been entered, so a
+	// cycle can bound itself (visits.verify >= 3).
+	VarVisits = invocation.VarVisits
 )

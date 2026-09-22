@@ -416,11 +416,16 @@ for the namespace picks up the resumed work.
 err := srv.Resume(ctx, execID)
 ```
 
-`Cancel(ctx, execID, reason)` moves a running or waiting execution to the
-terminal `cancelled` status, which `Resume` cannot revive. Cancelling an
-execution that is already terminal is a no-op, but an id that names no
-execution at all returns `ErrNotFound` — "nothing left to cancel" and "you
-cancelled nothing" are different answers.
+`Cancel(ctx, execID, reason)` moves a running, waiting or **failed** execution
+to the terminal `cancelled` status, which `Resume` cannot revive. Cancelling a
+failed one is how you retire it: failed is terminal but resumable, so it would
+otherwise stay revivable forever with no way to give up on it, and it stays in
+the hot bucket while it does. The failure reason is kept alongside the cancel
+reason rather than overwritten.
+
+Cancelling an execution that is already completed or cancelled is a no-op, but
+an id that names no execution at all returns `ErrNotFound` — "nothing left to
+cancel" and "you cancelled nothing" are different answers.
 
 ## Cron scheduling
 

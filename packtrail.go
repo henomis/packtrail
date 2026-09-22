@@ -969,13 +969,19 @@ func (s *Server) FailActivity(
 	return s.engine.FailActivity(ctx, execID, node, generation, attempt, reason)
 }
 
-// Cancel transitions a running or waiting execution to the terminal cancelled
-// state with an optional reason (stored on the execution's error field). It is
-// idempotent and stale-safe: cancelling an already-terminal execution is a
-// no-op, and any in-flight work — pending retries, fanin joins, signal waits, or
-// an async activity later settled via CompleteActivity — no-ops once the
-// execution is cancelled. A cancelled execution is terminal and, unlike a failed
-// one, cannot be resumed.
+// Cancel transitions a running, waiting or failed execution to the terminal
+// cancelled state with an optional reason (stored on the execution's error
+// field). It is idempotent and stale-safe: cancelling a completed or already
+// cancelled execution is a no-op, and any in-flight work — pending retries,
+// fanin joins, signal waits, or an async activity later settled via
+// CompleteActivity — no-ops once the execution is cancelled. A cancelled
+// execution is terminal and, unlike a failed one, cannot be resumed.
+//
+// Cancelling a failed execution is how one is retired: failed is terminal but
+// resumable, so without this an operator could revive it forever and retire it
+// never. The failure reason is kept alongside the cancel reason rather than
+// overwritten — it is why they were looking at the execution in the first
+// place. Once cancelled it is archivable, so it also leaves the hot bucket.
 //
 // An execID naming no execution returns [ErrNotFound]. That idempotence is about
 // *state*, not about the id: "already terminal, nothing to do" and "this id

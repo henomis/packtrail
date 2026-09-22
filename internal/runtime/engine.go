@@ -2535,12 +2535,16 @@ func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 	}
 
 	updated, err := e.store.Mutate(ctx, execID, func(ex *store.Execution) error {
-		if !ex.Active() {
-			return errSkip // already terminal: no-op
+		// Failed is terminal but resumable, so cancelling it is the act that
+		// gives up on it for good — the only way an operator can retire an
+		// execution they are never going to fix. Completed and cancelled are
+		// past any decision: no-op.
+		if !ex.Active() && ex.Status != store.StatusFailed {
+			return errSkip
 		}
 
+		ex.Error = cancelReason(reason, ex)
 		ex.Status = store.StatusCancelled
-		ex.Error = reason
 
 		return nil
 	})
@@ -2559,6 +2563,21 @@ func (e *Engine) Cancel(ctx context.Context, execID, reason string) error {
 	e.emitEvent(ctx, updated)
 
 	return nil
+}
+
+// cancelReason composes what an execution records for a cancel. Cancelling a
+// failed execution must not erase why it failed: that reason is the whole
+// reason an operator is looking at it, and cancelling is how they file it away.
+func cancelReason(reason string, ex *store.Execution) string {
+	if ex.Status != store.StatusFailed || ex.Error == "" {
+		return reason
+	}
+
+	if reason == "" {
+		return "cancelled after failure: " + ex.Error
+	}
+
+	return reason + " (after failure: " + ex.Error + ")"
 }
 
 // cancelAbsent decides what a Cancel means when the hot bucket has no such

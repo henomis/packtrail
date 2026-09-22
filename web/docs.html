@@ -400,7 +400,9 @@ log.<span class="fn">Printf</span>(<span class="s">"started %s"</span>, id)
         <code>input</code> (the start payload), <code>results</code> (each visited node's output, keyed
         by node id), <code>signals</code> (received signal payloads, keyed by signal name),
         <code>branches</code> (the current fan's outputs), <code>last_node</code> (the id of the most
-        recently settled output — "the previous step's result" is <code>results[last_node]</code>) and
+        recently settled output — "the previous step's result" is <code>results[last_node]</code>),
+        <code>visits</code> (how many times each node has been entered, keyed by node id — the way a cycle
+        bounds itself, e.g. <code>visits.verify &gt;= 3</code>) and
         <code>released_by</code> (the signal that released the wait immediately before this node; empty
         everywhere else).
         Reach into them with dotted paths (<code>results.triage.risk_score</code>,
@@ -577,6 +579,7 @@ packtrail.<span class="fn">WithInvoker</span>(<span class="s">"agent"</span>, ag
           <tr><td>signals</td><td>Every received signal payload, keyed by signal name.</td></tr>
           <tr><td>branches</td><td>Outputs of the fan currently being joined, keyed by branch id.</td></tr>
           <tr><td>last_node</td><td>Id of the most recently settled output — the previous step is <code>results[last_node]</code>. Signal nodes produce no output, so never appear here.</td></tr>
+          <tr><td>visits</td><td>How many times each node has been entered, keyed by node id. Counts entries, not attempts: a node retried three times on one visit counts once.</td></tr>
           <tr><td>released_by</td><td>The signal that released the wait immediately before this node; omitted at every other node. Its payload is <code>signals[released_by]</code>.</td></tr>
         </tbody>
       </table>
@@ -855,7 +858,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>CompleteActivity(ctx, execID, node, attempt, res)</td><td>Settle an async activity previously reported as <code>StatusPending</code>. Idempotent.</td></tr>
           <tr><td>CompleteActivityWithGeneration(ctx, execID, node, gen, attempt, res)</td><td>Generation-fenced settlement using <code>Request.Generation</code> — preferred when flows have legal cycles or use <code>Resume</code>.</td></tr>
           <tr><td>Resume(ctx, execID)</td><td>Revive a failed execution with a fresh retry budget.</td></tr>
-          <tr><td>Cancel(ctx, execID, reason)</td><td>Transition a running/waiting execution to the terminal <code>cancelled</code> status. Abandon, not interrupt; a no-op if already terminal, <code>ErrNotFound</code> for an unknown id.</td></tr>
+          <tr><td>Cancel(ctx, execID, reason)</td><td>Transition a running, waiting or failed execution to the terminal <code>cancelled</code> status. Abandon, not interrupt; cancelling a failed execution retires it (it can no longer be resumed, and the failure reason is kept). A no-op if already completed or cancelled, <code>ErrNotFound</code> for an unknown id.</td></tr>
           <tr><td>FailActivity(ctx, execID, node, gen, attempt, reason)</td><td>Settle a parked async node as <code>failed</code> (resumable) — for a worker about to drop a job it can never complete. Stale calls are no-ops.</td></tr>
           <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> control-state snapshot, or <code>ErrNotFound</code>.</td></tr>
           <tr><td>Results(ctx, execID)</td><td>The assembled <a href="#invoker-context">invocation context</a> — what invokers and choice rules see; decode with <code>DecodeContext</code>.</td></tr>
@@ -1022,7 +1025,7 @@ id, _ := client.<span class="fn">Start</span>(ctx, <span class="s">"research-pip
           <tr><td>GET /api/flows/{name}</td><td>Full <code>FlowGraph</code> (nodes + edges).</td></tr>
           <tr><td>GET /api/executions</td><td>Execution summaries; filter with <code>?status=</code> or <code>?flow=</code>.</td></tr>
           <tr><td>GET /api/executions/{id}</td><td><code>Execution</code> control-state snapshot.</td></tr>
-          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals, branches, last_node}</code> context (data plane).</td></tr>
+          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals, branches, last_node, visits}</code> context (data plane).</td></tr>
           <tr><td>GET /api/executions/{id}/history</td><td>Ordered transition trace (<code>?limit=</code>; empty unless <code>WithHistory</code>).</td></tr>
           <tr><td>GET /api/deadletters</td><td>Dead-letter count and recent dead-letter records.</td></tr>
           <tr><td>GET /api/events</td><td>Live Server-Sent Events stream of every transition.</td></tr>

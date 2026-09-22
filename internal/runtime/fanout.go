@@ -104,6 +104,7 @@ func ensurePendingBranches(ex *store.Execution, node *dsl.Node) error {
 		bs, ok := ex.Branches[b]
 		if !ok || bs.Generation != ex.NodeGeneration {
 			ex.ClearOutput(b)
+			ex.CountVisit(b)
 			ex.Branches[b] = store.BranchState{NodeID: b, Status: store.BranchPending, Generation: ex.NodeGeneration}
 		}
 	}
@@ -150,8 +151,7 @@ func (e *Engine) parkAtFanin(
 		}
 
 		ex.Status = store.StatusWaiting
-		ex.CurrentNode = fanin
-		ex.NodeGeneration++
+		ex.EnterNode(fanin)
 		ex.Attempt = 0
 		ex.AppendWork(evalItem)
 

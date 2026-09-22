@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -245,4 +246,106 @@ func TestReleasedByScopedToGeneration(t *testing.T) {
 	if got := releasedBy(&store.Execution{NodeGeneration: 1}); got != "" {
 		t.Errorf("releasedBy with no release = %q, want empty", got)
 	}
+}
+
+// visitsFlow loops work → gate → retry → work and exits on the visit count
+// alone: the work node returns nothing a rule could count, so the only way out
+// is `visits.work`.
+const visitsFlow = `
+name: visits
+nodes:
+  - {id: start, type: task, subject: "tasks.vstart.{execution_id}"}
+  - {id: work, type: task, subject: "tasks.vwork.{execution_id}"}
+  - id: gate
+    type: choice
+    on_error: fail
+    rules:
+      - {when: 'visits.work >= 3', to: done}
+      - {default: true, to: retry}
+  - {id: retry, type: task, subject: "tasks.vretry.{execution_id}"}
+  - {id: done, type: task, subject: "tasks.vdone.{execution_id}"}
+edges:
+  - {from: start, to: work}
+  - {from: work, to: gate}
+  - {from: retry, to: work}
+`
+
+// TestVisitsBoundALoop: a cycle can bound itself on the visit count, and the
+// counts the nodes see are their own entries — not attempts, and not shared
+// between nodes.
+func TestVisitsBoundALoop(t *testing.T) {
+	h := newHarness(t, visitsFlow, Config{})
+	h.serve(t, "tasks.vstart.*", passthrough)
+	h.serve(t, "tasks.vretry.*", passthrough)
+
+	work := newCapture("work")
+	h.serve(t, "tasks.vwork.*", work.handler(t))
+
+	done := newCapture("done")
+	h.serve(t, "tasks.vdone.*", done.handler(t))
+
+	id, err := h.engine.Start(context.Background(), "visits", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The node being invoked sees its own visit, so the counts run 1, 2, 3.
+	for want := uint64(1); want <= 3; want++ {
+		got := work.wait(t)
+		if got.Visits["work"] != want {
+			t.Fatalf("work visit %d saw visits[work] = %d", want, got.Visits["work"])
+		}
+
+		if got.Visits["start"] != 1 {
+			t.Errorf("work saw visits[start] = %d, want 1", got.Visits["start"])
+		}
+	}
+
+	final := done.wait(t)
+	if final.Visits["work"] != 3 || final.Visits["retry"] != 2 || final.Visits["done"] != 1 {
+		t.Errorf("done saw visits = %v; want work=3 retry=2 done=1", final.Visits)
+	}
+
+	h.waitStatus(t, id, store.StatusCompleted, 10*time.Second)
+}
+
+// retryVisitsFlow retries its first node twice before it succeeds.
+const retryVisitsFlow = `
+name: retryvisits
+nodes:
+  - {id: flaky, type: task, subject: "tasks.flaky.{execution_id}", retry: {max_attempts: 3}}
+  - {id: after, type: task, subject: "tasks.after.{execution_id}"}
+edges:
+  - {from: flaky, to: after}
+`
+
+// TestVisitsCountEntriesNotAttempts: a node retried twice was entered once, so
+// a loop bound on visits is not spent by transient faults.
+func TestVisitsCountEntriesNotAttempts(t *testing.T) {
+	h := newHarness(t, retryVisitsFlow, Config{})
+
+	var attempts atomic.Int64
+
+	h.serve(t, "tasks.flaky.*", func(_ context.Context, _ protocol.TaskRequest) (protocol.TaskResponse, error) {
+		if attempts.Add(1) < 3 {
+			return protocol.TaskResponse{Status: protocol.StatusRetry, Error: "transient"}, nil
+		}
+
+		return protocol.TaskResponse{Status: protocol.StatusOK, Payload: json.RawMessage(`{"ok":true}`)}, nil
+	})
+
+	after := newCapture("after")
+	h.serve(t, "tasks.after.*", after.handler(t))
+
+	id, err := h.engine.Start(context.Background(), "retryvisits", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	got := after.wait(t)
+	if got.Visits["flaky"] != 1 {
+		t.Errorf("visits[flaky] = %d after 3 attempts on one visit, want 1", got.Visits["flaky"])
+	}
+
+	h.waitStatus(t, id, store.StatusCompleted, 15*time.Second)
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,5 +122,72 @@ func TestCancelUnknownExecution(t *testing.T) {
 	err := h.engine.Cancel(context.Background(), "exec-does-not-exist", "x")
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("cancel unknown: %v, want store.ErrNotFound", err)
+	}
+}
+
+// A failed execution is terminal but resumable, so cancelling it is how an
+// operator gives up on one they are never going to fix. Before this it was a
+// no-op: the execution could be revived forever and retired never.
+func TestCancelFailedExecutionRetiresIt(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	ctx := context.Background()
+
+	failed := &store.Execution{
+		ID: "hot-failed", FlowName: "linear", CurrentNode: "a",
+		Status: store.StatusFailed, Error: "task a: boom",
+	}
+	if _, err := h.store.Create(ctx, failed); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := h.engine.Cancel(ctx, "hot-failed", "not worth fixing"); err != nil {
+		t.Fatalf("cancel failed execution: %v", err)
+	}
+
+	ex, err := h.store.Get(ctx, "hot-failed")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if ex.Status != store.StatusCancelled {
+		t.Fatalf("status = %q, want cancelled", ex.Status)
+	}
+
+	// Why it failed is the reason the operator was looking at it; cancelling
+	// files it away rather than erasing it.
+	if !strings.Contains(ex.Error, "not worth fixing") || !strings.Contains(ex.Error, "task a: boom") {
+		t.Errorf("error = %q, want both the cancel reason and the original failure", ex.Error)
+	}
+
+	// Cancelled is not resumable — that is what retiring it means.
+	if resumeErr := h.engine.Resume(ctx, "hot-failed"); resumeErr == nil {
+		t.Error("Resume revived a cancelled execution")
+	}
+}
+
+// With no reason given, the failure is still what the record says.
+func TestCancelFailedExecutionKeepsFailureWithoutReason(t *testing.T) {
+	h := newHarness(t, linearFlow, Config{})
+	ctx := context.Background()
+
+	failed := &store.Execution{
+		ID: "hot-failed-2", FlowName: "linear", CurrentNode: "a",
+		Status: store.StatusFailed, Error: "task a: boom",
+	}
+	if _, err := h.store.Create(ctx, failed); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := h.engine.Cancel(ctx, "hot-failed-2", ""); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	ex, err := h.store.Get(ctx, "hot-failed-2")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !strings.Contains(ex.Error, "task a: boom") {
+		t.Errorf("error = %q, want the original failure preserved", ex.Error)
 	}
 }

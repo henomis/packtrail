@@ -1032,6 +1032,80 @@ func (s *Server) Results(ctx context.Context, execID string) (json.RawMessage, e
 	return s.engine.Results(ctx, execID)
 }
 
+// OutputRecord is one stored output of a node, as returned by
+// [Server.OutputHistory].
+type OutputRecord struct {
+	// Node is the node that produced it.
+	Node string
+	// Version identifies this output among the node's others.
+	Version string
+	// Payload is the output itself.
+	Payload json.RawMessage
+	// At is when it was written.
+	At time.Time
+	// Current reports whether this is the version the execution committed —
+	// the one Results shows and the one later steps read. The others are
+	// earlier visits of a loop, or candidates an engine wrote without
+	// committing (a stale attempt, a lost lease).
+	Current bool
+}
+
+// OutputHistory returns every stored output of one node, oldest first.
+//
+// Results holds one output per node, so a node revisited in a loop overwrites
+// its predecessor: after three attempts, only the third is readable, and "why
+// did this loop three times?" is answered by the two that are gone. They were
+// never actually gone — each visit writes its own versioned entry and nothing
+// removes it until the execution is swept — but nothing could read them back.
+//
+// Ordering is by write time rather than by version, which is a NUID: sequential
+// within one engine instance, not comparable across two.
+//
+// An archived execution has had its data plane dropped by the sweep, so this
+// returns nothing for one.
+func (s *Server) OutputHistory(ctx context.Context, execID, node string) ([]OutputRecord, error) {
+	if !validExecID(execID) {
+		return nil, fmt.Errorf("%w: execution id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, execID)
+	}
+
+	// A node id has the same shape as an execution id: both become KV key
+	// segments, so both are checked before a lookup is attempted.
+	if !validExecID(node) {
+		return nil, fmt.Errorf("%w: node id %q must match [A-Za-z0-9_-]{1,128}", ErrInvalidArgument, node)
+	}
+
+	if err := s.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	records, err := s.store.OutputHistory(ctx, execID, node)
+	if err != nil {
+		return nil, err
+	}
+
+	// Which one the flow actually used is control-plane state, so it is read
+	// from the execution rather than guessed from the ordering: the newest
+	// entry can be an uncommitted candidate.
+	committed := ""
+
+	if ex, exErr := s.store.Get(ctx, execID); exErr == nil {
+		committed = ex.OutputVersion(node)
+	}
+
+	out := make([]OutputRecord, 0, len(records))
+	for _, r := range records {
+		out = append(out, OutputRecord{
+			Node:    r.Node,
+			Version: r.Version,
+			Payload: r.Payload,
+			At:      r.At,
+			Current: r.Version != "" && r.Version == committed,
+		})
+	}
+
+	return out, nil
+}
+
 // ByStatus returns the ids of executions currently indexed under status. The
 // index is eventually consistent (best-effort visibility).
 func (s *Server) ByStatus(ctx context.Context, status string) ([]string, error) {

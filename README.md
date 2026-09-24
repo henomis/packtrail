@@ -503,6 +503,24 @@ Two design rules make crashes boring:
   schedule — see `WithStallRedrive`) re-flushes it. State and the work that
   drives it can never disagree.
 
+`Server.OutputHistory(ctx, id, node)` reads **every** output a node produced,
+oldest first, each with when it was written and whether it is the version the
+execution committed:
+
+```go
+for _, rec := range srv.OutputHistory(ctx, id, "verify") {
+    fmt.Println(rec.At, rec.Current, string(rec.Payload))
+}
+```
+
+`Results` holds one output per node, so a node revisited in a loop overwrites
+its predecessor — and the earlier attempts are exactly what answers "why did
+this run three times?". They were never gone: each visit writes its own
+versioned entry and nothing removes it until the execution is swept. This reads
+them back. Candidates an engine wrote without committing (a stale attempt, a
+lost lease) appear too, which is what an investigation wants; `Current` marks
+the one the flow used.
+
 With `WithHistory(retention)`, every transition is also appended to a durable
 per-execution trace, queryable via `Server.History(ctx, id, limit)` — the
 step-by-step story of a run, kept for the configured retention.

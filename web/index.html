@@ -172,7 +172,7 @@
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--choice"></span>Conditional routing</h3>
-      <p><code>choice</code> nodes evaluate <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr-lang</a> expressions over the assembled context — <code>input</code>, <code>results</code>, <code>signals</code>, <code>branches</code>, <code>last_node</code>, <code>released_by</code> — first match wins, expressions compiled at startup, not at runtime.</p>
+      <p><code>choice</code> nodes evaluate <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr-lang</a> expressions over the assembled context — <code>input</code>, <code>results</code>, <code>signals</code>, <code>branches</code>, <code>last_node</code>, <code>released_by</code>, <code>visits</code> — first match wins, expressions compiled at startup, not at runtime.</p>
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--signal"></span>External signals</h3>
@@ -371,7 +371,7 @@
 <span class="cm">//   req.Target      → agent name, URL, subject …</span>
 <span class="cm">//   req.ExecutionID → owning execution</span>
 <span class="cm">//   req.Payload     → assembled context: {input, results, signals,</span>
-<span class="cm">//                     branches, last_node, released_by}</span>
+<span class="cm">//                     branches, last_node, released_by, visits}</span>
 <span class="cm">//                     — decode with packtrail.DecodeContext</span>
 <span class="cm">//   req.Attempt     → 0-based retry counter</span>
 <span class="cm">//   req.Deadline    → per-node timeout</span>
@@ -800,7 +800,7 @@ srv.<span class="fn">Run</span>(ctx) <span class="cm">// blocks: engine + indexe
           <tr><td>GET /api/flows/{name}</td><td>Full flow graph (nodes + edges) as <code>FlowGraph</code></td></tr>
           <tr><td>GET /api/executions</td><td>Execution summaries; filter with <code>?status=</code> or <code>?flow=</code></td></tr>
           <tr><td>GET /api/executions/{id}</td><td><code>Execution</code> control-state snapshot including branches and signals</td></tr>
-          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals, branches, last_node}</code> context (data plane)</td></tr>
+          <tr><td>GET /api/executions/{id}/results</td><td>Assembled <code>{input, results, signals, branches, last_node, visits}</code> context (data plane)</td></tr>
           <tr><td>GET /api/executions/{id}/history</td><td>Ordered transition trace (empty unless <code>WithHistory</code>)</td></tr>
           <tr><td>GET /api/deadletters</td><td>Dead-letter count and recent dead-letter records</td></tr>
           <tr><td>GET /api/events</td><td>Live Server-Sent Events stream of every execution transition</td></tr>

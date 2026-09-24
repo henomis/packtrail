@@ -508,7 +508,11 @@ oldest first, each with when it was written and whether it is the version the
 execution committed:
 
 ```go
-for _, rec := range srv.OutputHistory(ctx, id, "verify") {
+history, err := srv.OutputHistory(ctx, id, "verify")
+if err != nil {
+    return err
+}
+for _, rec := range history {
     fmt.Println(rec.At, rec.Current, string(rec.Payload))
 }
 ```
@@ -601,7 +605,7 @@ so they can be checked early and never drift:
 | `ValidateNamespace(ns)` | The `WithNamespace` rule (`[A-Za-z0-9_-]{1,64}`); validate the composed string |
 | `ValidateCron(expr)` | The cron grammar `ScheduleFlow` and the reconcile options accept |
 | `DecodeContext(doc)` / `InvocationContext` | Decode `Request.Payload` or `Server.Results` into the typed context |
-| `VarInput`, `VarResults`, `VarSignals`, `VarBranches`, `VarLastNode`, `VarReleasedBy` | The variable names a choice `when` expression can reference |
+| `VarInput`, `VarResults`, `VarSignals`, `VarBranches`, `VarLastNode`, `VarReleasedBy`, `VarVisits` | The variable names a choice `when` expression can reference |
 | `FlowSchemaVersion` | The `version` a `FlowDef` must carry for this build |
 | `ErrInvalidArgument` | Wraps rejected caller input (ids, flow names, statuses, cron, namespace); map it to a 400 with `errors.Is` |
 | `Server.FailActivity(ctx, execID, node, gen, attempt, reason)` | Settle a parked async node as failed — for an out-of-process worker about to drop a job |

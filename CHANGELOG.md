@@ -4,12 +4,19 @@
 
 ### Added
 
-- **`Server.OutputHistory(ctx, execID, node)`**: every output a node produced,
+- **`Server.OutputHistory(ctx, execID, node)`** (#11): every output a node produced,
   oldest first, with its write time and whether it is the committed version.
   `Results` keeps one output per node, so a loop's earlier attempts were
   unreadable — although each visit had always written its own versioned entry.
   Uncommitted candidates (a stale attempt, a lost lease) are included, and
   `Current` marks the one the flow used.
+
+### Fixed
+
+- **`VarVisits` exported** (#10). `visits` shipped in v0.2.1 without a `Var*`
+  constant, so a layer compiling its own syntax down to `when` expressions had
+  to restate the string literal. It now sits alongside the other context
+  variables.
 
 ## v0.2.1
 

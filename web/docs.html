@@ -832,7 +832,9 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
         (<code>Branches</code>), received <code>Signals</code>, the active <code>WaitSignal</code>, any
         <code>Error</code> and <code>UpdatedAt</code>. Payloads live in the data plane and are not
         carried on the snapshot — read the assembled <a href="#invoker-context">invocation context</a> with
-        <code>Server.Results(ctx, id)</code>. The execution KV is the source of truth — read it (not
+        <code>Server.Results(ctx, id)</code>. <code>Results</code> holds one output per node; every output a node
+        produced across the visits of a loop is still readable, oldest first, with
+        <code>Server.OutputHistory(ctx, id, node)</code>. The execution KV is the source of truth — read it (not
         the indexes) for correctness decisions.
       </p>
     </section>
@@ -862,6 +864,7 @@ srv.<span class="fn">ScheduleFlow</span>(ctx, <span class="s">"nightly"</span>, 
           <tr><td>FailActivity(ctx, execID, node, gen, attempt, reason)</td><td>Settle a parked async node as <code>failed</code> (resumable) — for a worker about to drop a job it can never complete. Stale calls are no-ops.</td></tr>
           <tr><td>Get(ctx, execID)</td><td>Return an <code>Execution</code> control-state snapshot, or <code>ErrNotFound</code>.</td></tr>
           <tr><td>Results(ctx, execID)</td><td>The assembled <a href="#invoker-context">invocation context</a> — what invokers and choice rules see; decode with <code>DecodeContext</code>.</td></tr>
+          <tr><td>OutputHistory(ctx, execID, node)</td><td>Every output a node produced, oldest first, as <code>[]OutputRecord</code> (<code>Node</code>, <code>Version</code>, <code>Payload</code>, <code>At</code>, <code>Current</code>). Recovers a loop's earlier attempts, which <code>Results</code> overwrites; uncommitted candidates are included and <code>Current</code> marks the one the flow used. Empty once archived.</td></tr>
           <tr><td>History(ctx, execID, limit)</td><td>Ordered per-execution transition trace (requires <code>WithHistory</code>).</td></tr>
           <tr><td>ByStatus(ctx, status)</td><td>Execution ids indexed under a status (eventually consistent).</td></tr>
           <tr><td>ByFlow(ctx, flow)</td><td>Execution ids belonging to a flow.</td></tr>
@@ -926,7 +929,7 @@ id, _ := client.<span class="fn">Start</span>(ctx, <span class="s">"research-pip
           <tr><td>ValidateNamespace(ns)</td><td>The <code>WithNamespace</code> rule (<code>[A-Za-z0-9_-]{1,64}</code>); validate the composed string, not its parts.</td></tr>
           <tr><td>ValidateCron(expr)</td><td>The cron grammar <code>ScheduleFlow</code> and the reconcile options accept.</td></tr>
           <tr><td>DecodeContext(doc) / InvocationContext</td><td>Decode <code>Request.Payload</code> or <code>Server.Results</code> into the typed <a href="#invoker-context">context</a>.</td></tr>
-          <tr><td>VarInput … VarReleasedBy</td><td>The variable names a choice <code>when</code> expression can reference.</td></tr>
+          <tr><td>VarInput … VarVisits</td><td>The variable names a choice <code>when</code> expression can reference.</td></tr>
           <tr><td>FlowSchemaVersion</td><td>The <code>version</code> a <code>FlowDef</code> must carry for this build.</td></tr>
           <tr><td>ErrInvalidArgument</td><td>Wraps rejected caller input (ids, flow names, statuses, cron, namespace) — map it to a 400 with <code>errors.Is</code>.</td></tr>
         </tbody>

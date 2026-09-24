@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`Server.OutputHistory(ctx, execID, node)`**: every output a node produced,
+  oldest first, with its write time and whether it is the committed version.
+  `Results` keeps one output per node, so a loop's earlier attempts were
+  unreadable — although each visit had always written its own versioned entry.
+  Uncommitted candidates (a stale attempt, a lost lease) are included, and
+  `Current` marks the one the flow used.
+
 ## v0.2.1
 
 Loop semantics and the end of an execution's life.

@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -192,6 +194,71 @@ func (s *Store) DeletePayloads(ctx context.Context, execID string) error {
 			keys = append(keys, entry.Key())
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+// OutputRecord is one stored output of a node: the value, which version it is,
+// and when it was written.
+type OutputRecord struct {
+	Node    string
+	Version string
+	Payload json.RawMessage
+	At      time.Time
+}
+
+// OutputHistory returns every stored output of one node, oldest first.
+//
+// The data is already there: each visit writes its own versioned entry
+// (OutputVersionKey) and nothing deletes it until the execution is swept — the
+// execution document simply points at the last one, so Results shows only that.
+// After a loop, "why did this run three times?" is answered by the attempts
+// that were overwritten, which nothing could read back.
+//
+// Ordering comes from the entries' own creation times rather than the version
+// strings: a version is a NUID, sequential within one engine instance but not
+// comparable across two.
+//
+// A candidate an engine wrote and then did not commit (a stale attempt, a lost
+// lease) appears here too. That is deliberate — it is exactly what an
+// investigation wants — and Execution.OutputVersion(node) says which one the
+// flow actually used.
+func (s *Store) OutputHistory(ctx context.Context, execID, node string) ([]OutputRecord, error) {
+	prefix := execID + ".outv." + node + "."
+
+	w, err := s.payloads.Watch(ctx, prefix+">")
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+	defer func() { _ = w.Stop() }()
+
+	var records []OutputRecord
+
+	for {
+		select {
+		case entry, ok := <-w.Updates():
+			if !ok || entry == nil {
+				slices.SortFunc(records, func(a, b OutputRecord) int { return a.At.Compare(b.At) })
+
+				return records, nil
+			}
+
+			if entry.Operation() != jetstream.KeyValuePut {
+				continue
+			}
+
+			records = append(records, OutputRecord{
+				Node:    node,
+				Version: strings.TrimPrefix(entry.Key(), prefix),
+				Payload: json.RawMessage(entry.Value()),
+				At:      entry.Created(),
+			})
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }

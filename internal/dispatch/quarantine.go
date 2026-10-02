@@ -159,7 +159,23 @@ func (d *Dispatcher) quarantine(ctx context.Context, msg jetstream.Msg, execID s
 func (d *Dispatcher) handleQuarantined(ctx context.Context, msg jetstream.Msg, execID string) {
 	evs, err := d.Loader.Log.DecodeEach(ctx, msg)
 	if err != nil {
-		_ = msg.Ack()
+		var delivered uint64
+		if md, merr := msg.Metadata(); merr == nil {
+			delivered = md.NumDelivered
+		}
+
+		// Only an unreadable body is given up on: a claim-checked decision
+		// whose blob cannot be read yet may be the terminal one (I-51).
+		if quarantinable(err, delivered) {
+			_ = msg.Ack()
+
+			return
+		}
+
+		d.In.Logger.Warn("packtrail: quarantined decision unreadable, will retry", "exec", execID,
+			"deliveries", delivered, "err", err)
+
+		_ = msg.NakWithDelay(backoff(delivered))
 
 		return
 	}
@@ -288,7 +304,12 @@ func (d *Dispatcher) Replay(ctx context.Context, execID string) error {
 
 	d.Cache.Drop(execID)
 
-	last, err := d.replayFrom(ctx, execID, max(mark.Seq, 1))
+	// The replay runs outside the partition runner, possibly while this
+	// process's dispatcher applies the same events: it folds into a private
+	// cache so the two never mutate one state.
+	cache := statecache.New(1)
+
+	last, err := d.replayFrom(ctx, cache, execID, max(mark.Seq, 1))
 	if err != nil {
 		return fmt.Errorf("dispatch: replay %s: %w", execID, err)
 	}
@@ -308,18 +329,20 @@ func (d *Dispatcher) Replay(ctx context.Context, execID string) error {
 	// later skip decision (always confirmed against the index) processes
 	// them; this pass covers those already skipped. Effects are idempotent,
 	// so a dispatcher also running one does no harm.
-	_, err = d.replayFrom(ctx, execID, last+1)
+	_, err = d.replayFrom(ctx, cache, execID, last+1)
 
 	return err
 }
 
-func (d *Dispatcher) replayFrom(ctx context.Context, execID string, from uint64) (uint64, error) {
+func (d *Dispatcher) replayFrom(ctx context.Context, cache *statecache.Cache, execID string,
+	from uint64,
+) (uint64, error) {
 	last := from - 1
 
 	var aerr error
 
 	err := d.Loader.Log.ScanDecisions(ctx, execID, from, func(evs []event.Event) bool {
-		if aerr = d.applyDecision(ctx, execID, evs); aerr != nil {
+		if aerr = d.applyDecision(ctx, cache, execID, evs); aerr != nil {
 			return false
 		}
 

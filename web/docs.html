@@ -556,7 +556,7 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <p>
         <code>task</code>, <code>map</code>, <code>subflow</code> and <code>join</code> nodes may declare
         <code>on_failure: &lt;node&gt;</code>. When the node fails permanently — retries exhausted, a
-        permanent error, an invalid output, a last attempt that timed out, a map item that failed, a
+        permanent error, an invalid or unencodable output, a last attempt that timed out, a map item that failed, a
         child that did not complete, a join whose policy was not met — the execution enters the handler
         instead of failing. This is how sagas and compensation are expressed in the graph.
       </p>
@@ -684,7 +684,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
       <table class="doctable">
         <thead><tr><th>Return</th><th>Effect</th></tr></thead>
         <tbody>
-          <tr><td>*Result, nil</td><td>Complete: <code>Output</code> (a JSON object or nil), <code>Writes</code>, <code>Next</code> (a declared dynamic successor), <code>Usage</code>.</td></tr>
+          <tr><td>*Result, nil</td><td>Complete: <code>Output</code> (a JSON object or nil), <code>Writes</code>, <code>Next</code> (a declared dynamic successor), <code>Usage</code>. A result that cannot be encoded as JSON (e.g. NaN in <code>Usage</code>) fails the task permanently.</td></tr>
           <tr><td>nil, err</td><td>Fail the attempt; retried by the node's policy.</td></tr>
           <tr><td>worker.Permanent(err)</td><td>Fail without retry; <code>on_failure</code> or execution failure follows.</td></tr>
           <tr><td>worker.Interrupt(payload)</td><td>Pause at this node until <code>Client.Resume</code> — see <a href="#human">human in the loop</a>.</td></tr>

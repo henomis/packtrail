@@ -179,18 +179,22 @@ func (d *Dispatcher) process(ctx context.Context, msg jetstream.Msg) error {
 		return err
 	}
 
-	return d.applyDecision(ctx, execOf(msg.Subject()), evs)
+	return d.applyDecision(ctx, d.Cache, execOf(msg.Subject()), evs)
 }
 
 // applyDecision folds the events of one decision into the execution's state,
 // runs their effects in order and updates the index. The state is loaded once,
 // before the first event: the events of a decision share a stream sequence, so
 // a reload in the middle would land before the whole decision. A failure
-// retries the whole decision; effects are idempotent.
-func (d *Dispatcher) applyDecision(ctx context.Context, execID string, evs []event.Event) error {
-	e, err := d.stateBefore(ctx, execID, evs[0])
+// retries the whole decision; effects are idempotent. States are folded in
+// place, so cache must belong to the calling goroutine's path: the partition
+// runner uses d.Cache, a replay its own.
+func (d *Dispatcher) applyDecision(ctx context.Context, cache *statecache.Cache, execID string,
+	evs []event.Event,
+) error {
+	e, err := d.stateBefore(ctx, cache, execID, evs[0])
 	if err != nil {
-		d.Cache.Drop(execID)
+		cache.Drop(execID)
 
 		return err
 	}
@@ -207,7 +211,7 @@ func (d *Dispatcher) applyDecision(ctx context.Context, execID string, evs []eve
 		stopsOf(e.State, ev, &stop)
 
 		if err = e.State.Apply(e.Def, ev); err != nil {
-			d.Cache.Drop(execID)
+			cache.Drop(execID)
 
 			return err
 		}
@@ -215,13 +219,13 @@ func (d *Dispatcher) applyDecision(ctx context.Context, execID string, evs []eve
 		e.State.LastSeq = ev.Seq
 
 		if err = d.effects(ctx, e, ev); err != nil {
-			d.Cache.Drop(execID)
+			cache.Drop(execID)
 
 			return err
 		}
 	}
 
-	d.Cache.Put(execID, e)
+	cache.Put(execID, e)
 	d.publishStop(stop)
 
 	return projection.IndexFrom(ctx, d.In, e.State, created, prev)
@@ -269,10 +273,12 @@ func (d *Dispatcher) publishStop(stop wire.Stop) {
 
 // stateBefore returns the state of execID just before ev, the first event of
 // a decision.
-func (d *Dispatcher) stateBefore(ctx context.Context, execID string, ev event.Event) (statecache.Entry, error) {
+func (d *Dispatcher) stateBefore(ctx context.Context, cache *statecache.Cache, execID string,
+	ev event.Event,
+) (statecache.Entry, error) {
 	// The cache is only trusted when it is exactly one decision behind:
 	// another dispatcher may have handled events of this execution meanwhile.
-	if e, ok := d.Cache.Get(execID); ok && e.State.Events == ev.Index-1 && e.State.LastSeq < ev.Seq {
+	if e, ok := cache.Get(execID); ok && e.State.Events == ev.Index-1 && e.State.LastSeq < ev.Seq {
 		return e, nil
 	}
 

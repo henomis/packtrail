@@ -415,7 +415,10 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 
 	res, err := w.call(ctx, job)
 
-	var intr *InterruptError
+	var (
+		intr *InterruptError
+		c    cmd.Command
+	)
 
 	switch {
 	case errors.As(err, &intr):
@@ -424,12 +427,20 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 			return failCmd(id, wj.ExecID, ref, merr.Error(), false)
 		}
 
-		return cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p})
+		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p})
 	case err != nil:
 		return failCmd(id, wj.ExecID, ref, err.Error(), !IsPermanent(err))
+	default:
+		c, err = completeCmd(id, wj, ref, res)
 	}
 
-	return completeCmd(id, wj, ref, res)
+	// A result that cannot be encoded (NaN usage, invalid raw JSON) would
+	// otherwise leave an empty command and a task that never settles.
+	if err != nil {
+		return failCmd(id, wj.ExecID, ref, err.Error(), false)
+	}
+
+	return c, nil
 }
 
 func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {

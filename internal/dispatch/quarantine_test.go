@@ -23,13 +23,18 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/henomis/packtrail/event"
+	"github.com/henomis/packtrail/flow"
+	"github.com/henomis/packtrail/internal/eventlog"
 	"github.com/henomis/packtrail/internal/fold"
 	"github.com/henomis/packtrail/internal/infra"
+	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/metrics"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/natstest"
 	"github.com/henomis/packtrail/internal/projection"
 	"github.com/henomis/packtrail/internal/registry"
+	"github.com/henomis/packtrail/internal/snapshot"
 	"github.com/henomis/packtrail/internal/statecache"
 )
 
@@ -105,3 +110,43 @@ func TestNotFoundIsDeterministicOnlyWhenPersistent(t *testing.T) {
 }
 
 var errPoisonTest = fmt.Errorf("apply: %w", fold.ErrApply)
+
+// TestReplayDoesNotShareTheLiveCache: Replay runs on an engine goroutine while
+// this process's dispatcher may be applying the same events. The states it
+// folds must stay private: a shared *fold.State would be mutated by both
+// (concurrent map writes, or an index gap that re-quarantines the execution).
+func TestReplayDoesNotShareTheLiveCache(t *testing.T) {
+	d, ctx := newDispatcher(t)
+	d.Loader = loader.New(d.In, eventlog.New(d.In), snapshot.New(d.In, 0), registry.New(d.In))
+
+	def, err := flow.Parse([]byte("name: one\nnodes:\n  - {id: a, type: task, kind: k}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := d.Loader.Flows.Register(ctx, def)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := event.Event{
+		Type: event.ExecutionStarted, Version: event.Version, Time: time.Now(), Index: 1,
+		Data: &event.Started{ExecID: "x", Flow: "one", FlowHash: hash, Input: []byte(`{}`)},
+	}
+
+	if _, err = d.Loader.Log.Append(ctx, "x", 0, []event.Event{started}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = projection.Quarantine(ctx, d.In, "x", 1, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = d.Replay(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := d.Cache.Get("x"); ok {
+		t.Fatal("the replay published its state into the dispatcher's shared cache")
+	}
+}

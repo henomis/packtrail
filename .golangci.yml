@@ -110,8 +110,17 @@ linters:
           - lll
           - goconst
           - mnd
+          - errchkjson
       - path: (.+)_test\.go
         text: 'dot-imports: '
+      # The acceptance harness and the embedded server helper are test support.
+      - path: internal/(acceptance|natstest)/
+        linters:
+          - mnd
+          - goconst
+          - gosec
+          - errchkjson
+          - funlen
       # examples/ is demo code; flag defaults and buffer sizes there are self-documenting.
       - path: examples/
         linters:

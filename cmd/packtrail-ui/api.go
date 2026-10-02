@@ -18,364 +18,538 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
+	"fmt"
+	"mime"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/henomis/packtrail"
+	"github.com/henomis/packtrail/internal/names"
 )
 
-const pingInterval = 25 * time.Second
+const (
+	keyExecID    = "exec_id"
+	keyOK        = "ok"
+	defaultLimit = 100
+	maxBody      = 4 << 20
+	requestTTL   = 30 * time.Second
+)
 
+// api serves every namespace of the NATS account (or only an allowlist of
+// them), keeping one lazily attached client per namespace.
 type api struct {
-	srv *packtrail.Server
+	nc    *nats.Conn
+	def   string
+	allow []string // nil: any namespace discovered on the account
+
+	mu      sync.Mutex
+	clients map[string]*packtrail.Client
 }
 
-func newAPI(srv *packtrail.Server) *api { return &api{srv: srv} }
+// newAPI returns the API. def is the namespace the UI selects first; allow,
+// when non-nil, restricts the UI to those namespaces.
+func newAPI(nc *nats.Conn, def string, allow []string) *api {
+	return &api{nc: nc, def: def, allow: allow, clients: map[string]*packtrail.Client{}}
+}
 
-func (a *api) routes() http.Handler {
+// nsHandler is a handler bound to the client of the {ns} path segment.
+type nsHandler func(http.ResponseWriter, *http.Request, *packtrail.Client)
+
+func (a *api) routes(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/flows", a.listFlows)
-	mux.HandleFunc("GET /api/flows/{name}", a.flowGraph)
-	mux.HandleFunc("GET /api/executions", a.listExecutions)
-	mux.HandleFunc("GET /api/executions/{id}", a.getExecution)
-	mux.HandleFunc("GET /api/executions/{id}/results", a.getResults)
-	mux.HandleFunc("GET /api/executions/{id}/history", a.getHistory)
-	mux.HandleFunc("GET /api/deadletters", a.deadLetters)
-	mux.HandleFunc("GET /api/events", a.events)
-	mux.Handle("/", staticHandler())
 
-	return mux
-}
+	mux.HandleFunc("GET /api/namespaces", a.namespaces)
 
-// execSummary is a compact execution row for the list view.
-type execSummary struct {
-	ID          string    `json:"id"`
-	Flow        string    `json:"flow"`
-	Status      string    `json:"status"`
-	CurrentNode string    `json:"current_node"`
-	Error       string    `json:"error,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-func (a *api) listFlows(w http.ResponseWriter, r *http.Request) {
-	flows, err := a.srv.ListFlows(r.Context())
-	if err != nil {
-		httpError(w, err)
-		return
+	for pattern, h := range map[string]nsHandler{
+		"GET /executions":                 a.list,
+		"GET /executions/{id}":            a.get,
+		"GET /executions/{id}/history":    a.history,
+		"GET /executions/{id}/watch":      a.watch,
+		"POST /executions/{id}/signal":    a.signal,
+		"POST /executions/{id}/resume":    a.resume,
+		"POST /executions/{id}/cancel":    a.cancel,
+		"POST /executions/{id}/fork":      a.fork,
+		"POST /executions/{id}/rerun":     a.rerun,
+		"GET /flows":                      a.flows,
+		"GET /flows/{name}":               a.flow,
+		"GET /schedules":                  a.schedules,
+		"GET /deadletters":                a.deadLetters,
+		"POST /deadletters/{seq}/redrive": a.redrive,
+	} {
+		method, path, _ := strings.Cut(pattern, " ")
+		mux.HandleFunc(method+" /api/ns/{ns}"+path, a.bind(h))
 	}
 
-	writeJSON(w, flows)
+	mux.Handle("GET /", static)
+
+	return securityHeaders(mux)
 }
 
-func (a *api) flowGraph(w http.ResponseWriter, r *http.Request) {
-	g, err := a.srv.FlowGraph(r.Context(), r.PathValue("name"))
-	if errors.Is(err, packtrail.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
+func (a *api) bind(h nsHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := ctxOf(r)
+		c, err := a.client(ctx, r.PathValue("ns"))
 
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	writeJSON(w, g)
-}
-
-// listExecutions returns execution summaries, optionally filtered by ?status= or
-// ?flow=.
-//
-// Filtered queries read summaries directly from the visibility index (no
-// per-execution round-trips). The unfiltered case ("list all") fetches each
-// execution concurrently with a bounded pool because the index has no
-// all-executions view that carries full summary data.
-//
-// The unfiltered path is an O(N) scan of the entire hot bucket with no
-// pagination: its cost scales with the number of non-archived executions. It
-// stays cheap only when archival is enabled (WithArchival) so completed work
-// leaves the hot bucket — see the packtrail-ui README note. On a deployment
-// without archival, prefer the ?status= / ?flow= filtered queries, which the
-// index answers without a full scan.
-func (a *api) listExecutions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	status := r.URL.Query().Get("status")
-	flow := r.URL.Query().Get("flow")
-
-	if status != "" || flow != "" {
-		var (
-			events []packtrail.Event
-			err    error
-		)
-
-		if status != "" {
-			events, err = a.srv.ByStatusEvents(ctx, status)
-		} else {
-			events, err = a.srv.ByFlowEvents(ctx, flow)
-		}
+		cancel()
 
 		if err != nil {
 			httpError(w, err)
+
 			return
 		}
 
-		out := make([]execSummary, len(events))
-		for i, ev := range events {
-			out[i] = execSummary{
-				ID: ev.ExecID, Flow: ev.Flow, Status: ev.Status,
-				CurrentNode: ev.Node, Error: ev.Error, UpdatedAt: ev.Time,
-			}
+		h(w, r, c)
+	}
+}
+
+// client returns the attached client of ns. A client is cached only once it
+// has attached: Client keeps its first attach error forever, so a namespace
+// that is not provisioned yet (or a transient NATS failure) must not poison
+// the cache. Only provisioned (and allowed) namespaces get a client at all.
+func (a *api) client(ctx context.Context, ns string) (*packtrail.Client, error) {
+	a.mu.Lock()
+	c, ok := a.clients[ns]
+	a.mu.Unlock()
+
+	if ok {
+		return c, nil
+	}
+
+	known, err := a.known(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if !slices.Contains(known, ns) {
+		return nil, fmt.Errorf("%w: namespace %q", packtrail.ErrNotFound, ns)
+	}
+
+	c, err = packtrail.NewClient(a.nc, packtrail.WithClientNamespace(ns))
+	if err != nil {
+		return nil, err
+	}
+
+	// Flows attaches the client (a cheap KV key listing).
+	if _, err = c.Flows(ctx); err != nil {
+		return nil, fmt.Errorf("namespace %q: %w", ns, err)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if prev, cached := a.clients[ns]; cached {
+		return prev, nil
+	}
+
+	a.clients[ns] = c
+
+	return c, nil
+}
+
+// known lists the namespaces the UI may serve: every namespace provisioned on
+// the account, narrowed to the allowlist when there is one.
+func (a *api) known(ctx context.Context) ([]string, error) {
+	found, err := discover(ctx, a.nc)
+	if err != nil || a.allow == nil {
+		return found, err
+	}
+
+	return slices.DeleteFunc(found, func(ns string) bool { return !slices.Contains(a.allow, ns) }), nil
+}
+
+// discover finds the provisioned namespaces: a prefix p is one when both the
+// p-events and p-cmd streams exist.
+func discover(ctx context.Context, nc *nats.Conn) ([]string, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, err
+	}
+
+	streams := map[string]bool{}
+
+	lister := js.StreamNames(ctx)
+	for name := range lister.Name() {
+		streams[name] = true
+	}
+
+	if err = lister.Err(); err != nil {
+		return nil, fmt.Errorf("list streams: %w", err)
+	}
+
+	out := []string{}
+
+	for name := range streams {
+		p, ok := strings.CutSuffix(name, "-events")
+		if !ok || !names.ValidPrefix(p) {
+			continue
 		}
 
-		writeJSON(w, out)
-
-		return
-	}
-
-	ids, err := a.srv.List(ctx)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	result, err := a.fetchSummaries(ctx, ids)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	writeJSON(w, result)
-}
-
-// fetchSummaries fetches a summary for each id concurrently. An id archived or
-// pruned between List and Get (ErrNotFound) is an expected skip; any other Get
-// error is returned (first one wins) so the caller surfaces the fault rather than
-// returning a silently-truncated list.
-func (a *api) fetchSummaries(ctx context.Context, ids []string) ([]execSummary, error) {
-	const maxParallel = 32
-
-	out := make([]execSummary, len(ids))
-	sem := make(chan struct{}, maxParallel)
-
-	var (
-		wg     sync.WaitGroup
-		errMu  sync.Mutex
-		getErr error
-	)
-
-	for i, id := range ids {
-		wg.Add(1)
-
-		go func(i int, id string) {
-			defer wg.Done()
-
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			ex, gerr := a.srv.Get(ctx, id)
-			switch {
-			case gerr == nil:
-				out[i] = execSummary{
-					ID: ex.ID, Flow: ex.Flow, Status: ex.Status,
-					CurrentNode: ex.CurrentNode, Error: ex.Error, UpdatedAt: ex.UpdatedAt,
-				}
-			case errors.Is(gerr, packtrail.ErrNotFound):
-				// Expected: gone between List and Get. Skip.
-			default:
-				errMu.Lock()
-				if getErr == nil {
-					getErr = gerr
-				}
-				errMu.Unlock()
-			}
-		}(i, id)
-	}
-
-	wg.Wait()
-
-	if getErr != nil {
-		return nil, getErr
-	}
-
-	result := make([]execSummary, 0, len(out))
-	for _, e := range out {
-		if e.ID != "" {
-			result = append(result, e)
-		}
-	}
-
-	return result, nil
-}
-
-func (a *api) getExecution(w http.ResponseWriter, r *http.Request) {
-	ex, err := a.srv.Get(r.Context(), r.PathValue("id"))
-	if errors.Is(err, packtrail.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	writeJSON(w, ex)
-}
-
-// getResults returns the execution's assembled
-// {input, results, signals, branches, last_node} context document — the
-// data-plane view invokers and choice rules see. The control-state snapshot
-// (getExecution) does not carry payloads; this is where they live. An archived
-// execution's entries may be gone: what remains is returned.
-func (a *api) getResults(w http.ResponseWriter, r *http.Request) {
-	res, err := a.srv.Results(r.Context(), r.PathValue("id"))
-	if errors.Is(err, packtrail.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	data, err := json.Marshal(res)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	if _, err = w.Write(data); err != nil {
-		slog.Error("write results", "err", err)
-	}
-}
-
-// getHistory returns the execution's ordered transition trace (oldest first,
-// capped by ?limit=). It is empty unless the observed deployment runs with
-// WithHistory, so the dashboard treats an empty trace as "feature off".
-func (a *api) getHistory(w http.ResponseWriter, r *http.Request) {
-	limit := 0
-
-	if s := r.URL.Query().Get("limit"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil {
-			limit = n
+		if n := names.New(p); streams[n.StreamCmd] {
+			out = append(out, p)
 		}
 	}
 
-	evs, err := a.srv.History(r.Context(), r.PathValue("id"), limit)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
+	slices.Sort(out)
 
-	if evs == nil {
-		evs = []packtrail.Event{}
-	}
-
-	writeJSON(w, evs)
+	return out, nil
 }
 
-// deadLetters returns the dead-letter count and the most recent records, so the
-// dashboard can surface dropped poison work (a non-zero count warrants attention).
-func (a *api) deadLetters(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func (a *api) namespaces(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
 
-	count, err := a.srv.DeadLetterCount(ctx)
+	known, err := a.known(ctx)
 	if err != nil {
 		httpError(w, err)
+
 		return
 	}
 
-	const recentCap = 50
-
-	recent, err := a.srv.RecentDeadLetters(ctx, recentCap)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	writeJSON(w, map[string]any{"count": count, "recent": recent})
+	writeJSON(w, map[string]any{"namespaces": known, "default": a.def})
 }
 
-// events streams live execution transitions as Server-Sent Events.
-func (a *api) events(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		httpError(w, errors.New("streaming unsupported"))
-		return
-	}
+func securityHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		h.ServeHTTP(w, r)
+	})
+}
 
-	ctx := r.Context()
-
-	ch, err := a.srv.WatchEvents(ctx)
-	if err != nil {
-		httpError(w, err)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher.Flush()
-
-	ping := time.NewTicker(pingInterval)
-	defer ping.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ping.C:
-			_, _ = w.Write([]byte(": ping\n\n"))
-
-			flusher.Flush()
-		case ev, open := <-ch:
-			if !open {
-				return
-			}
-
-			data, marshalErr := json.Marshal(ev)
-			if marshalErr != nil {
-				slog.Error("marshal event", "err", marshalErr)
-				continue
-			}
-
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(data)
-			_, _ = w.Write([]byte("\n\n"))
-
-			flusher.Flush()
-		}
-	}
+func ctxOf(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), requestTTL)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("write json", "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
+// httpError maps the public error sentinels to status codes: caller mistakes
+// are 4xx, not 500.
 func httpError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 
 	switch {
 	case errors.Is(err, packtrail.ErrInvalidArgument):
 		code = http.StatusBadRequest
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		code = http.StatusServiceUnavailable
+	case errors.Is(err, packtrail.ErrNotFound), errors.Is(err, packtrail.ErrUnknownFlow):
+		code = http.StatusNotFound
+	case errors.Is(err, packtrail.ErrArchived):
+		code = http.StatusConflict
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
+	http.Error(w, err.Error(), code)
+}
 
-	if encErr := json.NewEncoder(w).Encode(map[string]string{"error": err.Error()}); encErr != nil {
-		slog.Error("write error response", "err", encErr)
+// decodeAction reads a JSON action body. Requiring application/json blocks
+// cross-site form posts (a browser cannot send it without a CORS preflight).
+func decodeAction(w http.ResponseWriter, r *http.Request, v any) bool {
+	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mt != "application/json" {
+		http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+
+		return false
 	}
+
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(v); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+
+		return false
+	}
+
+	return true
+}
+
+func (a *api) list(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	q := r.URL.Query()
+	f := packtrail.ListFilter{Status: packtrail.Status(q.Get("status")), Flow: q.Get("flow"), Limit: defaultLimit}
+
+	if attr := q.Get("attr"); attr != "" {
+		k, v, _ := strings.Cut(attr, "=")
+		f.Attr, f.Value = k, v
+	}
+
+	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
+		f.Limit = l
+	}
+
+	out, err := c.List(ctx, f)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	writeJSON(w, out)
+}
+
+func (a *api) get(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
+
+	st, err := c.StateAt(ctx, r.PathValue("id"), seq)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	writeJSON(w, st)
+}
+
+type historyRow struct {
+	Seq         uint64 `json:"seq"`
+	DecisionEnd bool   `json:"decision_end"`
+	Event       any    `json:"event"`
+}
+
+func (a *api) history(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	evs, err := c.History(ctx, r.PathValue("id"))
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	rows := make([]historyRow, len(evs))
+	for i, ev := range evs {
+		rows[i] = historyRow{Seq: ev.Seq, DecisionEnd: ev.DecisionEnd, Event: ev}
+	}
+
+	writeJSON(w, rows)
+}
+
+// watch streams new events as server-sent events until the execution ends.
+func (a *api) watch(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	from, _ := strconv.ParseUint(r.URL.Query().Get("from"), 10, 64)
+
+	ch, err := c.Watch(r.Context(), r.PathValue("id"), from)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	for ev := range ch {
+		b, lerr := json.Marshal(historyRow{Seq: ev.Seq, DecisionEnd: ev.DecisionEnd, Event: ev})
+		if lerr != nil {
+			return
+		}
+
+		if _, lerr = fmt.Fprintf(w, "data: %s\n\n", b); lerr != nil {
+			return
+		}
+
+		flusher.Flush()
+	}
+}
+
+func (a *api) signal(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	var body struct {
+		Name    string          `json:"name"`
+		Payload json.RawMessage `json:"payload"`
+	}
+
+	if !decodeAction(w, r, &body) {
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) {
+		return nil, c.Signal(ctx, r.PathValue("id"), body.Name, nullable(body.Payload))
+	})
+}
+
+func (a *api) resume(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	var body struct {
+		Node  string          `json:"node"`
+		Value json.RawMessage `json:"value"`
+	}
+
+	if !decodeAction(w, r, &body) {
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) {
+		return nil, c.Resume(ctx, r.PathValue("id"), body.Node, nullable(body.Value))
+	})
+}
+
+func (a *api) cancel(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+
+	if !decodeAction(w, r, &body) {
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) {
+		return nil, c.Cancel(ctx, r.PathValue("id"), body.Reason)
+	})
+}
+
+func (a *api) fork(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	var body struct {
+		Seq uint64 `json:"seq"`
+	}
+
+	if !decodeAction(w, r, &body) {
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) {
+		id, err := c.Fork(ctx, r.PathValue("id"), body.Seq)
+
+		return map[string]string{keyExecID: id}, err
+	})
+}
+
+func (a *api) rerun(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	var body struct {
+		Node string `json:"node"`
+	}
+
+	if !decodeAction(w, r, &body) {
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) {
+		id, err := c.Rerun(ctx, r.PathValue("id"), body.Node)
+
+		return map[string]string{keyExecID: id}, err
+	})
+}
+
+func (a *api) act(w http.ResponseWriter, r *http.Request, fn func(context.Context) (any, error)) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	out, err := fn(ctx)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	if out == nil {
+		out = map[string]bool{keyOK: true}
+	}
+
+	writeJSON(w, out)
+}
+
+func nullable(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+
+	return raw
+}
+
+func (a *api) flows(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	out, err := c.Flows(ctx)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	writeJSON(w, out)
+}
+
+func (a *api) flow(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	def, err := c.Flow(ctx, r.PathValue("name"), r.URL.Query().Get("version"))
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	writeJSON(w, map[string]any{"definition": def, "start": def.StartNode()})
+}
+
+func (a *api) schedules(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	out, err := c.Schedules(ctx)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	writeJSON(w, out)
+}
+
+type deadLetterRow struct {
+	packtrail.DeadLetter
+
+	Seq uint64 `json:"seq"`
+}
+
+func (a *api) deadLetters(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	ctx, cancel := ctxOf(r)
+	defer cancel()
+
+	out, err := c.DeadLetters(ctx, defaultLimit)
+	if err != nil {
+		httpError(w, err)
+
+		return
+	}
+
+	rows := make([]deadLetterRow, len(out))
+	for i, d := range out {
+		rows[i] = deadLetterRow{DeadLetter: d, Seq: d.Seq}
+	}
+
+	writeJSON(w, rows)
+}
+
+func (a *api) redrive(w http.ResponseWriter, r *http.Request, c *packtrail.Client) {
+	seq, err := strconv.ParseUint(r.PathValue("seq"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid sequence", http.StatusBadRequest)
+
+		return
+	}
+
+	a.act(w, r, func(ctx context.Context) (any, error) { return nil, c.Redrive(ctx, seq) })
 }

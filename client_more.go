@@ -1,0 +1,646 @@
+// Copyright 2026 Simone Vellei
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package packtrail
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/henomis/packtrail/event"
+	"github.com/henomis/packtrail/internal/engine"
+	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/sched"
+	"github.com/henomis/packtrail/internal/wire"
+)
+
+// IsTerminal reports whether ev ends an execution.
+func IsTerminal(ev event.Event) bool {
+	switch ev.Type { //nolint:exhaustive // only terminal types matter.
+	case event.ExecutionCompleted, event.ExecutionFailed, event.ExecutionCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// Watch streams the events of an execution from sequence from (0 = the
+// beginning), as they are appended: LangGraph's "updates" stream mode. The
+// channel closes after the terminal event or when ctx ends.
+func (c *Client) Watch(ctx context.Context, execID string, from uint64) (<-chan event.Event, error) {
+	if err := checkExecID(execID); err != nil {
+		return nil, err
+	}
+
+	if err := c.attach(ctx); err != nil {
+		return nil, err
+	}
+
+	cfg := jetstream.OrderedConsumerConfig{FilterSubjects: []string{c.in.EventSubject(execID)}}
+	if from > 0 {
+		cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		cfg.OptStartSeq = from
+	}
+
+	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	it, err := cons.Messages()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan event.Event, watchBuffer)
+
+	go func() {
+		defer close(out)
+		defer it.Stop()
+
+		go func() {
+			<-ctx.Done()
+			it.Stop()
+		}()
+
+		for {
+			msg, lerr := it.Next()
+			if lerr != nil {
+				return
+			}
+
+			evs, lerr := c.ld.Log.Decode(ctx, msg)
+			if lerr != nil {
+				c.in.Logger.Warn("packtrail: watch decode", "lerr", lerr)
+
+				return
+			}
+
+			if !sendDecision(ctx, out, evs) {
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// sendDecision sends the events of one decision to out. It returns false
+// when the watch must end: ctx is done or the execution finished.
+func sendDecision(ctx context.Context, out chan<- event.Event, evs []event.Event) bool {
+	for _, ev := range evs {
+		select {
+		case out <- ev:
+		case <-ctx.Done():
+			return false
+		}
+
+		if IsTerminal(ev) {
+			return false
+		}
+	}
+
+	return true
+}
+
+const watchBuffer = 64
+
+// Progress is an intermediate result a worker published while running a node
+// (worker.Job.Progress). It is never stored: only listeners receive it.
+type Progress struct {
+	ExecID     string `json:"exec_id"`
+	Node       string `json:"node"`
+	Key        string `json:"key"`
+	Generation int    `json:"generation"`
+	Attempt    int    `json:"attempt"`
+	// Seq counts the messages of one job attempt from 1: a gap means one was
+	// lost (delivery is best effort).
+	Seq  int64           `json:"seq"`
+	Time time.Time       `json:"time"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+// Progress streams the progress messages workers publish for execID, as they
+// arrive: LangGraph's "custom" stream mode. Messages are not stored, so only
+// those published after the subscription are received; to see an execution
+// from its first step, choose its id (WithExecutionID) and subscribe before
+// Start. The channel closes when ctx ends or the execution finishes (after the
+// messages already received).
+func (c *Client) Progress(ctx context.Context, execID string) (<-chan Progress, error) {
+	if err := checkExecID(execID); err != nil {
+		return nil, err
+	}
+
+	if err := c.attach(ctx); err != nil {
+		return nil, err
+	}
+
+	var (
+		out    = make(chan Progress, watchBuffer)
+		done   = make(chan struct{})
+		mu     sync.RWMutex // a send never races the close of out
+		closed bool
+	)
+
+	sub, err := c.nc.Subscribe(c.in.Names.ProgressFilter(execID), func(m *nats.Msg) {
+		var p Progress
+		if json.Unmarshal(m.Data, &p) != nil {
+			return
+		}
+
+		mu.RLock()
+		defer mu.RUnlock()
+
+		if closed {
+			return
+		}
+
+		select {
+		case out <- p:
+		case <-done:
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		wctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		_, _ = c.Wait(wctx, execID)
+
+		// Deliver what already arrived, then close.
+		if sub.Drain() == nil {
+			for sub.IsValid() && ctx.Err() == nil {
+				time.Sleep(drainPoll)
+			}
+		}
+
+		_ = sub.Unsubscribe()
+
+		close(done) // releases a callback blocked on a full channel
+
+		mu.Lock()
+		closed = true
+
+		close(out)
+		mu.Unlock()
+	}()
+
+	return out, nil
+}
+
+const drainPoll = 10 * time.Millisecond
+
+// Wait blocks until the execution finishes and returns its final state. It
+// watches event headers only (no payloads are fetched while waiting).
+//
+// Only ctx ends a wait early, besides an invalid id: a read that fails (a
+// timeout under load, a leader election) is retried with backoff instead of
+// being returned to a caller that asked to wait.
+func (c *Client) Wait(ctx context.Context, execID string) (*State, error) {
+	if err := checkExecID(execID); err != nil {
+		return nil, err
+	}
+
+	delay := waitRetry
+
+	for {
+		st, err := c.waitStep(ctx, execID)
+		if st != nil {
+			return st, nil
+		}
+
+		if err == nil {
+			delay = waitRetry
+
+			continue
+		}
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		if c.in == nil {
+			return nil, err // the client never attached: retrying cannot help
+		}
+
+		c.in.Logger.Debug("packtrail: wait, will retry", "exec", execID, "in", delay, "err", err)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		delay = min(delay*2, maxWaitRetry) //nolint:mnd // exponential backoff.
+	}
+}
+
+// waitStep reads the execution and, unless it already finished, watches its
+// log until a terminal event shows up. It returns the final state once
+// finished, nothing when the caller should look again, or an error.
+func (c *Client) waitStep(ctx context.Context, execID string) (*State, error) {
+	st, err := c.Get(ctx, execID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
+	if st != nil && st.Status.Terminal() {
+		return st, nil
+	}
+
+	from := uint64(0)
+	if st != nil {
+		from = st.LastSeq + 1
+	}
+
+	return nil, c.waitTerminal(ctx, execID, from)
+}
+
+// waitTerminal returns when a terminal event header is seen after from, or
+// when the watch ends early (the caller re-checks the log).
+func (c *Client) waitTerminal(ctx context.Context, execID string, from uint64) error {
+	cfg := jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{c.in.EventSubject(execID)}, HeadersOnly: true,
+	}
+	if from > 0 {
+		cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		cfg.OptStartSeq = from
+	}
+
+	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, cfg)
+	if err != nil {
+		return err
+	}
+
+	it, err := cons.Messages()
+	if err != nil {
+		return err
+	}
+
+	defer it.Stop()
+
+	stop := context.AfterFunc(ctx, it.Stop)
+	defer stop()
+
+	for {
+		msg, lerr := it.Next()
+		if lerr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			time.Sleep(waitRetry)
+
+			return nil
+		}
+
+		for _, t := range event.Types(msg.Headers()) {
+			switch t { //nolint:exhaustive // only terminal types matter.
+			case event.ExecutionCompleted, event.ExecutionFailed, event.ExecutionCancelled:
+				return nil
+			}
+		}
+	}
+}
+
+const (
+	waitRetry    = 50 * time.Millisecond
+	maxWaitRetry = 2 * time.Second
+)
+
+// ---------------------------------------------------------------------------
+// Cron schedules
+
+// ScheduleOption configures Schedule.
+type ScheduleOption func(*scheduleOpts)
+
+type scheduleOpts struct{ tz, version string }
+
+// ScheduleTimeZone evaluates the cron expression in an IANA time zone.
+func ScheduleTimeZone(tz string) ScheduleOption { return func(o *scheduleOpts) { o.tz = tz } }
+
+// ScheduleVersion pins the flow version started by the schedule.
+func ScheduleVersion(hash string) ScheduleOption { return func(o *scheduleOpts) { o.version = hash } }
+
+// Schedule installs (or replaces) a cron schedule that starts flowName with
+// input on every firing. It is a JetStream message schedule: no process keeps
+// time, any engine turns the firing into an execution "<name>-<seq>".
+func (c *Client) Schedule(ctx context.Context, name, flowName, cron string, input any,
+	opts ...ScheduleOption,
+) error {
+	if err := checkSchedule(name, flowName, cron); err != nil {
+		return err
+	}
+
+	if err := c.attach(ctx); err != nil {
+		return err
+	}
+
+	var o scheduleOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	b, err := marshalObject(input)
+	if err != nil {
+		return err
+	}
+
+	body, err := json.Marshal(engine.ScheduleSpec{Flow: flowName, Version: o.version, Input: b})
+	if err != nil {
+		return err
+	}
+
+	m := nats.NewMsg(c.in.Names.ScheduleSubject(name))
+	m.Header.Set(sched.HeaderSchedule, cron)
+	m.Header.Set(sched.HeaderScheduleTarget, c.in.Names.CronSubject(name))
+
+	if o.tz != "" {
+		m.Header.Set(sched.HeaderScheduleTZ, o.tz)
+	}
+
+	m.Data = body
+
+	if _, err = c.in.JS.PublishMsg(ctx, m); err != nil {
+		return fmt.Errorf("packtrail: schedule %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// Unschedule removes a cron schedule.
+func (c *Client) Unschedule(ctx context.Context, name string) error {
+	if err := names.CheckToken("schedule name", name); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+
+	if err := c.attach(ctx); err != nil {
+		return err
+	}
+
+	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamCmd)
+	if err != nil {
+		return err
+	}
+
+	return s.Purge(ctx, jetstream.WithPurgeSubject(c.in.Names.ScheduleSubject(name)))
+}
+
+// ScheduleInfo describes an installed schedule.
+type ScheduleInfo struct {
+	Name     string          `json:"name"`
+	Cron     string          `json:"cron"`
+	TimeZone string          `json:"time_zone,omitempty"`
+	Flow     string          `json:"flow"`
+	Version  string          `json:"version,omitempty"`
+	Input    json.RawMessage `json:"input,omitempty"`
+}
+
+// Schedules lists the installed cron schedules.
+func (c *Client) Schedules(ctx context.Context) ([]ScheduleInfo, error) {
+	if err := c.attach(ctx); err != nil {
+		return nil, err
+	}
+
+	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamCmd)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := s.Info(ctx, jetstream.WithSubjectFilter(c.in.Names.ScheduleSubject("*")))
+	if err != nil {
+		return nil, err
+	}
+
+	var out []ScheduleInfo
+
+	for subj := range info.State.Subjects {
+		m, lerr := s.GetLastMsgForSubject(ctx, subj)
+		if lerr != nil {
+			continue
+		}
+
+		var spec engine.ScheduleSpec
+		if lerr = json.Unmarshal(m.Data, &spec); lerr != nil {
+			continue
+		}
+
+		out = append(out, ScheduleInfo{
+			Name: subj[strings.LastIndexByte(subj, '.')+1:], Cron: m.Header.Get(sched.HeaderSchedule),
+			TimeZone: m.Header.Get(sched.HeaderScheduleTZ), Flow: spec.Flow, Version: spec.Version, Input: spec.Input,
+		})
+	}
+
+	slices.SortFunc(out, func(a, b ScheduleInfo) int { return strings.Compare(a.Name, b.Name) })
+
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Dead letters
+
+// DeadLetter is a message packtrail gave up on: an invalid command, a job
+// whose deliveries were exhausted, an undeliverable trigger.
+type DeadLetter = wire.DeadLetter
+
+// DeadLetters returns the most recent dead letters, newest first.
+func (c *Client) DeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	if err := c.attach(ctx); err != nil {
+		return nil, err
+	}
+
+	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamDLQ)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := s.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []DeadLetter
+
+	for seq := info.State.LastSeq; seq >= info.State.FirstSeq && seq > 0; seq-- {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+
+		m, lerr := s.GetMsg(ctx, seq)
+		if lerr != nil {
+			continue
+		}
+
+		var d DeadLetter
+		if json.Unmarshal(m.Data, &d) == nil {
+			d.Seq = seq
+			out = append(out, d)
+		}
+	}
+
+	return out, nil
+}
+
+// Redrive re-publishes the dead letter at seq to its original subject (with
+// a fresh deduplication id) and removes it from the dead-letter stream.
+func (c *Client) Redrive(ctx context.Context, seq uint64) error {
+	if err := c.attach(ctx); err != nil {
+		return err
+	}
+
+	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamDLQ)
+	if err != nil {
+		return err
+	}
+
+	m, err := s.GetMsg(ctx, seq)
+	if err != nil {
+		return fmt.Errorf("%w: dead letter %d: %w", ErrNotFound, seq, err)
+	}
+
+	var d DeadLetter
+	if err = json.Unmarshal(m.Data, &d); err != nil {
+		return err
+	}
+
+	msg := nats.NewMsg(d.Subject)
+	msg.Data = d.Body
+
+	for k, v := range d.Header {
+		if k != wire.HeaderMsgID && !strings.HasPrefix(k, "Nats-") {
+			msg.Header[k] = v
+		}
+	}
+
+	// A redriven command keeps its command id (the fold stays idempotent).
+	if _, err = c.in.JS.PublishMsg(ctx, msg); err != nil {
+		return err
+	}
+
+	return s.DeleteMsg(ctx, seq)
+}
+
+// ---------------------------------------------------------------------------
+// Long-term store
+
+// Store is a namespaced key-value store for application data that outlives
+// executions (LangGraph Store). Namespaces and keys are tokens.
+type Store struct{ c *Client }
+
+// Store returns the long-term store.
+func (c *Client) Store() *Store { return &Store{c: c} }
+
+func (s *Store) kv(ctx context.Context, ns, key string) (jetstream.KeyValue, string, error) {
+	if err := s.c.attach(ctx); err != nil {
+		return nil, "", err
+	}
+
+	if err := names.CheckToken("store namespace", ns); err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+
+	if key != "" {
+		if err := names.CheckToken("store key", key); err != nil {
+			return nil, "", fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+	}
+
+	kv, err := s.c.in.KV(ctx, s.c.in.Names.BucketStore)
+
+	return kv, ns + "." + key, err
+}
+
+// Put stores value (any JSON-encodable value) under ns/key.
+func (s *Store) Put(ctx context.Context, ns, key string, value any) error {
+	kv, k, err := s.kv(ctx, ns, key)
+	if err != nil {
+		return err
+	}
+
+	b, err := marshalAny(value)
+	if err != nil {
+		return err
+	}
+
+	_, err = kv.Put(ctx, k, b)
+
+	return err
+}
+
+// Get returns the value under ns/key.
+func (s *Store) Get(ctx context.Context, ns, key string) (json.RawMessage, error) {
+	kv, k, err := s.kv(ctx, ns, key)
+	if err != nil {
+		return nil, err
+	}
+
+	e, err := kv.Get(ctx, k)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil, fmt.Errorf("%w: %s/%s", ErrNotFound, ns, key)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return e.Value(), nil
+}
+
+// Delete removes ns/key.
+func (s *Store) Delete(ctx context.Context, ns, key string) error {
+	kv, k, err := s.kv(ctx, ns, key)
+	if err != nil {
+		return err
+	}
+
+	return kv.Delete(ctx, k)
+}
+
+// Keys lists the keys of a namespace.
+func (s *Store) Keys(ctx context.Context, ns string) ([]string, error) {
+	kv, _, err := s.kv(ctx, ns, "")
+	if err != nil {
+		return nil, err
+	}
+
+	l, err := kv.ListKeysFiltered(ctx, ns+".*")
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	var out []string
+	for k := range l.Keys() {
+		out = append(out, strings.TrimPrefix(k, ns+"."))
+	}
+
+	slices.Sort(out)
+
+	return out, nil
+}

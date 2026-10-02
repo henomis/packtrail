@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package acceptance holds module-level acceptance checks from spec §12.
 package acceptance
 
 import (
@@ -21,21 +20,51 @@ import (
 	"testing"
 )
 
-// TestNoForbiddenDependencies enforces the spec §12 acceptance criterion that
-// Packtrail must not depend on the integration repository: it is a
-// standalone engine backed only by NATS.
+// TestNoForbiddenDependencies keeps the module lean: NATS, expr-lang, yaml
+// and a JSON Schema validator — nothing else, and nothing AI-specific.
 func TestNoForbiddenDependencies(t *testing.T) {
-	for _, f := range []string{"../../go.mod", "../../go.sum"} {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
+	data, err := os.ReadFile("../../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	allowed := []string{
+		"github.com/nats-io/", "github.com/expr-lang/expr", "gopkg.in/yaml.v3",
+		"github.com/santhosh-tekuri/jsonschema", "github.com/klauspost/compress", "github.com/minio/highwayhash",
+		"github.com/google/go-tpm", "github.com/antithesishq/", "golang.org/x/", "github.com/nats-io/nuid",
+	}
+
+	inRequire := false
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+
+		switch {
+		case strings.HasPrefix(line, "require ("):
+			inRequire = true
+
+			continue
+		case line == ")":
+			inRequire = false
+
+			continue
 		}
 
-		text := strings.ToLower(string(data))
-		for _, forbidden := range []string{"integration"} {
-			if strings.Contains(text, forbidden) {
-				t.Errorf("%s contains forbidden dependency %q", f, forbidden)
+		if !inRequire || line == "" {
+			continue
+		}
+
+		mod := strings.Fields(line)[0]
+		ok := false
+
+		for _, a := range allowed {
+			if strings.HasPrefix(mod, a) {
+				ok = true
 			}
+		}
+
+		if !ok {
+			t.Errorf("unexpected dependency %s", mod)
 		}
 	}
 }

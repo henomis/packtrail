@@ -1,40 +1,52 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>packtrail · observability</title>
-  <link rel="stylesheet" href="style.css" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>packtrail</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header>
-    <h1>packtrail</h1>
-    <span class="sub">observability</span>
-    <button id="dlq" class="dlq" hidden title="dead-lettered work — click to inspect"></button>
-    <span id="conn" class="conn" title="live event stream">●</span>
-  </header>
-
-  <main>
-    <aside id="sidebar">
-      <div class="filters">
-        <select id="flow-filter"><option value="">all flows</option></select>
-        <select id="status-filter">
-          <option value="">all statuses</option>
-          <option value="running">running</option>
-          <option value="waiting">waiting</option>
-          <option value="completed">completed</option>
-          <option value="failed">failed</option>
-          <option value="cancelled">cancelled</option>
-        </select>
+<header>
+  <h1>packtrail</h1>
+  <nav>
+    <select id="f-ns" aria-label="namespace" title="namespace"></select>
+    <select id="f-status" aria-label="status">
+      <option value="">all statuses</option>
+      <option>running</option><option>waiting</option><option>completed</option>
+      <option>failed</option><option>cancelled</option>
+    </select>
+    <input id="f-flow" placeholder="flow" aria-label="flow">
+    <input id="f-attr" placeholder="attr=value" aria-label="search attribute">
+    <button id="refresh">Refresh</button>
+    <button id="show-dlq">Dead letters</button>
+  </nav>
+</header>
+<main>
+  <section id="list-pane"><table id="list"><thead><tr><th>execution</th><th>flow</th><th>status</th><th>updated</th></tr></thead><tbody></tbody></table></section>
+  <section id="detail-pane">
+    <p class="hint" id="empty">Select an execution.</p>
+    <div id="detail" hidden>
+      <h2 id="d-title"></h2>
+      <div class="meta" id="d-meta"></div>
+      <div class="actions">
+        <button data-act="signal">Signal…</button>
+        <button data-act="resume">Resume…</button>
+        <button data-act="cancel">Cancel</button>
+        <button data-act="fork">Fork at selected</button>
+        <button data-act="rerun">Rerun node…</button>
+        <button id="graph-fit" title="fit the graph to the pane (wheel zooms, drag pans, double-click fits)">Fit</button>
       </div>
-      <ul id="exec-list"></ul>
-    </aside>
-
-    <section id="detail">
-      <p class="empty">Select an execution.</p>
-    </section>
-  </main>
-
-  <script src="app.js"></script>
+      <div id="graph-wrap"><svg id="graph" role="img" aria-label="flow graph"></svg></div>
+      <div class="split">
+        <div><h3>Timeline <small id="d-at"></small></h3><ol id="timeline"></ol></div>
+        <div><h3>State</h3><pre id="state"></pre></div>
+      </div>
+    </div>
+    <div id="dlq" hidden><h2>Dead letters</h2><table><thead><tr><th>seq</th><th>kind</th><th>key</th><th>reason</th><th></th></tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+<div id="banner" role="alert" hidden><span id="banner-msg"></span><button id="banner-close" aria-label="dismiss">×</button></div>
+<script src="app.js"></script>
 </body>
 </html>

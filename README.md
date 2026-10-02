@@ -1,719 +1,200 @@
-# Packtrail
+# packtrail
 
 [![Build Status](https://github.com/henomis/packtrail/actions/workflows/checks.yml/badge.svg)](https://github.com/henomis/packtrail/actions/workflows/checks.yml) [![GoDoc](https://godoc.org/github.com/henomis/packtrail?status.svg)](https://godoc.org/github.com/henomis/packtrail) [![Go Report Card](https://goreportcard.com/badge/github.com/henomis/packtrail)](https://goreportcard.com/report/github.com/henomis/packtrail) [![GitHub release](https://img.shields.io/github/release/henomis/packtrail.svg)](https://github.com/henomis/packtrail/releases)
 
-A **durable, ecosystem-agnostic workflow engine** in Go, backed **only by NATS**
-(Core + JetStream + KV + Message Scheduler). Packtrail orchestrates declarative
-flow graphs — `task`, `fanout`, `fanin`, `choice` and `signal` nodes — defined
-either in YAML or directly as Go structs, with crash-durable state, retries,
-conditional routing, external signals and timers/cron.
+A durable workflow engine built only on [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
 
-Packtrail's defining feature is that **node execution is pluggable**. The engine
-never speaks a wire protocol directly: every `task`/branch node runs through an
-[`Invoker`](invoker/invoker.go). A project plugs in its own transport — an
-agent caller, an HTTP client, a NATS request/reply worker — and inherits all of
-packtrail's durability machinery for free.
+**Website and full documentation: <https://henomis.github.io/packtrail/>**
 
-```mermaid
-flowchart LR
-    FLOWS["YAML flows\nor Go structs"] --> Engine["Engine\n(runtime)"]
-    Engine <-->|"invoker.Invoke\n(pluggable seam)"| Invokers["Invoker(s)\nagent / http\nnats-task"]
-    Invokers --> Services["your services\n(agents, APIs…)"]
-    Engine -->|"CAS state / work / timers"| NATS["NATS JetStream + KV\n(the only backend)"]
-```
+- **Event-sourced.** Every execution is an ordered log of events on its own
+  subject. State, snapshots, the visibility index, jobs and timers are all
+  derived from it, so time travel, forks, replays and audit come for free.
+- **A declarative graph, not workflow-as-code.** Tasks, choices, fan-out/join,
+  awaits (human in the loop), dynamic maps, subflows, dynamic edges,
+  interrupts and failure routing (`on_failure`, for compensation); typed
+  state channels with reducers. No determinism rules for
+  your code.
+- **Workers in any language.** A task is a job on `<ns>.work.<kind>`; a
+  worker answers with a command over a small, versioned JSON protocol
+  ([protocol reference](https://henomis.github.io/packtrail/docs.html#protocol)). The Go SDK is in `worker/`.
+- **Agnostic.** No agents, LLMs or tokens in the core. Budgets are generic
+  counters; an "agent" is just a worker.
+- **Only NATS (≥ 2.12).** One message per decision with an expected-sequence
+  check for single-writer appends,
+  message schedules for durable timers and cron, KV and object stores for
+  everything else. No database, no extra coordinator.
 
-## Installation
+**What it is, and is not.** packtrail is a *workflow-as-data* engine: you
+declare the graph (YAML or Go structs) and packtrail interprets it. In that it
+is closer to AWS Step Functions, Netflix Conductor or Argo — and to LangGraph's
+graphs — than to Temporal, whose workflows are code replayed
+deterministically. What it shares with Temporal is the durability model:
+event history, durable timers, workers in any language.
+
+## Install
 
 ```sh
 go get github.com/henomis/packtrail
+go install github.com/henomis/packtrail/cmd/packtrail@latest      # CLI
+go install github.com/henomis/packtrail/cmd/packtrail-ui@latest   # dashboard
 ```
 
-Requires Go 1.26+ and a running **NATS Server 2.12+** with JetStream enabled
-(`nats-server -js`) — packtrail relies on the JetStream **Message Scheduler**
-(2.12) for every timer (retry backoff, signal timeouts, cron). Tests embed a
-real NATS server — no external server needed to run them.
+Requires Go 1.26+ and NATS Server 2.12+ with JetStream enabled
+(`docker run --rm -p 4222:4222 nats:2.14.2 -js`).
 
-> **Upgrading across pre-1.0 releases:** the on-NATS layout (bucket and stream
-> shapes) may change between pre-1.0 versions with no migration tooling. Drain
-> in-flight executions before upgrading, or start the new version under a fresh
-> namespace.
-
-## Quick start
-
-```go
-nc, _ := nats.Connect(nats.DefaultURL)
-
-srv, _ := packtrail.New(nc,
-    packtrail.WithFlowsDir("flows"),           // directory of *.yaml flow files
-    packtrail.WithNamespace("acme"),           // isolate from other deployments
-    packtrail.WithInvoker("agent", myInvoker), // your transport
-    packtrail.WithResultCache(),               // idempotent retries
-)
-
-// Register an in-process nats-task worker (optional)
-srv.Handle(ctx, "tasks.notify.*", notifyHandler)
-
-id, _ := srv.Start(ctx, "agent-pipeline", payload)
-srv.Signal(ctx, id, "approval", data)
-ex, _ := srv.Get(ctx, id)
-
-srv.Run(ctx) // blocks: engine + indexer + reconcile + archival
-```
-
-`New` performs no NATS I/O: it parses and validates the flows, and every bucket
-and stream is provisioned lazily by the first call that needs NATS (`Start`,
-`Run`, `Get`, …). Call `srv.Init(ctx)` explicitly at startup if you want
-provisioning errors (e.g. JetStream disabled, missing permissions) to fail
-fast instead of surfacing on first use.
-
-## Built-in transport
-
-Packtrail ships the built-in **`nats-task`** invoker — a `pkg/protocol`
-request/reply on `tasks.<x>.*` — as the default transport. So:
-
-- Any task worker that serves the protocol (`protocol.Serve` on `tasks.*`) works
-  unchanged — just use the default `subject:` on a node.
-- New flows can select any registered invoker per node via `invoker:` + `target:`.
-- The core has **no dependency on any agent framework** (enforced by
-  `internal/acceptance`), so it stays reusable by any project.
-
-For slow nodes there is also the built-in **`invoker/asyncqueue`** package, which
-makes any ordinary Invoker durable and asynchronous — see
-[Async activities](#async-activities-long-running-work).
-
-## Flow definition
-
-Flows can be defined in YAML or as Go structs — both paths run through the same
-validation and produce identical runtime behaviour.
-
-### YAML
+## Quick look
 
 ```yaml
-version: "1.0"
-name: agent-pipeline
+# review.yaml
+name: review
+channels:
+  notes: {reducer: append}
 nodes:
-  - {id: triage, type: task, invoker: agent, target: triage-agent,
-     timeout: 2m, retry: {max_attempts: 3, backoff: exponential}}
-  - id: route
+  - id: draft
+    type: task
+    kind: writer
+    timeout: 1m
+    retry: {max_attempts: 3, backoff: exponential}
+    next: check
+  - id: check
     type: choice
     rules:
-      - {when: 'results.triage.category == "billing"', to: billing-agent}
-      - {default: true, to: general-agent}
-  - {id: billing-agent, type: task, invoker: agent, target: billing-agent}
-  - {id: general-agent, type: task, invoker: agent, target: general-agent}
-  - {id: notify, type: task, subject: "tasks.notify.{execution_id}"}  # built-in nats-task
-edges:
-  - {from: triage, to: route}
-  - {from: billing-agent, to: notify}
-  - {from: general-agent, to: notify}
+      - {when: "results.draft.score >= 8", to: approve}
+      - {default: true, to: draft}
+  - id: approve
+    type: await
+    signal: approval
+    timeout: 48h
+    next: publish
+  - {id: publish, type: task, kind: publisher}
+start: draft
 ```
 
-### Go structs
-
-The same flow as a `FlowDef`, useful when flows are constructed programmatically:
-
 ```go
-packtrail.WithFlowDef(packtrail.FlowDef{
-    Version: "1.0",
-    Name: "agent-pipeline",
-    Nodes: []packtrail.NodeDef{
-        {ID: "triage", Type: "task", Invoker: "agent", Target: "triage-agent",
-         Timeout: 2 * time.Minute, Retry: &packtrail.RetryPolicy{MaxAttempts: 3, Backoff: "exponential"}},
-        {ID: "route", Type: "choice", Rules: []packtrail.RuleDef{
-            {When: `results.triage.category == "billing"`, To: "billing-agent"},
-            {Default: true, To: "general-agent"},
-        }},
-        {ID: "billing-agent", Type: "task", Invoker: "agent", Target: "billing-agent"},
-        {ID: "general-agent", Type: "task", Invoker: "agent", Target: "general-agent"},
-        {ID: "notify", Type: "task", Subject: "tasks.notify.{execution_id}"},
-    },
-    Edges: []packtrail.EdgeDef{
-        {From: "triage", To: "route"},
-        {From: "billing-agent", To: "notify"},
-        {From: "general-agent", To: "notify"},
-    },
+eng, _ := packtrail.New(nc, packtrail.WithFlowsDir("flows"))
+go eng.Run(ctx) // provisions the namespace and processes commands
+
+w, _ := worker.New(nc, "writer", func(ctx context.Context, j *worker.Job) (*worker.Result, error) {
+	var in struct{ Topic string }
+	if err := j.Input(&in); err != nil {
+		return nil, worker.Permanent(err)
+	}
+	return &worker.Result{
+		Output: map[string]any{"text": "…", "score": 9},
+		Writes: map[string]any{"notes": "drafted " + in.Topic},
+	}, nil
 })
+go w.Run(ctx)
+
+c := eng.Client()
+id, _ := c.Start(ctx, "review", map[string]any{"topic": "NATS"})
+_ = c.Signal(ctx, id, "approval", map[string]any{"by": "ana"})
+st, _ := c.Wait(ctx, id) // final state: channels, results, counters, …
 ```
 
-`WithFlowDef` may be combined freely with `WithFlow` and `WithFlowsDir`; duplicate
-flow names across any source are rejected at startup.
-
-Use keyed composite literals for `FlowDef` and `NodeDef`. These structs mirror
-the YAML schema and may grow as the schema gains fields (for example `Version`
-and choice-node `OnError`).
-
-- `invoker:` / `Invoker` selects a registered Invoker kind (default `nats-task`).
-- `target:` / `Target` is interpreted by that Invoker (an agent name, a URL, …);
-  `subject:` / `Subject` is the nats-task alias. `{execution_id}` is substituted
-  at dispatch.
-- `retry.backoff` / `Retry.Backoff` accepts `exponential`, `linear`, or `fixed` (default).
-- Flow names, node ids and signal names become NATS subject tokens and KV key
-  segments, so they must match `[A-Za-z0-9_-]{1,128}` (the namespace prefix:
-  `[A-Za-z0-9_-]{1,64}`); anything else is rejected at load time.
-- **YAML is strict.** An unknown field (a typo like `retires:`) is a parse
-  error, not a silently dropped setting, and a file may hold exactly one flow
-  document (extra `---` documents are rejected, so none is silently ignored).
-- **Every `invoker:` kind must be registered.** `New` rejects a flow whose task
-  node names a kind that is neither the built-in `nats-task` nor registered via
-  `WithInvoker`/`WithAsyncInvoker` — a typo'd kind fails at construction, not on
-  the first execution to reach that node. Kind registrations must also be
-  unambiguous: the same custom kind registered twice, both sync and async, or an
-  async kind shadowing `nats-task`, is a construction error. A sync
-  `WithInvoker("nats-task", ...)` intentionally replaces the built-in transport.
-- **Every node must be reachable.** A node not connected to the start node by
-  any edge, choice rule, fanout branch or `on_timeout` route is rejected — dead
-  graph configuration is almost always a typo'd target.
-- A `nats-task` subject must be publishable: whitespace or wildcard characters
-  (`*`, `>`) are rejected at load. `{execution_id}` is the only placeholder — any
-  other `{…}` token (a typo like `{exec_id}`) is rejected rather than sent as a
-  literal subject shared by every execution.
-- **Exactly one start node.** The start node is the single node with no inbound
-  transition. When every node is routed into (typically a retry loop back to the
-  first node), the error names the reference that consumed each node, so you can
-  loop back to a later node instead.
-- **Choice nodes route only by their rules.** An outgoing edge from a choice
-  node is rejected, since it would never be taken.
-- **A retry block must be able to retry.** A `retry.backoff` without
-  `retry.max_attempts` is rejected: it would run the node once and never retry.
-- **A node timeout must fit its invoker.** A node selecting an async kind (see
-  [Async activities](#async-activities-long-running-work)) may not declare a
-  `timeout` above that kind's activity timeout — `New` rejects it rather than
-  capping the call silently.
-
-## Node types
-
-### `task`
-
-Invokes an Invoker with the assembled context and stores whatever it returns as
-this node's output. The most common node type. The context is:
-
-```jsonc
-{
-  "input":       {},  // the start payload
-  "results":     {},  // every settled node's output, keyed by node id
-  "signals":     {},  // every received signal payload, keyed by signal name
-  "branches":    {},  // outputs of the fan currently being joined
-  "last_node":   "",  // id of the most recently settled output
-  "released_by": "",  // signal that released the wait just before this node (else omitted)
-  "visits":      {}   // times each node has been entered, keyed by node id
-}
-```
-
-Decode it with `packtrail.DecodeContext(req.Payload)` into a
-`packtrail.InvocationContext` rather than a hand-written mirror struct, so a
-renamed field fails to compile instead of silently reading as empty.
-
-```yaml
-- id: step
-  type: task
-  invoker: agent          # registered invoker kind (default: nats-task)
-  target: my-agent        # interpreted by the invoker
-  timeout: 2m
-  retry:
-    max_attempts: 3
-    backoff: exponential
-```
-
-### `choice`
-
-Routes the execution to one of several branches based on boolean expressions
-evaluated against the assembled context:
-
-```yaml
-- id: route
-  type: choice
-  rules:
-    - {when: 'results.triage.risk_score > 80', to: manual-review}
-    - {when: 'input.category == "billing" && results.triage.amount > 1000', to: billing-agent}
-    - {default: true, to: general-agent}
-```
-
-- **Expression language.** `when` uses [expr-lang](https://expr-lang.org/): comparisons
-  (`==`, `!=`, `<`, `>`), boolean logic (`&&`, `||`, `!`), membership (`in`),
-  string and arithmetic operators. Compiled once on load — a syntax error is a
-  validation error, not a runtime surprise.
-- **Bounded evaluation.** Choice rules run as straight-line predicates with an
-  explicit VM memory budget. To keep evaluation bounded, validation rejects
-  ranges, iteration helpers (`map`, `filter`, `all`, `any`, `sortBy`, …), and
-  function calls other than `len(...)`.
-- **Variables in scope.** `input` (the start payload), `results` (each visited
-  node's output, keyed by node id), `signals` (received signal payloads, keyed
-  by signal name), `branches` (the current fan's outputs) and `last_node` (the
-  id of the most recently settled output — "the previous step's result" is
-  `results[last_node]`), `released_by` (the signal that released the wait
-  immediately before this node; empty everywhere else) and `visits` (how many
-  times each node has been entered, keyed by node id). Reach into them with
-  dotted paths:
-  `results.triage.risk_score`, `input.user.tier`, `signals.approval.granted`,
-  `visits.verify`.
-- **Bounding a loop.** `visits` counts node *entries*, not attempts: a node
-  retried three times on one visit counts once, and a `Resume` re-enters the
-  node it failed on. It is what lets a cycle stop itself without every node
-  keeping its own tally:
-
-  ```yaml
-  - id: gate
-    type: choice
-    rules:
-      - {when: 'results.verify.pass == true', to: publish}
-      - {when: 'visits.verify >= 3', to: escalate}
-      - {default: true, to: fix}
-  ```
-
-  A fan-out branch is counted too, though it never becomes the current node.
-- **First match wins.** Rules are evaluated top to bottom. Order from most to least
-  specific.
-- **`default` is required.** Validation rejects a choice node without a
-  `{default: true, to: …}` branch, so a choice can never dead-end.
-- **Missing fields fall through.** If a `when` expression errors (e.g. missing
-  field), that rule counts as no match and evaluation continues to the next rule.
-  Add `on_error: fail` (or `NodeDef.OnError: "fail"`) to fail the execution on an
-  evaluation error instead.
-
-### `fanout` / `fanin`
-
-Dispatch multiple branches in parallel and join them back:
-
-```yaml
-- id: fan
-  type: fanout
-  branches: [worker-a, worker-b, worker-c]
-
-- id: join
-  type: fanin
-  wait_for: [worker-a, worker-b, worker-c]
-  join_policy: all          # all | any | quorum:N
-```
-
-- `fanout` launches every branch listed in `branches` as a parallel sub-execution.
-- `fanin` waits for the branches listed in `wait_for` according to `join_policy`:
-  - `all` (default) — advance when every branch completes.
-  - `any` — advance when the first branch completes.
-  - `quorum:N` — advance when at least N branches complete.
-- The fan graph is validated at load: a node may be a branch of at most one
-  fanout, every `wait_for` node must be some fanout's branch, and fanout/fanin
-  nodes must not lie on a cycle (branch state is per-execution, not per-visit,
-  so a revisit would reuse it). Adjacency is checked too: every branch must be
-  a `task` node (any other type would never settle), a fanout's single outgoing
-  edge must lead to a fanin (that is where the execution parks and the join is
-  evaluated), and that fanin may only wait for branches of its own fanout —
-  waiting on a subset is fine (join on the critical branches, let the rest
-  settle in the background), but not the same branch twice.
-- A branch is reached only through its fanout. An edge, choice rule or
-  `on_timeout` routed into a branch is rejected (the execution would run that
-  one node and report `completed` with the rest of the flow skipped), and so is
-  an outgoing edge from a branch (the fanin, not the branch, advances the
-  execution — put the edge after the fanin).
-
-### `signal`
-
-Parks the execution until an external signal arrives (or the timeout fires):
-
-```yaml
-- id: wait-approval
-  type: signal
-  signal_name: approval
-  timeout: 24h
-  on_timeout: escalation    # node to jump to on timeout
-```
-
-Send the signal from your application:
-
-```go
-srv.Signal(ctx, execID, "approval", json.RawMessage(`{"approved": true}`))
-// If the caller may retry after an ambiguous publish result:
-srv.SignalWithID(ctx, execID, "approval", "request-123", json.RawMessage(`{"approved": true}`))
-```
-
-The signal payload is stored in the data plane — downstream nodes and choice
-rules see it as `signals.approval` — and execution resumes at the next node,
-which sees `released_by: "approval"` in its context (a signal node produces no
-output of its own, so `last_node` does not name it). If `timeout` elapses first,
-the execution advances to `on_timeout` instead and `released_by` stays empty. An `on_timeout` without a positive `timeout` is rejected at load — the
-route could never fire.
-
-Signals are durable and forgiving about ordering: a signal sent before the
-execution reaches its signal node is stored and consumed on arrival, and one
-sent just before the execution is created is redelivered until the execution
-exists. That is why `Signal` does not reject an unknown execution id: a
-genuinely orphaned signal (e.g. a typo'd execution id) returns nil and is
-dead-lettered after the delivery cap instead of vanishing silently. When the id
-comes from a human rather than a concurrent `Start`, `Get` the execution first.
-Timeouts
-are evaluated by the NATS Message Scheduler at roughly one-second granularity,
-so sub-second `timeout` values fire at the next tick. Use `SignalWithID` when a
-caller needs an idempotency key for ambiguous publish retries; duplicate
-publishes with the same key collapse within the signal stream's dedupe window.
-
-## Async activities (long-running work)
-
-An Invoker normally returns a terminal status (`StatusOK`/`Error`/`Retry`) and
-the engine settles the node synchronously. For long-running work (an agent call,
-a remote job) an Invoker can instead return **`StatusPending`**: the engine parks
-the execution as `waiting` and frees its work slot immediately, without blocking.
-The activity is settled later via
-`Server.CompleteActivityWithGeneration(ctx, execID, node, generation, attempt, result)`
-— OK to advance, Error to fail, Retry to re-dispatch per the node policy. Use the
-`Generation` from the original `Request`; it fences stale completions from an
-earlier legal cycle or `Resume` visit of the same node/attempt. The legacy
-`CompleteActivity(ctx, execID, node, attempt, result)` remains available when no
-generation is available. Completion is idempotent and robust to a completion that
-arrives before the task has finished parking, so an at-least-once worker can call
-it freely. This works for plain task nodes and fan-out branches alike.
-
-### The built-in async invoker (recommended)
-
-You rarely need to wire that plumbing by hand. The **`invoker/asyncqueue`**
-package turns any *ordinary synchronous* Invoker into a durable asynchronous one:
-register it with `WithAsyncInvoker` and packtrail dispatches matching nodes to a
-JetStream work-queue (returning `StatusPending` for you), runs your Invoker on an
-in-process worker pool off the engine's critical path, and settles the result via
-`CompleteActivityWithGeneration` — with bounded queues, at-least-once delivery,
-generation-aware dispatch dedup, ack-extending heartbeats and crash redelivery
-all handled for you.
-
-```go
-// Your slow work is just a normal Invoker — no queue/ack/heartbeat code.
-exec := packtrail.InvokerFunc(func(ctx context.Context, req packtrail.Request) (packtrail.Result, error) {
-    out, err := callSlowService(ctx, req.Target, req.Payload) // an agent, an API, …
-    if err != nil {
-        return packtrail.Result{}, err // transient → retried per the node policy
-    }
-    return packtrail.Result{Status: packtrail.StatusOK, Payload: out}, nil
-})
-
-srv, _ := packtrail.New(nc,
-    packtrail.WithAsyncInvoker("agent", exec,
-        asyncqueue.WithConcurrency(64)), // tune the worker (optional)
-    // … plus flows whose nodes select `invoker: agent`
-)
-```
-
-Each kind gets its own work-queue stream (`<ns>-async-<kind>`), so many workers —
-in or out of process — can share it to scale horizontally; the low-level
-`asyncqueue.Dispatcher` and `asyncqueue.Worker` are exported for out-of-process
-workers.
-
-An async node that declares no `timeout` runs under the kind's activity timeout
-(`asyncqueue.WithActivityTimeout`, 5m by default), not `WithDefaultTimeout`. A
-node that declares a longer timeout than that ceiling is rejected by `New` —
-raise `WithActivityTimeout` for the kind instead.
-
-A job the worker can never complete (it exhausted its deliveries) settles its
-node as **failed** via `Server.FailActivity` before it is dead-lettered, so the
-execution does not stay `waiting` forever — and, being failed rather than
-cancelled, it can be `Resume`d once the cause is fixed. The built-in worker does
-this automatically; an out-of-process worker should call `FailActivity` itself.
-
-### Doing it by hand
-
-For a bespoke transport you can implement the two halves yourself: return
-`StatusPending` from your Invoker after enqueuing a durable job, and call
-`CompleteActivityWithGeneration` from the worker that runs it.
-
-```go
-// dispatch (non-blocking): enqueue a durable job, return pending
-func (d *dispatcher) Invoke(ctx context.Context, req packtrail.Request) (packtrail.Result, error) {
-    enqueueJob(req.ExecutionID, req.NodeID, req.Generation, req.Attempt, req.Payload) // your durable queue
-    return packtrail.Result{Status: packtrail.StatusPending}, nil
-}
-
-// later, from the worker that ran the job:
-srv.CompleteActivityWithGeneration(ctx, execID, node, generation, attempt,
-    packtrail.Result{Status: packtrail.StatusOK, Payload: out})
-```
-
-## Resuming failed executions
-
-A failed execution can be revived with `Resume`. It re-runs the node it failed
-on with a fresh retry budget, preserving the durable state and every stored
-output. Any running engine
-for the namespace picks up the resumed work.
-
-```go
-err := srv.Resume(ctx, execID)
-```
-
-`Cancel(ctx, execID, reason)` moves a running, waiting or **failed** execution
-to the terminal `cancelled` status, which `Resume` cannot revive. Cancelling a
-failed one is how you retire it: failed is terminal but resumable, so it would
-otherwise stay revivable forever with no way to give up on it, and it stays in
-the hot bucket while it does. The failure reason is kept alongside the cancel
-reason rather than overwritten.
-
-Cancelling an execution that is already completed or cancelled is a no-op, but
-an id that names no execution at all returns `ErrNotFound` — "nothing left to
-cancel" and "you cancelled nothing" are different answers.
-
-## Cron scheduling
-
-Start a flow on a recurring schedule with `ScheduleFlow`. The cron expression is
-6-field (`sec min hour dom mon dow`), or one of `@yearly`/`@annually`,
-`@monthly`, `@weekly`, `@daily`/`@midnight`, `@hourly`, `@every <duration>` or
-`@at <time>`:
-
-```go
-// trigger "daily-report" at 08:00 every day
-srv.ScheduleFlow(ctx, "daily-report-schedule", "daily-report", "0 0 8 * * *", nil)
-```
-
-Calling `ScheduleFlow` again with the same name replaces the existing schedule.
-A malformed expression is rejected with `ErrInvalidArgument` (and one passed to
-`WithReconcileActive`/`WithReconcileFull` fails `New`), rather than being
-accepted and failing later inside the engine. `packtrail.ValidateCron(expr)`
-runs the same check for expressions coming from your own configuration.
-
-To also run periodic visibility reconciliation, configure it at startup. There
-are two independent, durable schedules: a cheap active-set pass over in-flight
-executions and an authoritative full scan as the deep backstop:
-
-```go
-packtrail.WithReconcileActive("0 */5 * * * *") // in-flight execs, every 5 minutes
-packtrail.WithReconcileFull("0 0 * * * *")     // full scan, hourly
-```
-
-To keep the executions bucket (and the scans over it) bounded, enable archival.
-Completed executions are swept into a cold archive bucket on the full-reconcile
-schedule and kept for the retention window; failed executions stay hot so they
-remain resumable:
-
-```go
-packtrail.WithArchive(30 * 24 * time.Hour) // keep completed execs queryable for 30 days
-```
-
-## Durability model
-
-Two design rules make crashes boring:
-
-- **Control plane vs data plane.** The execution *document* (one KV entry,
-  CAS-guarded) holds only control state: current node, node-visit generation, attempt,
-  branches, which outputs exist. Every payload — the start input, each node's
-  output, each signal — is its own entry in a separate payloads bucket, written
-  *before* the transition that references it commits. The document never grows
-  with payload bytes, and a flow's size is bounded per-output (see
-  `WithMaxPayloadBytes`), not per-flow. Read the assembled view with
-  `Server.Results(ctx, id)` — the same
-  `{input, results, signals, branches, last_node, visits}` document invokers and choice
-  rules see.
-- **Transactional outbox.** Every state transition commits its follow-on work
-  (the next work item, a retry timer, a join re-evaluation) *in the same CAS
-  write*, then a flush publishes it (deduplicated by msg-id). A crash between
-  commit and publish leaves the message durably on the document, where the next
-  delivery, completion, or the **stall watchdog** (run by the reconcile-active
-  schedule — see `WithStallRedrive`) re-flushes it. State and the work that
-  drives it can never disagree.
-
-`Server.OutputHistory(ctx, id, node)` reads **every** output a node produced,
-oldest first, each with when it was written and whether it is the version the
-execution committed:
-
-```go
-history, err := srv.OutputHistory(ctx, id, "verify")
-if err != nil {
-    return err
-}
-for _, rec := range history {
-    fmt.Println(rec.At, rec.Current, string(rec.Payload))
-}
-```
-
-`Results` holds one output per node, so a node revisited in a loop overwrites
-its predecessor — and the earlier attempts are exactly what answers "why did
-this run three times?". They were never gone: each visit writes its own
-versioned entry and nothing removes it until the execution is swept. This reads
-them back. Candidates an engine wrote without committing (a stale attempt, a
-lost lease) appear too, which is what an investigation wants; `Current` marks
-the one the flow used.
-
-With `WithHistory(retention)`, every transition is also appended to a durable
-per-execution trace, queryable via `Server.History(ctx, id, limit)` — the
-step-by-step story of a run, kept for the configured retention.
-
-## Writing an Invoker
-
-An Invoker is the bridge between packtrail and your ecosystem:
-
-```go
-type Invoker interface {
-    Invoke(ctx context.Context, req Request) (Result, error)
-}
-```
-
-`Request` carries the resolved `Target`, the assembled context as `Payload`
-(decode it with `packtrail.DecodeContext` — see [`task`](#task)), the
-node-visit `Generation`, the `Attempt` number and a `Deadline`. Return
-`Result{Status: StatusOK, Payload: out}` to advance with a new node output,
-`StatusError` to fail the node, or `StatusRetry` (or a non-nil error) to retry
-per the node's policy.
-
-A `StatusOK` payload becomes this node's output, stored as its own data-plane
-entry and visible to every downstream node as `results.<node>`. Outputs never
-merge into a shared document, so any JSON shape is legal (the start `input`
-alone must be an object, for expression ergonomics). Return an empty payload
-to record no output for the node.
-
-### Idempotency under at-least-once delivery
-
-Packtrail is durable because it may redeliver: if an engine crashes after invoking a
-node but before persisting the advance, the work item is redelivered. Wrap
-invocations in the result cache (`WithResultCache()`) so a redelivery of the
-**same** `(execution, node, generation, attempt)` returns the stored result
-instead of re-running the side effect, while a genuine retry (a new attempt), a
-`Resume`, or a legal cycle revisit still re-invokes. Enable it whenever
-invocations have side effects that must not run twice (LLM calls, writes,
-e-mails). See [`invoker/cache.go`](invoker/cache.go).
-
-The cache covers both invocation paths: the engine-side dispatch (including an
-async node's `StatusPending`, so a redelivered work item re-parks instead of
-dispatching a second job) and the async worker's execution of your Invoker
-(under a separate keyspace in the same bucket, so a job redelivered after a
-worker crash serves the completed result instead of re-firing the side effect).
-
-## Clients and higher-level layers
-
-A `Server` built with only `WithNamespace` is a **client**: it loads no flows and
-runs no engine, but can read, signal, cancel — and **start** — executions of a
-running deployment. `Start`/`StartWithID` read the flow's start node from the
-flow registry (published by every engine at startup), write the execution and
-commit its first work item for whichever engine runs the namespace. A flow name
-in neither the local set nor the registry fails at the call; a name still
-published but known to no running engine starts, then fails with
-`unknown flow` once its first work item dead-letters.
-
-```go
-client, _ := packtrail.New(nc, packtrail.WithNamespace("acme"))
-
-// Provisioning is lazy, so any call on a Server creates the namespace's
-// resources. Check first when the namespace comes from a human:
-ok, err := packtrail.Exists(ctx, nc, "acme")
-if err != nil {
-    return err
-}
-if !ok {
-    return fmt.Errorf("no packtrail deployment for namespace %q", "acme")
-}
-id, _ := client.Start(ctx, "agent-pipeline", payload)
-```
-
-For layers that compile their own configuration into packtrail (a CLI, a
-different flow syntax, a platform), the package exports the rules it enforces
-so they can be checked early and never drift:
-
-| Helper | Purpose |
-|--------|---------|
-| `Exists(ctx, nc, namespace)` | Report whether a namespace was ever provisioned, without provisioning it |
-| `ValidateNamespace(ns)` | The `WithNamespace` rule (`[A-Za-z0-9_-]{1,64}`); validate the composed string |
-| `ValidateCron(expr)` | The cron grammar `ScheduleFlow` and the reconcile options accept |
-| `DecodeContext(doc)` / `InvocationContext` | Decode `Request.Payload` or `Server.Results` into the typed context |
-| `VarInput`, `VarResults`, `VarSignals`, `VarBranches`, `VarLastNode`, `VarReleasedBy`, `VarVisits` | The variable names a choice `when` expression can reference |
-| `FlowSchemaVersion` | The `version` a `FlowDef` must carry for this build |
-| `ErrInvalidArgument` | Wraps rejected caller input (ids, flow names, statuses, cron, namespace); map it to a 400 with `errors.Is` |
-| `Server.FailActivity(ctx, execID, node, gen, attempt, reason)` | Settle a parked async node as failed — for an out-of-process worker about to drop a job |
-
-## Server options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithNamespace(prefix)` | `"packtrail"` | Prefix for every NATS resource; isolates deployments on a shared cluster |
-| `WithFlowsDir(dir)` | — | Load all `*.yaml`/`*.yml` files in dir |
-| `WithFlow(yamlDoc)` | — | Register a single flow from an inline YAML document; may be called multiple times |
-| `WithFlowDef(f)` | — | Register a single flow from a `FlowDef` Go struct; may be combined with `WithFlow`/`WithFlowsDir` |
-| `WithInvoker(kind, inv)` | — | Register an Invoker under kind; overrides the built-in `"nats-task"` if reused |
-| `WithAsyncInvoker(kind, exec, opts…)` | — | Register an async Invoker under kind: nodes dispatch to a bounded durable work-queue and `exec` runs on a hosted worker pool (see `invoker/asyncqueue`) |
-| `WithResultCache()` | disabled | Cache invocation results by `(execution, node, generation, attempt)` for idempotent retries — engine dispatch and async worker execution alike; entries expire after the cache TTL |
-| `WithResultCacheTTL(d)` | `24h` | Result-cache entry TTL (implies `WithResultCache`); a negative value disables expiry |
-| `WithReconcileActive(cronExpr)` | — | Schedule the cheap active-set reconcile over in-flight executions (6-field cron); each pass also runs the stall watchdog |
-| `WithStallRedrive(d)` | 5× ack wait | Stall watchdog threshold: an active execution quiet past `d` — outside any retry backoff and not lease-held — gets its work item re-driven (heals lost work after a crash); negative disables |
-| `WithReconcileFull(cronExpr)` | — | Schedule the authoritative full reconcile; also runs fired-schedule reclaim, archival sweep and index GC. Keep it well below the active cadence |
-| `WithArchive(retention)` | disabled | Sweep completed executions into a cold archive bucket retained for `retention`; bounds the hot bucket while keeping retained archive records queryable/idempotent. Runs on the full-reconcile schedule |
-| `WithSignalRetention(d)` | `7d` | Signal stream retention and dedupe-window ceiling; raise if executions may wait through a longer outage. Omitted, an existing stream keeps its current retention (so a namespace-only client never retunes the engine's) |
-| `WithOwnerID(id)` | random | Stable per-instance lease owner id |
-| `WithLeaseTTL(d)` | `30s` | Ownership lease TTL; a contender may take over after observing the same foreign lease revision unchanged for roughly this long |
-| `WithMaxConcurrency(n)` | `64` | Max work items processed concurrently per instance |
-| `WithDefaultTimeout(d)` | `30s` | Invocation timeout for synchronous nodes that omit one (async kinds use their activity timeout) |
-| `WithMaxDeliver(n)` | `10` | Deliveries of a work item, fired schedule or signal before it is dead-lettered instead of retried forever; non-positive values are treated as the default (the cap cannot be disabled) |
-| `WithDrainTimeout(d)` | `30s` | Graceful-shutdown window for in-flight work to settle before stragglers are abandoned to redelivery; also the default drain budget of hosted async workers (`asyncqueue.WithDrainTimeout` overrides per kind) |
-| `WithMaxPayloadBytes(n)` | `512 KiB` | Cap on a single payload entry (start input, one node's output, one signal); an over-limit output fails its node with a clear reason (negative disables). A value above the server's `max_payload` fails `New`; the default is lowered to it on a smaller server |
-| `WithMaxDocumentBytes(n)` | `768 KiB` | Cap on the execution control document; protects very wide fanouts or large outboxes from opaque NATS size errors (negative disables) |
-| `WithHistory(retention)` | disabled | Durable per-execution transition trace in a `<ns>-history` stream, queryable via `Server.History` for `retention` |
-
-## Observability (packtrail-ui)
-
-`cmd/packtrail-ui` is a read-only web dashboard for any packtrail deployment. It connects
-to the same NATS cluster, reads execution state and the **flow registry** (every
-flow's graph is published to a KV bucket at startup), and tails the live event
-stream — so it needs no access to your flow source or engine process.
-
-> **No built-in authentication.** `packtrail-ui` serves every execution's
-> payloads, history, errors and dead-letters to anyone who can reach its HTTP
-> address — there is no login, token, or access control of any kind. Bind it to
-> a loopback or private address, or put an authenticating reverse proxy in
-> front, before exposing it beyond a network you already trust.
-
-> **Enable archival for the list view.** The unfiltered `GET /api/executions`
-> ("all executions") is an O(N) scan of the hot bucket with no pagination, so its
-> cost grows with the number of non-archived executions. Run the observed
-> deployment with archival (`WithArchive`, see the Durability model section) so
-> completed work leaves the hot bucket, or drive the dashboard with the
-> `?status=` / `?flow=` filters, which are answered from the visibility index
-> without a full scan.
+A worker can stream intermediate results with `j.Progress(v)`; clients follow
+them with `c.Progress(ctx, id)` (or `packtrail progress <exec>`). Progress is
+never stored: the log keeps the final result only.
+
+The CLI does the same from a shell:
 
 ```sh
-go run ./cmd/packtrail-ui --namespace packtrail --addr :8088   # NATS_URL honoured
+packtrail run -flows flows/ &
+packtrail start review -input '{"topic":"NATS"}' -wait
+packtrail history <exec>          # every event
+packtrail get <exec> -seq 12      # state right after event 12
+packtrail fork <exec> 12          # continue from there in a new execution
+packtrail fork <exec> 12 -writes '{"notes":"try again"}'  # … with edited state
+packtrail update <exec> -writes '{"notes":"from ops"}'     # write channels now, synchronously
+packtrail rerun <exec> draft      # run a node (and what follows) again
 ```
 
-It serves an embedded (no-npm) dashboard: a filterable execution list, a detail
-view (status, current node, payload, branches, signals, error), and an **SVG flow
-graph** with the live execution overlaid, updated in real time over SSE. The
-backing API is also usable directly:
+`packtrail-ui` serves a debugging dashboard (graph, timeline, state at any
+point, actions) for every namespace on the NATS account; `-namespaces a,b`
+restricts it to a list. It has no authentication and binds to loopback by
+default.
 
-| endpoint | returns |
-|----------|---------|
-| `GET /api/flows` | flow names |
-| `GET /api/flows/{name}` | flow graph (`FlowGraph`) |
-| `GET /api/executions[?status=&flow=]` | execution summaries (filtered = indexed lookup; unfiltered = full hot-bucket scan) |
-| `GET /api/executions/{id}` | execution control-state snapshot |
-| `GET /api/executions/{id}/results` | assembled `{input, results, signals, branches, last_node, visits}` context |
-| `GET /api/executions/{id}/history` | ordered transition trace (`?limit=`; empty unless `WithHistory`) |
-| `GET /api/deadletters` | dead-letter count + recent records |
-| `GET /api/events` | live transitions (Server-Sent Events) |
+## Concepts
 
-A malformed execution id, flow name or `status` is answered with `400`
-(`ErrInvalidArgument`); an unknown flow or execution with `404`.
+| Concept | |
+|---|---|
+| Flow | Immutable, versioned (`<name>.<hash>`); executions keep the version they started with |
+| Execution | An event log; status `running`, `waiting`, `completed`, `failed`, `cancelled` |
+| Engine | Processes commands per partition: load state → decide → append (optimistic concurrency) → ack |
+| Dispatcher | Turns events into effects: jobs, timer schedules, child starts, parent notifications, index updates |
+| Worker | Serves a kind; heartbeats long jobs; reports complete / fail / interrupt |
+| Channels | Typed state written by tasks as deltas, folded by reducers |
+| Context | What a worker and expressions see: `input`, `channels`, `results`, `last_node`, `visits`, `signals`, `branches`, `counters`, `errors`, `item`, `resume` |
 
-The same data is available programmatically via `Server`:
+Delivery is at-least-once: a task can run more than once after a crash. Make
+side effects idempotent, or enable the result cache. Work that is no longer
+wanted is stopped: when an execution ends, a task is cancelled (a join
+settled, a map aborted) or an attempt times out, the running job's context is
+cancelled with cause `worker.ErrCancelled` — the handler should return
+promptly, and its result is dropped. The engine
+itself is exactly-once per decision: duplicates and stale results are absorbed
+by the fold.
 
-```go
-// flows
-names, _ := srv.ListFlows(ctx)
-graph, _ := srv.FlowGraph(ctx, "agent-pipeline")
+## Operations
 
-// executions
-ids, _ := srv.ByStatus(ctx, packtrail.ExecRunning)
-ids, _ := srv.ByFlow(ctx, "agent-pipeline")
-ex, _ := srv.Get(ctx, execID)
+- **Replication.** Use `WithReplicas(3)` on a JetStream cluster: the events
+  stream is the source of truth. Asking for replicas on a standalone server
+  fails at `Init`.
+- **Partitions are permanent** for a namespace (they are part of every event
+  subject). Pick the count up front (`WithPartitions`, default 64); to change
+  it, run a new namespace alongside and drain the old one.
+- **Quarantine.** An execution whose events the dispatcher can never process
+  is quarantined (`packtrail quarantined`, dead letters) instead of stalling
+  its partition; it can still be cancelled and closed. Once the cause is fixed
+  (typically an upgrade), `packtrail unquarantine <exec>` replays what was
+  skipped. Transient outages never quarantine: dispatching waits.
+- **Alert on stalls.** The dispatcher retries infrastructure errors forever
+  (it never gives up on an execution for a transient reason). Export
+  `Engine.Metrics().DispatchStall` — the longest time a partition with
+  pending events has gone without progress — and alert when it exceeds a
+  minute or so.
+- **Validate offline.** `packtrail.ValidateOptions(opts...)` runs every
+  check `New` does (flows, schedules, namespace, tuning) without a NATS
+  connection, so CI or a `validate` command can reject a bad configuration.
+  `ValidateNamespace`, `ValidateName` and `ValidateCron` expose the
+  identifier and cron rules, so callers don't have to copy the patterns.
+- **Long histories.** Once an execution's live log holds 10 000 events
+  (`WithHistoryLimit`), it is continued as new under the same id: the log so
+  far is archived as a segment and replaced by one event carrying the state.
+  Nothing else changes, and `History`, `StateAt`, `Fork` and `Rerun` still see
+  every event. `max_steps` still bounds the total number of node entries.
 
-// live event stream
-events, _ := srv.WatchEvents(ctx)
-for ev := range events {
-    fmt.Println(ev.ExecID, ev.Status, ev.Node)
-}
-```
+## Examples
 
-`WatchEvents` delivers events published after the call. Load current state via
-`Get`/`ByStatus` first, then apply events live to avoid races.
+Runnable programs in [examples/](examples/README.md): human in the loop,
+parallel research with reducers, map-reduce, retries and timeouts, time
+travel and forks, an agent-style tool loop, subflows, cron and message
+triggers. Start NATS with `docker run --rm -p 4222:4222 nats:2.14.2 -js`,
+then `make examples` runs them all.
+
+## Documentation
+
+The [documentation](https://henomis.github.io/packtrail/docs.html) covers:
+
+- [flow definitions](https://henomis.github.io/packtrail/docs.html#flow-anatomy) — every node type, channels and reducers, expressions
+- [workers](https://henomis.github.io/packtrail/docs.html#workers) — the Go SDK: results, errors, interrupts, progress, cancellation
+- [the client](https://henomis.github.io/packtrail/docs.html#client) — start, signal, update, time travel, fork, rerun
+- [operations](https://henomis.github.io/packtrail/docs.html#operations) — options, replication, partitions, quarantine, metrics
+- [the protocol](https://henomis.github.io/packtrail/docs.html#protocol) and [the event log](https://henomis.github.io/packtrail/docs.html#events) — for clients and workers in other languages
+
+API reference on [pkg.go.dev](https://pkg.go.dev/github.com/henomis/packtrail).
 
 ## Development
 
 ```sh
-go build ./...
-go test -race ./...   # all packages run against a real embedded nats-server
-go vet ./...
-gofmt -l .
-
-make build-ui         # self-contained packtrail-ui binary in bin/ (assets embedded)
+make check   # go test -race + golangci-lint + go vet
 ```
+
+Tests run against a real embedded nats-server. The acceptance suite
+(`internal/acceptance`) injects faults: engine kills, NATS restarts, duplicate
+and reordered completions. `PT_CONFORMANCE_WORKER="<command>"` runs the
+conformance suite against a worker written in another language.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0.

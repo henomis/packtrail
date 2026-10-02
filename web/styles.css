@@ -500,3 +500,9 @@ p{margin:0}
   .reveal{opacity:1;transform:none}
   html{scroll-behavior:auto}
 }
+
+/* node types: await, map, subflow */
+.dot--await{background:var(--rose)}
+.dot--map{background:var(--green)}
+.dot--subflow{background:var(--sky-hi)}
+.doctable td:first-child.wrap{white-space:normal}

@@ -32,6 +32,6 @@ go.work.sum
 # .idea/
 # .vscode/
 .claude/
+docs/
 
 CLAUDE.md
-docs/

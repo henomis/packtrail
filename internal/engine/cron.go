@@ -1,0 +1,177 @@
+// Copyright 2026 Simone Vellei
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nuid"
+
+	"github.com/henomis/packtrail/flow"
+	"github.com/henomis/packtrail/internal/cmd"
+	"github.com/henomis/packtrail/internal/consume"
+	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/wire"
+)
+
+// ScheduleSpec is the body of a cron schedule message: what to start on each
+// firing.
+type ScheduleSpec struct {
+	Flow    string          `json:"flow"`
+	Version string          `json:"version,omitempty"`
+	Input   json.RawMessage `json:"input,omitempty"`
+}
+
+// RunCron turns fired cron messages into start commands. The execution id is
+// "<schedule>-<stream sequence of the firing>": unique per firing and stable
+// across redelivery, so a firing starts exactly one execution.
+func (e *Engine) RunCron(ctx context.Context) error {
+	return consume.Run(ctx, e.In.JS, consume.Config{
+		Stream: e.In.Names.StreamCmd,
+		Consumer: jetstream.ConsumerConfig{
+			Durable: e.In.Names.DurCron(), FilterSubject: e.In.Names.CronFilter(),
+			AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + 1,
+		},
+		Group:      "cron",
+		PullExpiry: e.In.PullExpiry,
+		Drain:      e.Drain,
+		Logger:     e.In.Logger,
+		Handler:    e.handleCron,
+	})
+}
+
+func (e *Engine) handleCron(ctx context.Context, msg jetstream.Msg) {
+	name := msg.Subject()[strings.LastIndexByte(msg.Subject(), '.')+1:]
+
+	md, err := msg.Metadata()
+	if err != nil {
+		_ = msg.NakWithDelay(nakDelay)
+
+		return
+	}
+
+	var spec ScheduleSpec
+	if err = json.Unmarshal(msg.Data(), &spec); err != nil {
+		e.deadLetter(ctx, msg, name, "invalid schedule spec: "+err.Error())
+
+		return
+	}
+
+	execID := name + "-" + strconv.FormatUint(md.Sequence.Stream, 10)
+	if !names.ValidToken(execID) {
+		execID = "cron-" + strconv.FormatUint(md.Sequence.Stream, 10)
+	}
+
+	c, err := cmd.New("cron."+execID, cmd.Start, execID, cmd.StartData{
+		Flow: spec.Flow, Version: spec.Version, Input: spec.Input,
+	})
+	if err == nil {
+		err = wire.PublishCmd(ctx, e.In, c, "")
+	}
+
+	if err != nil {
+		_ = msg.NakWithDelay(nakDelay)
+
+		return
+	}
+
+	_ = msg.Ack()
+}
+
+// RunTrigger starts def whenever a message arrives on one of its triggers.
+// With a stream the trigger is a durable consumer (at-least-once; the
+// execution id comes from Nats-Msg-Id or the stream sequence, so redelivery
+// starts nothing twice); otherwise a core queue subscription (at-most-once).
+func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.Trigger) error {
+	if tr.Stream == "" {
+		sub, err := e.In.NC.QueueSubscribe(tr.Subject, e.In.Names.Prefix+"-trigger-"+def.Name, func(m *nats.Msg) {
+			execID := m.Header.Get(wire.HeaderMsgID)
+			if !names.ValidToken(execID) {
+				execID = def.Name + "-" + nuid.Next()
+			}
+
+			if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
+				e.In.Logger.Warn("packtrail: trigger start failed", "flow", def.Name, "err", err)
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("engine: trigger %s: %w", tr.Subject, err)
+		}
+
+		<-ctx.Done()
+
+		return sub.Unsubscribe()
+	}
+
+	return consume.Run(ctx, e.In.JS, consume.Config{
+		Stream: tr.Stream,
+		Consumer: jetstream.ConsumerConfig{
+			Durable:       e.In.Names.Prefix + "-trigger-" + def.Name + "-" + strconv.Itoa(i),
+			FilterSubject: tr.Subject, AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + 1,
+			AckWait: e.In.AckWait,
+		},
+		Drain:      e.Drain,
+		PullExpiry: e.In.PullExpiry,
+		Logger:     e.In.Logger,
+		Handler: func(ctx context.Context, msg jetstream.Msg) {
+			md, err := msg.Metadata()
+			if err != nil {
+				_ = msg.NakWithDelay(nakDelay)
+
+				return
+			}
+
+			execID := msg.Headers().Get(wire.HeaderMsgID)
+			if !names.ValidToken(execID) {
+				execID = def.Name + "-" + tr.Stream + "-" + strconv.FormatUint(md.Sequence.Stream, 10)
+			}
+
+			if err = e.startFromTrigger(ctx, def, execID, msg.Data()); err != nil {
+				_ = msg.NakWithDelay(nakDelay)
+
+				return
+			}
+
+			_ = msg.Ack()
+		},
+	})
+}
+
+// triggerDataKey wraps a trigger message that is not a JSON object.
+const triggerDataKey = "data"
+
+func (e *Engine) startFromTrigger(ctx context.Context, def *flow.Flow, execID string, data []byte) error {
+	input := json.RawMessage(data)
+	if len(data) == 0 || !json.Valid(data) {
+		b, _ := json.Marshal(map[string]string{triggerDataKey: string(data)}) //nolint:errchkjson // strings always encode
+		input = b
+	} else if data[0] != '{' {
+		b, _ := json.Marshal(map[string]json.RawMessage{triggerDataKey: data}) //nolint:errchkjson // data is valid JSON
+		input = b
+	}
+
+	c, err := cmd.New("trigger."+execID, cmd.Start, execID, cmd.StartData{Flow: def.Name, Input: input})
+	if err != nil {
+		return err
+	}
+
+	return wire.PublishCmd(ctx, e.In, c, "")
+}

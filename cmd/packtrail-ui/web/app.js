@@ -1,311 +1,292 @@
+// packtrail-ui: vanilla JS, no dependencies. Every value rendered as text
+// (textContent / createElement), never as HTML.
 "use strict";
 
-const $ = (sel) => document.querySelector(sel);
-const state = { selected: null, flowCache: {} };
+const $ = (s) => document.querySelector(s);
+let current = null;   // execution id
+let selectedSeq = 0;  // timeline selection (0 = latest)
+let watcher = null;
+let ns = null;        // selected namespace
 
-async function getJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${url}: ${r.status}`);
-  return r.json();
+// nsPath prefixes an API path with the selected namespace.
+const nsPath = (p) => `/api/ns/${encodeURIComponent(ns)}${p}`;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).trim()}`);
+  return r.headers.get("Content-Type")?.includes("json") ? r.json() : null;
 }
 
-// ---- execution list ---------------------------------------------------------
-
-async function loadFlows() {
-  const flows = (await getJSON("/api/flows")) || [];
-  const sel = $("#flow-filter");
-  for (const f of flows) {
-    const opt = document.createElement("option");
-    opt.value = opt.textContent = f;
-    sel.appendChild(opt);
-  }
+function post(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 }
 
-async function refreshList() {
-  const flow = $("#flow-filter").value;
-  const status = $("#status-filter").value;
-  let url = "/api/executions";
-  if (status) url += "?status=" + encodeURIComponent(status);
-  else if (flow) url += "?flow=" + encodeURIComponent(flow);
-  let execs = (await getJSON(url)) || [];
-  if (flow && status) execs = execs.filter((e) => e.flow === flow);
-  execs.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
-
-  const list = $("#exec-list");
-  list.innerHTML = "";
-  for (const e of execs) {
-    const li = document.createElement("li");
-    if (e.id === state.selected) li.classList.add("active");
-    li.innerHTML = `<div class="row1"><span class="flow">${esc(e.flow)}</span>
-      <span class="badge ${esc(e.status)}">${esc(e.status)}</span></div>
-      <div class="id">${esc(e.id)}</div>`;
-    li.onclick = () => selectExec(e.id);
-    list.appendChild(li);
-  }
+function el(tag, attrs = {}, text) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
 }
 
-// ---- execution detail -------------------------------------------------------
-
-async function selectExec(id) {
-  state.selected = id;
-  refreshList();
-  await renderDetail(id);
+// notify shows msg in the banner at the bottom of the page, in place of a
+// blocking alert(). Errors stay until dismissed or cleared by their source
+// (e.g. the list poll recovering); info notices fade after a few seconds.
+let noticeSource = null, noticeTimer = null;
+function notify(msg, { kind = "error", source = null } = {}) {
+  const b = $("#banner");
+  clearTimeout(noticeTimer);
+  b.className = kind; b.hidden = false; noticeSource = source;
+  $("#banner-msg").textContent = msg;
+  if (kind === "info") noticeTimer = setTimeout(() => (b.hidden = true), 5000);
 }
+function clearNotice(source) { if (noticeSource === source) $("#banner").hidden = true; }
+const fail = (e) => notify(e.message);
 
-async function renderDetail(id) {
-  let ex;
+function badge(status) { return el("span", { class: "badge st-" + String(status) }, String(status)); }
+
+async function loadList() {
+  if (!ns) return;
+  const q = new URLSearchParams();
+  if ($("#f-status").value) q.set("status", $("#f-status").value);
+  if ($("#f-flow").value) q.set("flow", $("#f-flow").value);
+  if ($("#f-attr").value) q.set("attr", $("#f-attr").value);
+  const tbody = $("#list tbody");
+  tbody.replaceChildren();
   try {
-    ex = await getJSON("/api/executions/" + encodeURIComponent(id));
-  } catch {
-    $("#detail").innerHTML = `<p class="empty">Execution not found.</p>`;
-    return;
-  }
-  // The snapshot is control state only; payloads live in the data plane
-  // (/results) and the transition trace in /history (empty unless the
-  // deployment enables WithHistory).
-  const eid = encodeURIComponent(id);
-  const [results, history] = await Promise.all([
-    getJSON(`/api/executions/${eid}/results`).catch(() => null),
-    getJSON(`/api/executions/${eid}/history?limit=200`).catch(() => []),
+    for (const s of (await api(nsPath("/executions?" + q))) || []) {
+      const tr = el("tr");
+      tr.append(el("td", {}, s.exec_id), el("td", {}, s.flow));
+      const td = el("td"); td.append(badge(s.status)); tr.append(td);
+      tr.append(el("td", {}, new Date(s.updated).toLocaleString()));
+      tr.onclick = () => open(s.exec_id);
+      if (s.exec_id === current) tr.classList.add("sel");
+      tbody.append(tr);
+    }
+    clearNotice("list");
+  } catch (e) { notify(`Cannot load executions: ${e.message}`, { source: "list" }); }
+}
+
+async function open(id) {
+  current = id; selectedSeq = 0;
+  $("#empty").hidden = true; $("#dlq").hidden = true; $("#detail").hidden = false;
+  await render().catch(fail);
+  if (watcher) watcher.close();
+  watcher = new EventSource(nsPath(`/executions/${encodeURIComponent(id)}/watch?from=0`));
+  let first = true;
+  watcher.onmessage = () => { if (!first) render().catch(fail); first = false; };
+  loadList();
+}
+
+async function render() {
+  const id = current;
+  const seq = selectedSeq ? `?seq=${selectedSeq}` : "";
+  const [st, hist] = await Promise.all([
+    api(nsPath(`/executions/${encodeURIComponent(id)}${seq}`)),
+    api(nsPath(`/executions/${encodeURIComponent(id)}/history`)),
   ]);
-  const d = $("#detail");
-  d.innerHTML = `
-    <h2>${esc(ex.flow)} <span class="badge ${esc(ex.status)}">${esc(ex.status)}</span></h2>
-    <div class="meta">${esc(ex.id)} · node: ${esc(ex.current_node || "—")}${generationSuffix(ex.node_generation)} · attempt ${ex.attempt || 0}
-      ${ex.wait_signal ? `· waiting on signal <b>${esc(ex.wait_signal)}</b>` : ""}
-      · updated ${new Date(ex.updated_at).toLocaleString()}</div>
-    ${ex.error ? `<div class="err">⚠ ${esc(ex.error)}</div>` : ""}
-    ${(ex.signals || []).length ? `<div class="chips">received signals: ${ex.signals.map((s) => `<span class="chip">${esc(s)}</span>`).join(" ")}</div>` : ""}
-    <section><h3>flow</h3><div id="graph-wrap"></div></section>
-    <section><h3>context <span class="hint">input · results · signals · branches · last_node</span></h3>
-      ${results ? `<pre>${esc(pretty(results))}</pre>` : `<p class="empty">No context available (payloads archived or expired).</p>`}
-    </section>
-    ${outputsSection(ex.outputs, ex.output_versions)}
-    ${branchSection(ex.branches)}
-    ${historySection(history)}
-  `;
-  const g = await loadFlow(ex.flow);
-  if (g) $("#graph-wrap").appendChild(renderGraph(g, ex));
+  $("#d-title").textContent = id;
+  const meta = $("#d-meta"); meta.replaceChildren(badge(st.status),
+    document.createTextNode(` ${st.flow}@${st.flow_hash} · ${st.events} events` +
+      (st.forked_from ? ` · forked from ${st.forked_from}@${st.fork_seq}` : "") +
+      (st.archived ? " · archived" : "") + (st.error ? ` · ${st.reason}: ${st.error}` : "")));
+  $("#d-at").textContent = selectedSeq ? `(state at seq ${selectedSeq})` : "(latest)";
+  $("#state").textContent = JSON.stringify(st, null, 2);
+  renderTimeline(hist);
+  const def = await api(nsPath(`/flows/${encodeURIComponent(st.flow)}?version=${encodeURIComponent(st.flow_hash)}`));
+  renderGraph(def.definition, def.start, st);
 }
 
-function outputsSection(outputs, versions) {
-  if (!outputs || !outputs.length) return "";
-  const rows = outputs
-    .map((node) => `<tr><td class="id">${esc(node)}</td><td class="id">${esc((versions || {})[node] || "legacy")}</td></tr>`)
-    .join("");
-  return `<section><h3>outputs <span class="hint">committed data-plane versions</span></h3>
-    <table class="data-table"><thead><tr><th>node</th><th>version</th></tr></thead>
-    <tbody>${rows}</tbody></table></section>`;
+function summary(ev) {
+  const d = ev.data || {};
+  return [d.node, d.key && d.key !== d.node ? d.key : "", d.name, d.to ? "→ " + d.to : "",
+    d.attempt ? "#" + d.attempt : "", d.error || d.reason || ""].filter(Boolean).join(" ");
 }
 
-// branchSection renders the control state of fan-out branches (results live
-// under context.results keyed by branch node id).
-function branchSection(branches) {
-  if (!branches || !Object.keys(branches).length) return "";
-  const rows = Object.keys(branches)
-    .sort()
-    .map((node) => {
-      const b = branches[node];
-      return `<tr><td class="id">${esc(node)}</td>
-        <td><span class="badge ${esc(b.status)}">${esc(b.status)}</span></td>
-        <td>${esc(b.generation || "—")}</td>
-        <td>${esc(b.attempt ?? "—")}</td>
-        <td>${esc(b.error || "")}</td></tr>`;
-    })
-    .join("");
-  return `<section><h3>branches</h3>
-    <table class="data-table"><thead><tr><th>branch</th><th>status</th><th>generation</th><th>attempt</th><th>error</th></tr></thead>
-    <tbody>${rows}</tbody></table></section>`;
+function renderTimeline(hist) {
+  const ol = $("#timeline"); ol.replaceChildren();
+  for (const row of hist) {
+    const li = el("li", {}, `${row.seq}  ${row.event.type}  ${summary(row.event)}`);
+    if (row.decision_end) li.classList.add("decision-end");
+    if (row.seq === selectedSeq) li.classList.add("sel");
+    li.title = JSON.stringify(row.event.data);
+    li.onclick = () => { selectedSeq = selectedSeq === row.seq ? 0 : row.seq; render().catch(fail); };
+    ol.append(li);
+  }
 }
 
-// historySection renders the durable per-execution trace; omitted entirely
-// when empty (WithHistory disabled, or records past retention).
-function historySection(history) {
-  if (!history || !history.length) return "";
-  const rows = history
-    .map(
-      (ev) => `<tr><td>${ev.time ? new Date(ev.time).toLocaleString() : "—"}</td>
-        <td><span class="badge ${esc(ev.status)}">${esc(ev.status)}</span></td>
-        <td class="id">${esc(ev.node || "—")}</td>
-        <td>${esc(ev.error || "")}</td></tr>`,
-    )
-    .join("");
-  return `<section><h3>history <span class="hint">${history.length} transitions</span></h3>
-    <table class="data-table"><thead><tr><th>time</th><th>status</th><th>node</th><th>error</th></tr></thead>
-    <tbody>${rows}</tbody></table></section>`;
+// Graph viewport: the SVG fills #graph-wrap and the viewBox decides what is
+// shown. Until the user zooms or pans, the view follows the pane (fit); a
+// resize of the pane re-fits it.
+const view = { x: 0, y: 0, scale: 1, w: 0, h: 0, key: null, user: false };
+const MAX_FIT_SCALE = 1.25;
+
+function applyView() {
+  const wrap = $("#graph-wrap"), cw = wrap.clientWidth, ch = wrap.clientHeight;
+  if (!cw || !ch || !view.w) return;
+  if (!view.user) {
+    view.scale = Math.min(cw / view.w, ch / view.h, MAX_FIT_SCALE);
+    view.x = (view.w - cw / view.scale) / 2; view.y = (view.h - ch / view.scale) / 2;
+  }
+  $("#graph").setAttribute("viewBox", `${view.x} ${view.y} ${cw / view.scale} ${ch / view.scale}`);
 }
 
-async function loadFlow(name) {
-  if (state.flowCache[name]) return state.flowCache[name];
+function fitGraph() { view.user = false; applyView(); }
+
+function initGraphView() {
+  const wrap = $("#graph-wrap"), svg = $("#graph");
+  new ResizeObserver(applyView).observe(wrap);
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const r = svg.getBoundingClientRect();
+    const px = view.x + (e.clientX - r.left) / view.scale, py = view.y + (e.clientY - r.top) / view.scale;
+    view.scale = Math.min(4, Math.max(0.1, view.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    view.x = px - (e.clientX - r.left) / view.scale; view.y = py - (e.clientY - r.top) / view.scale;
+    view.user = true; applyView();
+  }, { passive: false });
+  let drag = null;
+  svg.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, y: e.clientY }; svg.setPointerCapture(e.pointerId); });
+  svg.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    view.x -= (e.clientX - drag.x) / view.scale; view.y -= (e.clientY - drag.y) / view.scale;
+    drag = { x: e.clientX, y: e.clientY }; view.user = true; applyView();
+  });
+  svg.addEventListener("pointerup", () => { drag = null; });
+  svg.addEventListener("dblclick", fitGraph);
+}
+
+// Layered layout: BFS depth from the start node, each layer centred.
+// A fanout's next is its join, which runs after the branches: the layout
+// routes fanout → branches → join (dashed), so the join sits below them
+// instead of beside them. Edges back to the same or an earlier layer (loops)
+// run around the right side of the boxes.
+function renderGraph(def, start, st) {
+  const svg = $("#graph"); svg.replaceChildren();
+  const nodes = new Map(def.nodes.map((n) => [n.id, n]));
+  const joinOf = new Map();
+  for (const n of def.nodes) if (n.branches?.length && n.next) for (const b of n.branches) joinOf.set(b, n.next);
+  const succ = (n) => [n.branches?.length ? null : n.next, ...(n.rules || []).map((r) => r.to), n.on_timeout, n.on_failure,
+    ...(n.dynamic || []), ...(n.branches || []), joinOf.get(n.id)].filter(Boolean);
+  const depth = new Map([[start, 0]]); const queue = [start];
+  while (queue.length) {
+    const id = queue.shift();
+    for (const s of succ(nodes.get(id))) if (!depth.has(s)) { depth.set(s, depth.get(id) + 1); queue.push(s); }
+  }
+  const layers = [];
+  for (const [id, d] of depth) (layers[d] ||= []).push(id);
+  const label = (id) => `${id} · ${nodes.get(id).type}` + (st.visits?.[id] > 1 ? ` ×${st.visits[id]}` : "");
+  // Boxes grow with the longest label (~7px per char at 12px) so text never spills.
+  const W = Math.max(130, ...[...depth.keys()].map((id) => label(id).length * 7 + 16));
+  const H = 34, GX = 40, GY = 40, PAD = 20, LOOP = 50, pos = new Map();
+  const widest = Math.max(...layers.map((l) => l.length));
+  layers.forEach((ids, d) => ids.forEach((id, i) => pos.set(id, { x: PAD + ((widest - ids.length) / 2 + i) * (W + GX), y: PAD + d * (H + GY) })));
+  const ns = "http://www.w3.org/2000/svg";
+  const mk = (t, a) => { const e = document.createElementNS(ns, t); for (const [k, v] of Object.entries(a)) e.setAttribute(k, v); return e; };
+  const marker = mk("marker", { id: "arrow", viewBox: "0 0 8 8", refX: 8, refY: 4, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" });
+  marker.append(mk("path", { d: "M0,0 L8,4 L0,8 z", class: "arrow" }));
+  const defs = mk("defs", {}); defs.append(marker); svg.append(defs);
+  let loops = 0;
+  for (const [id, n] of nodes) for (const s of new Set(succ(n))) {
+    const a = pos.get(id), b = pos.get(s); if (!a || !b) continue;
+    let d;
+    if (b.y > a.y) {
+      d = `M${a.x + W / 2},${a.y + H} C${a.x + W / 2},${a.y + H + GY / 2} ${b.x + W / 2},${b.y - GY / 2} ${b.x + W / 2},${b.y}`;
+    } else if (id === s) {
+      const x = a.x + W + LOOP;
+      d = `M${a.x + W},${a.y + 8} C${x},${a.y - 10} ${x},${a.y + H + 10} ${a.x + W},${a.y + H - 8}`;
+    } else if (b.y === a.y) {
+      // Same layer: arc over the top.
+      d = `M${a.x + W / 2},${a.y} C${a.x + W / 2},${a.y - GY * 0.7} ${b.x + W / 2},${b.y - GY * 0.7} ${b.x + W / 2},${b.y}`;
+    } else {
+      // Loop back up: leave a's top, enter b's right side so it never crosses
+      // the forward edges into b's top; nested loops spread out.
+      const sx = a.x + W * 0.75, x = b.x + W + LOOP / 2 + 12 * loops++;
+      d = `M${sx},${a.y} C${sx},${a.y - GY * 0.8} ${x},${b.y + H / 2} ${b.x + W},${b.y + H / 2}`;
+    }
+    svg.append(mk("path", { class: joinOf.get(id) === s ? "edge join" : "edge", d, "marker-end": "url(#arrow)" }));
+  }
+  const active = new Set(Object.values(st.tasks || {}).map((t) => t.node).concat(Object.keys(st.awaits || {}), Object.keys(st.children || {}), Object.keys(st.maps || {})));
+  for (const [id, p] of pos) {
+    const g = mk("g", { transform: `translate(${p.x},${p.y})` });
+    if (active.has(id)) g.classList.add("n-active");
+    else if (st.failed_node === id) g.classList.add("n-failed");
+    else if (st.results && id in st.results) g.classList.add("n-done");
+    const r = mk("rect", { width: W, height: H, rx: 5 });
+    const t = mk("text", { x: 8, y: 21 }); t.textContent = label(id);
+    const tip = mk("title", {}); tip.textContent = label(id);
+    g.append(r, t, tip); svg.append(g);
+  }
+  const key = `${current}|${st.flow_hash}`;
+  view.w = widest * (W + GX) - GX + 2 * PAD + LOOP + 12 * loops;
+  view.h = layers.length * (H + GY) - GY + 2 * PAD;
+  if (view.key !== key) { view.key = key; view.user = false; }
+  applyView();
+}
+
+async function action(kind) {
+  const base = nsPath(`/executions/${encodeURIComponent(current)}`);
   try {
-    const g = await getJSON("/api/flows/" + encodeURIComponent(name));
-    state.flowCache[name] = g;
-    return g;
-  } catch {
-    return null;
+    if (kind === "signal") {
+      const name = prompt("Signal name"); if (!name) return;
+      const payload = prompt("Payload (JSON, optional)") || "null";
+      await post(base + "/signal", { name, payload: JSON.parse(payload) });
+    } else if (kind === "resume") {
+      const node = prompt("Interrupted node"); if (!node) return;
+      await post(base + "/resume", { node, value: JSON.parse(prompt("Value (JSON)") || "null") });
+    } else if (kind === "cancel") {
+      if (!confirm("Cancel this execution?")) return;
+      await post(base + "/cancel", { reason: "cancelled from packtrail-ui" });
+    } else if (kind === "fork") {
+      if (!selectedSeq) { notify("Select an event in the timeline first.", { kind: "info" }); return; }
+      const r = await post(base + "/fork", { seq: selectedSeq }); return open(r.exec_id);
+    } else if (kind === "rerun") {
+      const node = prompt("Node to rerun"); if (!node) return;
+      const r = await post(base + "/rerun", { node }); return open(r.exec_id);
+    }
+    await render();
+  } catch (e) { fail(e); }
+}
+
+async function showDLQ() {
+  $("#detail").hidden = true; $("#empty").hidden = true; $("#dlq").hidden = false;
+  const tbody = $("#dlq tbody"); tbody.replaceChildren();
+  for (const d of (await api(nsPath("/deadletters"))) || []) {
+    const tr = el("tr");
+    tr.append(el("td", {}, d.seq), el("td", {}, d.kind), el("td", {}, d.key), el("td", {}, d.reason));
+    const b = el("button", {}, "Redrive");
+    b.onclick = async () => { try { await post(nsPath(`/deadletters/${d.seq}/redrive`)); showDLQ(); } catch (e) { fail(e); } };
+    const td = el("td"); td.append(b); tr.append(td); tbody.append(tr);
   }
 }
 
-// ---- flow graph (layered SVG) ----------------------------------------------
-
-// derivedEdges expands routing implied by node type (choice rules, fanout
-// branches, signal on_timeout) on top of explicit edges.
-function derivedEdges(g) {
-  const edges = (g.edges || []).map((e) => [e.from, e.to]);
-  for (const n of g.nodes) {
-    if (n.type === "choice") for (const r of n.rules || []) edges.push([n.id, r.to]);
-    if (n.type === "fanout") for (const b of n.branches || []) edges.push([n.id, b]);
-    if (n.type === "signal" && n.on_timeout) edges.push([n.id, n.on_timeout]);
-  }
-  return edges;
+// selectNamespace switches every view to ns and records it in the URL hash,
+// so a shared link opens the same namespace.
+function selectNamespace(name) {
+  ns = name; current = null; selectedSeq = 0;
+  if (watcher) { watcher.close(); watcher = null; }
+  $("#f-ns").value = name;
+  history.replaceState(null, "", "#" + encodeURIComponent(name));
+  $("#detail").hidden = true; $("#dlq").hidden = true; $("#empty").hidden = false;
+  loadList();
 }
 
-function layout(g) {
-  const edges = derivedEdges(g);
-  const indeg = {}, children = {};
-  for (const n of g.nodes) { indeg[n.id] = 0; children[n.id] = []; }
-  for (const [from, to] of edges) {
-    if (!(to in indeg)) continue;
-    indeg[to]++; if (children[from]) children[from].push(to);
-  }
-  // BFS depth from roots; cap iterations to tolerate cycles.
-  const depth = {};
-  let frontier = g.nodes.filter((n) => indeg[n.id] === 0).map((n) => n.id);
-  if (frontier.length === 0 && g.nodes.length) frontier = [g.nodes[0].id];
-  frontier.forEach((id) => (depth[id] = 0));
-  let guard = 0;
-  while (frontier.length && guard++ < 1000) {
-    const next = [];
-    for (const id of frontier)
-      for (const c of children[id] || [])
-        if (depth[c] === undefined || depth[c] < depth[id] + 1) { depth[c] = depth[id] + 1; next.push(c); }
-    frontier = next;
-  }
-  g.nodes.forEach((n) => { if (depth[n.id] === undefined) depth[n.id] = 0; });
-
-  const byDepth = {};
-  for (const n of g.nodes) (byDepth[depth[n.id]] ||= []).push(n.id);
-  const pos = {};
-  const COLW = 200, ROWH = 80, NW = 150, NH = 46;
-  for (const d of Object.keys(byDepth)) {
-    byDepth[d].forEach((id, i) => { pos[id] = { x: 30 + d * COLW, y: 24 + i * ROWH }; });
-  }
-  const maxRows = Math.max(...Object.values(byDepth).map((a) => a.length), 1);
-  const maxDepth = Math.max(...Object.keys(byDepth).map(Number), 0);
-  return { edges, pos, NW, NH, COLW, width: 60 + (maxDepth + 1) * COLW, height: 48 + maxRows * ROWH };
+async function loadNamespaces() {
+  const sel = $("#f-ns");
+  let res;
+  try { res = await api("/api/namespaces"); } catch (e) { notify(`Cannot list namespaces: ${e.message}`); return; }
+  const list = res.namespaces || [];
+  sel.replaceChildren(...list.map((n) => el("option", { value: n }, n)));
+  if (!list.length) { $("#empty").textContent = "No packtrail namespace found on this NATS account."; return; }
+  const want = decodeURIComponent(location.hash.slice(1));
+  selectNamespace([want, ns, res.default].find((n) => n && list.includes(n)) || list[0]);
 }
 
-function renderGraph(g, ex) {
-  const L = layout(g);
-  const svg = svgEl("svg", { class: "graph", viewBox: `0 0 ${L.width} ${L.height}`, height: Math.min(L.height, 520) });
-  svg.appendChild(arrowDefs());
-
-  for (const [from, to] of L.edges) {
-    const a = L.pos[from], b = L.pos[to];
-    if (!a || !b) continue;
-    const x1 = a.x + L.NW, y1 = a.y + L.NH / 2, x2 = b.x, y2 = b.y + L.NH / 2;
-    const mx = (x1 + x2) / 2;
-    svg.appendChild(svgEl("path", {
-      class: "gedge", "marker-end": "url(#arrow)",
-      d: `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`,
-    }));
-  }
-
-  const settled = new Set(ex.outputs || []); // nodes with a stored output
-  for (const n of g.nodes) {
-    const p = L.pos[n.id];
-    const current = n.id === ex.current_node;
-    const cls = "gnode" + (settled.has(n.id) ? " done" : "") + (current ? " current " + ex.status : "");
-    const grp = svgEl("g", { class: cls, transform: `translate(${p.x},${p.y})` });
-    grp.appendChild(svgEl("rect", { width: L.NW, height: L.NH, rx: 8 }));
-    grp.appendChild(text(10, 19, n.id, "nid"));
-    grp.appendChild(text(10, 35, nodeLabel(n), "ntype"));
-    svg.appendChild(grp);
-  }
-  return svg;
-}
-
-function nodeLabel(n) {
-  if (n.type === "task") return "task" + (n.target ? " → " + n.target : "");
-  if (n.type === "fanin") return "fanin (" + (n.join_policy || "all") + ")";
-  if (n.type === "signal") return "signal: " + (n.signal_name || "");
-  return n.type;
-}
-
-// ---- dead-letter tile -------------------------------------------------------
-
-async function refreshDLQ() {
-  let dlq;
-  try {
-    dlq = await getJSON("/api/deadletters");
-  } catch {
-    return;
-  }
-  const btn = $("#dlq");
-  const count = dlq.count || 0;
-  btn.hidden = count === 0;
-  btn.textContent = `⚠ ${count} dead-lettered`;
-  state.dlq = dlq.recent || [];
-}
-
-function showDLQ() {
-  const rows = (state.dlq || [])
-    .slice()
-    .reverse()
-    .map(
-      (d) => `<tr><td><span class="badge failed">${esc(d.kind)}</span></td>
-        <td class="id">${esc(d.key)}</td><td>${esc(d.reason)}</td>
-        <td>${d.deliveries || 0}</td>
-        <td>${d.time ? new Date(d.time).toLocaleString() : "—"}</td></tr>`,
-    )
-    .join("");
-  $("#detail").innerHTML = `
-    <h2>dead-lettered work</h2>
-    <div class="meta">poisoned items dropped by the durable consumers (terminal error or exhausted retries)</div>
-    ${rows
-      ? `<table class="data-table"><thead><tr><th>kind</th><th>key</th><th>reason</th><th>deliveries</th><th>time</th></tr></thead><tbody>${rows}</tbody></table>`
-      : `<p class="empty">No dead-letters retained.</p>`}`;
-}
-
-// ---- live updates -----------------------------------------------------------
-
-function connectEvents() {
-  const es = new EventSource("/api/events");
-  es.onopen = () => $("#conn").classList.add("live");
-  es.onerror = () => $("#conn").classList.remove("live");
-  let pending = false;
-  es.onmessage = (m) => {
-    let ev; try { ev = JSON.parse(m.data); } catch { return; }
-    if (!pending) { pending = true; setTimeout(() => { pending = false; refreshList(); refreshDLQ(); }, 300); }
-    if (ev.exec_id === state.selected) renderDetail(state.selected);
-  };
-}
-
-// ---- helpers ----------------------------------------------------------------
-
-function svgEl(tag, attrs) {
-  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
-  for (const k in attrs) el.setAttribute(k, attrs[k]);
-  return el;
-}
-function text(x, y, s, cls) {
-  const t = svgEl("text", { x, y, class: cls });
-  t.textContent = s.length > 20 ? s.slice(0, 19) + "…" : s;
-  return t;
-}
-function arrowDefs() {
-  const defs = svgEl("defs", {});
-  const m = svgEl("marker", { id: "arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" });
-  const p = svgEl("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#2a2f3a" });
-  m.appendChild(p); defs.appendChild(m); return defs;
-}
-function pretty(v) { try { return JSON.stringify(v, null, 2); } catch { return String(v); } }
-function esc(s) { return String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
-function generationSuffix(g) { return g ? ` · gen ${esc(g)}` : ""; }
-
-// ---- boot -------------------------------------------------------------------
-
-$("#flow-filter").onchange = refreshList;
-$("#status-filter").onchange = refreshList;
-$("#dlq").onclick = showDLQ;
-loadFlows().then(refreshList).then(refreshDLQ).then(connectEvents);
+document.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => action(b.dataset.act)));
+$("#refresh").onclick = loadList;
+$("#graph-fit").onclick = fitGraph;
+$("#banner-close").onclick = () => ($("#banner").hidden = true);
+initGraphView();
+$("#show-dlq").onclick = showDLQ;
+["#f-status", "#f-flow", "#f-attr"].forEach((s) => $(s).addEventListener("change", loadList));
+$("#f-ns").addEventListener("change", () => selectNamespace($("#f-ns").value));
+loadNamespaces();
+setInterval(() => { if (ns) loadList(); }, 5000);

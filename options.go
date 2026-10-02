@@ -15,298 +15,420 @@
 package packtrail
 
 import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"time"
 
-	"github.com/henomis/packtrail/invoker"
-	"github.com/henomis/packtrail/invoker/asyncqueue"
+	"github.com/henomis/packtrail/flow"
+	"github.com/henomis/packtrail/internal/infra"
 )
 
-// Option configures a Server. Pass options to New.
-type Option func(*config)
+// Option configures an Engine.
+type Option func(*config) error
 
-// asyncInvoker records an async invoker kind registered via WithAsyncInvoker:
-// New ensures its work-queue stream and registers the Dispatcher; Run hosts a
-// Worker that executes exec and settles results via the Server.
-type asyncInvoker struct {
-	kind string
-	exec invoker.Invoker
-	opts []asyncqueue.Option
-}
-
-type syncInvoker struct {
-	kind string
-	exec invoker.Invoker
+type scheduleDef struct {
+	name, flow, cron, tz string
+	input                json.RawMessage
 }
 
 type config struct {
-	prefix   string
-	flowsDir string
-	flowDocs [][]byte
-	flowDefs []FlowDef
-
-	reconcileActiveCron string
-	reconcileFullCron   string
-	archiveRetention    time.Duration
-	historyRetention    time.Duration
-	signalRetention     time.Duration // 0 = default (7d); < 0 disables the age limit
-	stallRedrive        time.Duration // 0 = engine default (5×AckWait); < 0 disables the watchdog
-
-	invokers       []syncInvoker
-	asyncInvokers  []asyncInvoker
-	resultCache    bool
-	resultCacheTTL time.Duration
-
-	ownerID         string
-	leaseTTL        time.Duration
-	maxConcurrency  int
-	defaultTimeout  time.Duration
-	maxDeliver      int
-	maxPayloadBytes int
-	maxDocBytes     int
-	drainTimeout    time.Duration
+	namespace     string
+	flows         []*flow.Flow
+	flowsDirs     []string
+	partitions    int
+	owned         []int
+	snapshotEvery int
+	historyLimit  int
+	drain         time.Duration
+	logger        *slog.Logger
+	cacheSize     int
+	clock         func() time.Time
+	blobThreshold int
+	schedules     []scheduleDef
+	noDispatch    bool
+	noCommands    bool
+	timeouts      timeouts
+	replicas      int
 }
 
-// WithNamespace sets the resource prefix for every NATS bucket, stream, subject
-// and durable consumer (default "packtrail"). Give each independent deployment a
-// distinct namespace to let them share a NATS cluster without colliding.
-func WithNamespace(prefix string) Option { return func(c *config) { c.prefix = prefix } }
-
-// WithFlowsDir loads every *.yaml / *.yml flow definition in dir.
-func WithFlowsDir(dir string) Option { return func(c *config) { c.flowsDir = dir } }
-
-// WithFlow registers a single flow from its YAML document. It may be passed
-// multiple times.
-func WithFlow(yamlDoc []byte) Option {
-	return func(c *config) { c.flowDocs = append(c.flowDocs, yamlDoc) }
+// timeouts are the engine-side timeouts; zero values keep the defaults.
+type timeouts struct {
+	ackWait, pullExpiry, read, blob time.Duration
 }
 
-// WithFlowDef registers a single flow from a Go struct. It may be passed
-// multiple times and combined with WithFlow / WithFlowsDir.
-func WithFlowDef(f FlowDef) Option {
-	return func(c *config) { c.flowDefs = append(c.flowDefs, f) }
-}
+func (t timeouts) apply(in *infra.Infra) {
+	if t.ackWait > 0 {
+		in.AckWait = t.ackWait
+	}
 
-// WithInvoker registers an Invoker under kind, the value a flow node selects via
-// its `invoker:` field. The built-in "nats-task" kind is always registered and
-// may be overridden by passing WithInvoker("nats-task", ...). It may be passed
-// multiple times for distinct kinds; duplicate kinds are rejected by New.
-func WithInvoker(kind string, inv invoker.Invoker) Option {
-	return func(c *config) {
-		c.invokers = append(c.invokers, syncInvoker{kind: kind, exec: inv})
+	if t.pullExpiry > 0 {
+		in.PullExpiry = t.pullExpiry
+	}
+
+	if t.read > 0 {
+		in.ReadTimeout = t.read
+	}
+
+	if t.blob > 0 {
+		in.BlobTimeout = t.blob
 	}
 }
 
-// WithAsyncInvoker registers an asynchronous Invoker under kind. Unlike
-// WithInvoker, exec does not run on the engine's critical path: a flow node
-// selecting this kind is dispatched to a durable JetStream work-queue (the
-// engine parks the execution) and exec is run later by an in-process worker,
-// with at-least-once delivery. Use it for slow nodes — an agent call, an HTTP
-// request — so they never hold an engine slot. exec is an ordinary synchronous
-// Invoker returning StatusOK/StatusError/StatusRetry; the durability, retries
-// and completion are handled for you. opts tune the worker and its stream (see
-// the asyncqueue package). It may be passed multiple times for distinct kinds.
-//
-// Delivery to exec is at-least-once: a job redelivered after a worker crash
-// (invoked, but not yet settled and acked) runs exec again. For a target whose
-// side effects must not fire twice, enable WithResultCache — it dedups the
-// worker's execution as well — or make the target idempotent.
-// A node selecting an async kind and declaring no timeout of its own runs at
-// that kind's activity timeout (asyncqueue's WithActivityTimeout, 5m by
-// default), not at WithDefaultTimeout — which governs calls the engine waits on
-// inline. See Engine.callBudget.
-func WithAsyncInvoker(kind string, exec invoker.Invoker, opts ...asyncqueue.Option) Option {
-	return func(c *config) {
-		c.asyncInvokers = append(c.asyncInvokers, asyncInvoker{kind: kind, exec: exec, opts: opts})
-	}
-}
+// WithNamespace sets the namespace prefix of every NATS resource (default
+// "packtrail"): independent deployments can share a cluster.
+func WithNamespace(ns string) Option {
+	return func(c *config) error {
+		if err := ValidateNamespace(ns); err != nil {
+			return err
+		}
 
-// asyncKinds is the set of registered asynchronous invoker kinds, for the
-// engine's per-node timeout decision.
-func (c *config) asyncKinds() map[string]bool {
-	if len(c.asyncInvokers) == 0 {
+		c.namespace = ns
+
 		return nil
 	}
-
-	kinds := make(map[string]bool, len(c.asyncInvokers))
-	for _, ai := range c.asyncInvokers {
-		kinds[ai.kind] = true
-	}
-
-	return kinds
 }
 
-// WithResultCache enables idempotent invocation: every node result is cached by
-// (execution, node, attempt) in a KV bucket, so a re-invocation returns the
-// cached result instead of running the node again. Node invocation is otherwise
-// at-least-once — a work item redelivered after a crash, or a lease taken over
-// while an instance is paused, can run the same node twice (the execution-doc CAS
-// fences state, not external side-effects). Enable this (or make targets
-// idempotent) whenever an invocation has a side effect that must not run twice.
-// The cache covers both invocation paths: the engine-side dispatch (including
-// an async node's StatusPending, so a redelivered work item re-parks instead of
-// dispatching a second job) and the async worker's execution of the target
-// (under a separate keyspace in the same bucket, so a redelivered job serves
-// the completed result instead of re-firing the side effect).
-// Cache entries expire after a TTL (default 24h — see WithResultCacheTTL): an
-// entry is only ever consulted during the redelivery window of its own attempt,
-// so retaining it longer would just grow the bucket without bound.
-func WithResultCache() Option { return func(c *config) { c.resultCache = true } }
+// WithFlow registers a flow definition at Init.
+func WithFlow(def *flow.Flow) Option {
+	return func(c *config) error {
+		if def == nil {
+			return fmt.Errorf("%w: nil flow", ErrInvalidArgument)
+		}
 
-// WithResultCacheTTL enables the result cache with a custom entry TTL. Entries
-// need only outlive the redelivery window of a single attempt (ack wait ×
-// delivery cap), so the 24h default is already generous; raise it if your
-// redelivery horizon is unusually long. A negative TTL disables expiry (the
-// bucket then grows without bound — the pre-TTL behaviour). Implies
-// WithResultCache.
-func WithResultCacheTTL(d time.Duration) Option {
-	return func(c *config) {
-		c.resultCache = true
-		c.resultCacheTTL = d
+		cp, err := def.Clone()
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+
+		c.flows = append(c.flows, cp)
+
+		return nil
 	}
 }
 
-// WithHistory enables the durable per-execution history: every state
-// transition is also appended, best-effort, to a `<namespace>-history` stream
-// retained for the given duration, and Server.History returns an execution's
-// ordered step-by-step trace. Without it, transition events live only in the
-// short-retention events stream that feeds the visibility indexes. The trace
-// is observability, not operational truth.
-func WithHistory(retention time.Duration) Option {
-	return func(c *config) { c.historyRetention = retention }
+// WithFlowYAML parses and registers a flow definition at Init.
+func WithFlowYAML(yaml []byte) Option {
+	return func(c *config) error {
+		def, err := flow.Parse(yaml)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+
+		c.flows = append(c.flows, def)
+
+		return nil
+	}
 }
 
-// WithStallRedrive sets the quiet-time threshold after which the stall
-// watchdog re-drives an active execution (default 5× the engine ack wait; a
-// negative value disables the watchdog). The watchdog runs after each
-// reconcile-active pass (see WithReconcileActive — without that schedule it
-// only runs via Server.RedriveStalled), and it heals executions whose driving
-// work item was lost in a crash window: still active, quiet past the
-// threshold, not inside a scheduled retry backoff, and not lease-held by a
-// live instance. Set the threshold above your longest legitimate quiet period;
-// a false positive is state-safe (guarded transitions) but duplicates an
-// invocation within the at-least-once contract.
-func WithStallRedrive(d time.Duration) Option {
-	return func(c *config) { c.stallRedrive = d }
+// WithFlowsDir registers every *.yaml / *.yml flow of dir at Init.
+func WithFlowsDir(dir string) Option {
+	return func(c *config) error {
+		defs, err := flow.LoadDir(dir)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+
+		for _, d := range defs {
+			c.flows = append(c.flows, d)
+		}
+
+		c.flowsDirs = append(c.flowsDirs, dir)
+
+		return nil
+	}
 }
 
-// WithReconcileActive installs the recurring active-set reconcile: a cheap pass
-// over only the in-flight (running/waiting) executions, on the given 6-field
-// cron expression ("sec min hour dom mon dow"), e.g. "0 */5 * * * *". Its cost
-// is independent of accumulated terminal executions, so it is safe to run
-// often. It fixes the common drift where a finished execution is still indexed
-// as active, but cannot recover an execution missing from the index entirely.
-//
-// A malformed expression fails [New]; see [ValidateCron].
-func WithReconcileActive(cronExpr string) Option {
-	return func(c *config) { c.reconcileActiveCron = cronExpr }
+// WithPartitions sets the partition count of a new deployment (default 64).
+// It cannot change once the namespace is provisioned.
+func WithPartitions(n int) Option {
+	return func(c *config) error {
+		if n <= 0 || n > maxPartitions {
+			return fmt.Errorf("%w: partitions must be in 1..%d", ErrInvalidArgument, maxPartitions)
+		}
+
+		c.partitions = n
+
+		return nil
+	}
 }
 
-// WithReconcileFull installs the recurring full reconcile: an authoritative scan
-// of every execution on the given 6-field cron expression, e.g. "0 0 * * * *"
-// for hourly. It is the deep backstop that recovers index entries the active
-// pass cannot see, and it also runs low-frequency maintenance such as reclaiming
-// consumed scheduler firings; its cost grows with total execution volume, so
-// schedule it well below the active cadence. Without either option the indexer
-// still runs but no periodic reconcile is scheduled.
-//
-// A malformed expression fails [New]; see [ValidateCron].
-func WithReconcileFull(cronExpr string) Option {
-	return func(c *config) { c.reconcileFullCron = cronExpr }
+const maxPartitions = 1024
+
+// WithOwnedPartitions restricts this engine to some partitions (default: it
+// competes for all of them; pinned consumers make one engine active per
+// partition and fail over automatically).
+func WithOwnedPartitions(ps ...int) Option {
+	return func(c *config) error {
+		for _, p := range ps {
+			if p < 0 {
+				return fmt.Errorf("%w: negative partition", ErrInvalidArgument)
+			}
+		}
+
+		c.owned = ps
+
+		return nil
+	}
 }
 
-// WithArchive enables execution archival: completed executions are swept out of
-// the hot executions bucket into a cold archive bucket that retains them for
-// roughly retention before they expire. This bounds the hot bucket — and the
-// List/Keys and full-reconcile scans over it — by in-flight volume rather than
-// all-time volume. The sweep runs on the full-reconcile schedule (see
-// WithReconcileFull), so pair the two. Failed executions are left hot so they
-// remain resumable. Without this option the hot bucket retains every execution.
-func WithArchive(retention time.Duration) Option {
-	return func(c *config) { c.archiveRetention = retention }
+// DefaultHistoryLimit is the live log length (events) past which an execution
+// is continued as new under the same id.
+const DefaultHistoryLimit = 10000
+
+// WithHistoryLimit continues an execution as new once its live log holds n
+// events (default 10 000; negative disables): the log so far is archived as a
+// segment and replaced by one event carrying the folded state. Behaviour does
+// not change — same id, state, in-flight work and timers — and History,
+// StateAt, Fork and Rerun still see everything. A looping execution's log then
+// stays bounded (G5-07).
+func WithHistoryLimit(n int) Option {
+	return func(c *config) error {
+		c.historyLimit = n
+
+		return nil
+	}
 }
 
-// WithSignalRetention sets how long the signals stream retains messages (its
-// MaxAge) — the window during which an undelivered signal survives an engine
-// outage before it is dropped. A positive duration sets that window; a negative
-// value disables the age limit (retain until the stream's other limits). Raise
-// it if executions may wait for a signal through a longer outage than a week.
-//
-// Omitting the option (or passing zero) leaves retention unmanaged rather than
-// asserting a value: an existing signals stream keeps the MaxAge it already has,
-// and a newly created one gets the 7-day default. That distinction matters
-// because provisioning is a CreateOrUpdate that every participant performs — a
-// namespace-only client, which has no reason to hold this option, must not
-// silently retune the retention of the engine it is only observing.
-func WithSignalRetention(d time.Duration) Option {
-	return func(c *config) { c.signalRetention = d }
+// WithSnapshotEvery snapshots states every n events (default 100; negative
+// disables snapshots).
+func WithSnapshotEvery(n int) Option {
+	return func(c *config) error {
+		c.snapshotEvery = n
+
+		return nil
+	}
 }
 
-// WithOwnerID sets this instance's ownership-lease owner id. Defaults to a
-// random id; only set it if you need a stable, distinct id per instance.
-func WithOwnerID(id string) Option { return func(c *config) { c.ownerID = id } }
+// WithDrainTimeout bounds the graceful drain on shutdown (default 30s). A
+// non-positive value keeps the default.
+func WithDrainTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d > 0 {
+			c.drain = d
+		}
 
-// WithLeaseTTL sets the per-execution ownership lease TTL (default 30s). A
-// crashed instance's executions become available to others after roughly this.
-func WithLeaseTTL(d time.Duration) Option { return func(c *config) { c.leaseTTL = d } }
-
-// WithMaxConcurrency caps how many work items this instance processes at once
-// (default 64).
-func WithMaxConcurrency(n int) Option { return func(c *config) { c.maxConcurrency = n } }
-
-// WithDefaultTimeout sets the invocation timeout used when a node omits one
-// (default 30s).
-func WithDefaultTimeout(d time.Duration) Option {
-	return func(c *config) { c.defaultTimeout = d }
+		return nil
+	}
 }
 
-// WithMaxDeliver caps how many times a single message is delivered before the
-// engine dead-letters it instead of redelivering forever (default 10). It bounds
-// the blast radius of a message that can never succeed (e.g. its flow or node was
-// removed) or one that keeps hitting a transient fault. The cap applies to all
-// three of the engine's durable consumers: the work stream (failing the execution
-// with a descriptive reason), the fired-schedule stream (a removed-flow cron tick
-// or persistently-failing reconcile), and the signal stream. A terminal error on
-// any of them is dead-lettered immediately, regardless of this cap. A
-// non-positive value is treated as the default — the cap cannot be disabled,
-// or a poisoned message could redeliver forever. (The async invoker worker has
-// its own asyncqueue.WithMaxDeliver, which does allow an explicit opt-out.)
-func WithMaxDeliver(n int) Option { return func(c *config) { c.maxDeliver = n } }
+// WithReplicas sets the replication factor of every stream, KV bucket and
+// object store. Without it, existing resources keep the replication they are
+// deployed with and new ones get 1, so an engine started without the option
+// never scales a replicated deployment down. Use 3 in production: the events
+// stream is the source of truth. Changing it scales the resources at the next
+// Init; the cluster must have enough JetStream servers.
+func WithReplicas(n int) Option {
+	return func(c *config) error {
+		if n < 1 || n > maxReplicas {
+			return fmt.Errorf("%w: replicas must be between 1 and %d", ErrInvalidArgument, maxReplicas)
+		}
 
-// WithDrainTimeout sets how long a graceful shutdown waits for in-flight work
-// items to settle and ack before aborting the stragglers (default 30s). When Run
-// returns because its context was cancelled, the engine stops accepting new work
-// and drains what is already running within this window — so a clean restart does
-// not abandon in-flight invocations to redelivery (which would double-fire
-// naturally non-idempotent targets). Stragglers exceeding the window are cancelled
-// and their work redelivers. A hard crash is unaffected (it always relies on
-// redelivery). A non-positive value falls back to the 30s default.
-//
-// It bounds the whole graceful shutdown, not only the engine: [Server.Run] also
-// waits for the workers hosted by [WithAsyncInvoker] to drain, so this value is
-// applied to them as their default too. A kind that needs its own budget passes
-// asyncqueue.WithDrainTimeout to WithAsyncInvoker, which takes precedence.
-func WithDrainTimeout(d time.Duration) Option { return func(c *config) { c.drainTimeout = d } }
+		c.replicas = n
 
-// WithMaxPayloadBytes caps the size of an execution's payload (default 512 KiB,
-// store.DefaultMaxPayloadBytes). The payload grows as task results, branch
-// results and signal payloads are merged in; a transition that would exceed the
-// limit fails the execution with a clear reason instead of producing an opaque
-// KV write error. The default leaves headroom below NATS's 1 MiB max message
-// size for the rest of the execution document. Pass a negative value to disable
-// the guard; zero keeps the default.
-//
-// [New] reconciles the value against the connected server's max_payload, since a
-// cap above what the transport will carry disables the very guard it configures:
-// a value over that limit is rejected, and the *default* is tightened down to it
-// (the default states no intent — it assumes a stock 1 MiB server — so against a
-// smaller one it is simply too loose).
-func WithMaxPayloadBytes(n int) Option { return func(c *config) { c.maxPayloadBytes = n } }
+		return nil
+	}
+}
 
-// WithMaxDocumentBytes caps the serialized size of an execution's control
-// document (default 768 KiB, store.DefaultMaxDocumentBytes). The document is
-// small control metadata, but a very wide fanout (one BranchState per branch) or
-// a large transient outbox can grow it toward NATS's 1 MiB ceiling; a write that
-// would exceed the limit is rejected with a typed error (and, on the fanout path,
-// fails the node with a clear reason) instead of an opaque NATS publish error.
-// Pass a negative value to disable the guard; zero keeps the default.
-func WithMaxDocumentBytes(n int) Option { return func(c *config) { c.maxDocBytes = n } }
+const maxReplicas = 5
+
+// WithAckWait sets the ack wait of the engine's consumers (commands, events,
+// cron, triggers). Handlers heartbeat while they run, so this is not a limit
+// on how long a command may take: it is how long a message held by a crashed
+// process waits before another engine gets it (default 5s).
+func WithAckWait(d time.Duration) Option {
+	return func(c *config) error {
+		if d < time.Second {
+			return fmt.Errorf("%w: ack wait must be at least 1s", ErrInvalidArgument)
+		}
+
+		c.timeouts.ackWait = d
+
+		return nil
+	}
+}
+
+// WithPullExpiry sets how long the engine's pull requests live on the server
+// (default 5s). Shorter values hand partitions over faster after a crash.
+func WithPullExpiry(d time.Duration) Option {
+	return func(c *config) error {
+		if d < time.Second {
+			return fmt.Errorf("%w: pull expiry must be at least 1s", ErrInvalidArgument)
+		}
+
+		c.timeouts.pullExpiry = d
+
+		return nil
+	}
+}
+
+// WithReadTimeout bounds one batched read of an event log (default 5s).
+func WithReadTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: read timeout must be positive", ErrInvalidArgument)
+		}
+
+		c.timeouts.read = d
+
+		return nil
+	}
+}
+
+// WithBlobTimeout bounds one claim-check transfer when the caller's context
+// has no deadline (default 2m). Raise it for very large payloads on slow links.
+func WithBlobTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: blob timeout must be positive", ErrInvalidArgument)
+		}
+
+		c.timeouts.blob = d
+
+		return nil
+	}
+}
+
+// WithLogger sets the logger.
+func WithLogger(l *slog.Logger) Option {
+	return func(c *config) error {
+		c.logger = l
+
+		return nil
+	}
+}
+
+// WithStateCacheSize bounds the in-memory state caches (default 10000).
+func WithStateCacheSize(n int) Option {
+	return func(c *config) error {
+		c.cacheSize = n
+
+		return nil
+	}
+}
+
+// WithClock injects the clock decisions use (tests).
+func WithClock(now func() time.Time) Option {
+	return func(c *config) error {
+		c.clock = now
+
+		return nil
+	}
+}
+
+// WithBlobThreshold sets the body size above which messages use the
+// claim-check (default: server max_payload minus a margin).
+func WithBlobThreshold(n int) Option {
+	return func(c *config) error {
+		if n <= 0 {
+			return fmt.Errorf("%w: blob threshold must be positive", ErrInvalidArgument)
+		}
+
+		c.blobThreshold = n
+
+		return nil
+	}
+}
+
+// WithSchedule installs a cron schedule at Init. The expression is validated
+// here, so a typo fails at New instead of inside the engine (I-22).
+func WithSchedule(name, flowName, cron string, input any) Option {
+	return func(c *config) error {
+		if err := checkSchedule(name, flowName, cron); err != nil {
+			return err
+		}
+
+		b, err := marshalObject(input)
+		if err != nil {
+			return err
+		}
+
+		c.schedules = append(c.schedules, scheduleDef{name: name, flow: flowName, cron: cron, input: b})
+
+		return nil
+	}
+}
+
+func checkSchedule(name, flowName, cron string) error {
+	if err := ValidateName("schedule name", name); err != nil {
+		return err
+	}
+
+	if err := ValidateName("flow name", flowName); err != nil {
+		return err
+	}
+
+	return ValidateCron(cron)
+}
+
+// WithoutDispatcher runs only the command processors (scale the roles
+// independently).
+func WithoutDispatcher() Option {
+	return func(c *config) error {
+		c.noDispatch = true
+
+		return nil
+	}
+}
+
+// WithoutCommands runs only the dispatcher.
+func WithoutCommands() Option {
+	return func(c *config) error {
+		c.noCommands = true
+
+		return nil
+	}
+}
+
+// marshalObject encodes v as a JSON object (nil = {}).
+func marshalObject(v any) (json.RawMessage, error) {
+	if v == nil {
+		return json.RawMessage(`{}`), nil
+	}
+
+	var b []byte
+
+	switch x := v.(type) {
+	case json.RawMessage:
+		b = x
+	case []byte:
+		b = x
+	default:
+		var err error
+		if b, err = json.Marshal(v); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+	}
+
+	if len(b) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil || m == nil {
+		return nil, fmt.Errorf("%w: payload must be a JSON object", ErrInvalidArgument)
+	}
+
+	return b, nil
+}
+
+// marshalAny encodes v as JSON (nil = null).
+func marshalAny(v any) (json.RawMessage, error) {
+	switch x := v.(type) {
+	case nil:
+		return nil, nil
+	case json.RawMessage:
+		if !json.Valid(x) {
+			return nil, fmt.Errorf("%w: invalid JSON", ErrInvalidArgument)
+		}
+
+		return x, nil
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		}
+
+		return b, nil
+	}
+}

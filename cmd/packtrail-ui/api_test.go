@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,233 +27,185 @@ import (
 
 	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/internal/natstest"
+	"github.com/henomis/packtrail/worker"
 )
 
-const apiFlow = `
-version: "1.0"
-name: api-flow
-nodes:
-  - {id: a, type: task, invoker: custom, target: agent-a}
-  - {id: b, type: task, invoker: custom, target: agent-b}
-edges:
-  - {from: a, to: b}
-`
+func TestAPI(t *testing.T) {
+	s := natstest.Start(t)
 
-func newTestServer(t *testing.T) *packtrail.Server {
-	t.Helper()
-	srv := natstest.Start(t)
-	custom := packtrail.InvokerFunc(func(_ context.Context, _ packtrail.Request) (packtrail.Result, error) {
-		return packtrail.Result{Status: packtrail.StatusOK, Payload: []byte(`{"ok":true}`)}, nil
-	})
-
-	s, err := packtrail.New(srv.NC,
-		packtrail.WithNamespace("uitest"),
-		packtrail.WithFlow([]byte(apiFlow)),
-		packtrail.WithInvoker("custom", custom),
-		packtrail.WithHistory(time.Hour),
-	)
-	if err != nil {
-		t.Fatalf("packtrail.New: %v", err)
-	}
-
-	return s
-}
-
-func TestAPIFlowsAndExecutions(t *testing.T) {
-	s := newTestServer(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	go func() { _ = s.Run(ctx) }()
-
-	id, err := s.Start(ctx, "api-flow", nil)
+	eng, err := packtrail.New(s.Connect(t), packtrail.WithPartitions(2), packtrail.WithFlowYAML([]byte(`
+name: ui
+nodes:
+  - {id: w, type: await, signal: go, timeout: 1h, next: t}
+  - {id: t, type: task, kind: k}
+`)))
 	if err != nil {
-		t.Fatalf("start: %v", err)
+		t.Fatal(err)
 	}
-	// Wait for completion so the visibility index is populated.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		ex, getErr := s.Get(ctx, id)
-		if getErr == nil && ex.Status == packtrail.ExecCompleted {
-			break
+
+	if err = eng.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() { _ = eng.Run(ctx) }()
+
+	w, _ := worker.New(s.Connect(t), "k", func(context.Context, *worker.Job) (*worker.Result, error) {
+		return &worker.Result{Output: map[string]any{"ok": true}}, nil
+	})
+
+	go func() { _ = w.Run(ctx) }()
+
+	id, err := eng.Client().Start(ctx, "ui", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	static, _ := fs.Sub(webFS, "web")
+
+	srv := httptest.NewServer(newAPI(s.Connect(t), "packtrail", nil).routes(http.FileServerFS(static)))
+	defer srv.Close()
+
+	call := func(method, path, ctype, body string) (int, string) {
+		req, _ := http.NewRequestWithContext(ctx, method, srv.URL+path, strings.NewReader(body))
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
 		}
 
-		time.Sleep(20 * time.Millisecond)
+		resp, lerr := http.DefaultClient.Do(req)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		defer resp.Body.Close()
+
+		b, _ := io.ReadAll(resp.Body)
+
+		return resp.StatusCode, string(b)
 	}
 
-	h := newAPI(s).routes()
-
-	// /api/flows
-	if body := doGet(t, h, "/api/flows"); !strings.Contains(body, "api-flow") {
-		t.Errorf("/api/flows = %s, want api-flow", body)
+	if code, body := call("GET", "/", "", ""); code != 200 || !strings.Contains(body, "packtrail") {
+		t.Fatalf("index %d", code)
 	}
 
-	// /api/flows/{name}
-	var g packtrail.FlowGraph
-	mustJSON(t, h, "/api/flows/api-flow", &g)
-
-	if g.Name != "api-flow" || len(g.Nodes) != 2 || len(g.Edges) != 1 {
-		t.Errorf("graph = %+v, want 2 nodes / 1 edge", g)
+	if code, body := call("GET", "/api/namespaces", "", ""); code != 200 ||
+		body != `{"default":"packtrail","namespaces":["packtrail"]}`+"\n" {
+		t.Fatalf("namespaces %d %s", code, body)
 	}
 
-	// /api/executions
-	var execs []map[string]any
-	mustJSON(t, h, "/api/executions", &execs)
+	if code, _ := call("GET", "/api/ns/other/executions", "", ""); code != 404 {
+		t.Fatalf("unknown namespace: %d", code)
+	}
 
-	found := false
+	if code, _ := call("POST", "/api/ns/packtrail/executions/"+id+"/signal", "text/plain", `{"name":"go"}`); code != 415 {
+		t.Fatalf("form-style post accepted: %d", code)
+	}
 
-	for _, e := range execs {
-		if e["id"] == id {
-			found = true
+	if code, _ := call("POST", "/api/ns/packtrail/executions/nope/signal", "application/json", `{"name":"go"}`); code != 404 {
+		t.Fatalf("missing execution: %d", code)
+	}
 
-			if e["status"] != string(packtrail.ExecCompleted) {
-				t.Errorf("exec status = %v, want completed", e["status"])
-			}
+	if code, _ := call("GET", "/api/ns/packtrail/executions/a.b", "", ""); code != 400 {
+		t.Fatalf("invalid id: %d", code)
+	}
+
+	if code, body := call("POST", "/api/ns/packtrail/executions/"+id+"/signal", "application/json", `{"name":"go"}`); code != 200 {
+		t.Fatalf("signal %d %s", code, body)
+	}
+
+	st, err := eng.Client().Wait(ctx, id)
+	if err != nil || st.Status != packtrail.StatusCompleted {
+		t.Fatalf("wait %v %v", st, err)
+	}
+
+	code, body := call("GET", "/api/ns/packtrail/executions/"+id+"/history", "", "")
+
+	var rows []historyRow
+	if code != 200 || json.Unmarshal([]byte(body), &rows) != nil || len(rows) < 5 {
+		t.Fatalf("history %d %s", code, body)
+	}
+
+	if code, body = call("GET", "/api/ns/packtrail/flows/ui", "", ""); code != 200 || !strings.Contains(body, `"start":"w"`) {
+		t.Fatalf("flow %d %s", code, body)
+	}
+
+	if code, body = call("POST", "/api/ns/packtrail/executions/"+id+"/rerun", "application/json", `{"node":"t"}`); code != 200 ||
+		!strings.Contains(body, "exec_id") {
+		t.Fatalf("rerun %d %s", code, body)
+	}
+
+	for _, p := range []string{"/api/executions", "/api/deadletters", "/api/schedules", "/api/flows"} {
+		if code, body = call("GET", strings.Replace(p, "/api/", "/api/ns/packtrail/", 1), "", ""); code != 200 {
+			t.Fatalf("%s %d %s", p, code, body)
+		}
+	}
+}
+
+func TestAPIAllowlist(t *testing.T) {
+	s := natstest.Start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for _, ns := range []string{"a", "b"} {
+		eng, err := packtrail.New(s.Connect(t), packtrail.WithNamespace(ns))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err = eng.Init(ctx); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	if !found {
-		t.Errorf("execution %s not in /api/executions: %v", id, execs)
+	nc := s.Connect(t)
+
+	got, err := discover(ctx, nc)
+	if err != nil || strings.Join(got, ",") != "a,b" {
+		t.Fatalf("discover %v %v", got, err)
 	}
 
-	// /api/executions/{id}
-	var ex map[string]any
-	mustJSON(t, h, "/api/executions/"+id, &ex)
+	// "c" is allowed but not provisioned: it must fail without being cached.
+	a := newAPI(nc, "a", []string{"a", "c"})
+	srv := httptest.NewServer(a.routes(http.NotFoundHandler()))
 
-	if ex["flow"] != "api-flow" {
-		t.Errorf("detail flow = %v, want api-flow", ex["flow"])
-	}
+	defer srv.Close()
 
-	if ex["node_generation"] == nil {
-		t.Errorf("detail missing node_generation: %v", ex)
-	}
+	for path, want := range map[string]int{
+		"/api/ns/a/executions": 200,
+		"/api/ns/b/executions": 404,
+		"/api/ns/c/executions": 404,
+	} {
+		req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+path, nil)
 
-	if versions, ok := ex["output_versions"].(map[string]any); !ok || versions["a"] == nil || versions["b"] == nil {
-		t.Errorf("detail output_versions = %v, want committed versions for a and b", ex["output_versions"])
-	}
-
-	// /api/executions/{id}/results — the assembled data-plane context
-	var res map[string]any
-	mustJSON(t, h, "/api/executions/"+id+"/results", &res)
-
-	if _, ok := res["input"]; !ok {
-		t.Errorf("results missing input: %v", res)
-	}
-
-	if outs, ok := res["results"].(map[string]any); !ok || outs["a"] == nil || outs["b"] == nil {
-		t.Errorf("results.results = %v, want outputs for a and b", res["results"])
-	}
-
-	if _, ok := res["branches"]; !ok {
-		t.Errorf("results missing branches: %v", res)
-	}
-
-	if res["last_node"] != "b" {
-		t.Errorf("results.last_node = %v, want b", res["last_node"])
-	}
-
-	// /api/executions/{id}/history — history is emitted best-effort, so poll
-	// briefly for the trace to land.
-	var hist []map[string]any
-
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		hist = nil
-		mustJSON(t, h, "/api/executions/"+id+"/history?limit=50", &hist)
-
-		if len(hist) > 0 && hist[len(hist)-1]["status"] == string(packtrail.ExecCompleted) {
-			break
+		resp, lerr := http.DefaultClient.Do(req)
+		if lerr != nil {
+			t.Fatal(lerr)
 		}
 
-		time.Sleep(20 * time.Millisecond)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != want {
+			t.Fatalf("%s: %d, want %d", path, resp.StatusCode, want)
+		}
 	}
 
-	if len(hist) == 0 {
-		t.Error("history is empty, want the execution's transition trace")
-	} else if last := hist[len(hist)-1]; last["status"] != string(packtrail.ExecCompleted) {
-		t.Errorf("last history status = %v, want completed", last["status"])
-	}
-
-	// missing flow / execution → 404
-	if code := doGetCode(t, h, "/api/flows/nope"); code != http.StatusNotFound {
-		t.Errorf("missing flow code = %d, want 404", code)
-	}
-
-	if code := doGetCode(t, h, "/api/executions/nope/results"); code != http.StatusNotFound {
-		t.Errorf("missing execution results code = %d, want 404", code)
+	if _, ok := a.clients["c"]; ok {
+		t.Fatal("unprovisioned namespace cached")
 	}
 }
 
-func TestRejectsMalformedInputWith400(t *testing.T) {
-	s := newTestServer(t)
-	h := newAPI(s).routes()
-
-	cases := []struct {
-		name string
-		path string
-	}{
-		{"malformed exec id", "/api/executions/bad!id"},
-		{"malformed exec id results", "/api/executions/bad!id/results"},
-		{"malformed exec id history", "/api/executions/bad!id/history"},
-		{"unknown status filter", "/api/executions?status=bogus"},
-		{"malformed flow filter", "/api/executions?flow=bad!flow"},
+func TestParseAllow(t *testing.T) {
+	if got, err := parseAllow(""); got != nil || err != nil {
+		t.Fatalf("empty: %v %v", got, err)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if code := doGetCode(t, h, tc.path); code != http.StatusBadRequest {
-				t.Errorf("GET %s = %d, want 400", tc.path, code)
-			}
-		})
-	}
-}
-
-func TestServesDashboard(t *testing.T) {
-	s := newTestServer(t)
-	h := newAPI(s).routes()
-
-	body := doGet(t, h, "/")
-	if !strings.Contains(body, "packtrail") || !strings.Contains(body, "app.js") {
-		t.Errorf("GET / did not serve the dashboard:\n%s", body)
+	if got, err := parseAllow(" b, a ,,b"); err != nil || strings.Join(got, ",") != "a,b" {
+		t.Fatalf("list: %v %v", got, err)
 	}
 
-	if ct := func() string {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/app.js", nil))
-
-		return rec.Header().Get("Content-Type")
-	}(); !strings.Contains(ct, "javascript") {
-		t.Errorf("app.js content-type = %q", ct)
-	}
-}
-
-func doGet(t *testing.T, h http.Handler, path string) string {
-	t.Helper()
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s = %d", path, rec.Code)
-	}
-
-	return rec.Body.String()
-}
-
-func doGetCode(t *testing.T, h http.Handler, path string) int {
-	t.Helper()
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
-
-	return rec.Code
-}
-
-func mustJSON(t *testing.T, h http.Handler, path string, v any) {
-	t.Helper()
-
-	if err := json.Unmarshal([]byte(doGet(t, h, path)), v); err != nil {
-		t.Fatalf("decode %s: %v", path, err)
+	if _, err := parseAllow("a,b.c"); err == nil {
+		t.Fatal("invalid namespace accepted")
 	}
 }

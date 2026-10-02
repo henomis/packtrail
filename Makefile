@@ -1,4 +1,4 @@
-.PHONY: all test lint fmt vet clean coverage help license tidy fix doc check ui build-ui modernize
+.PHONY: examples all test lint fmt vet clean coverage help license tidy fix doc check ui build-ui modernize
 
 # Variables
 GO := go
@@ -26,6 +26,7 @@ help:
 	@echo "  make clean       - Clean build artifacts and cache"
 	@echo "  make license     - Add license headers to all Go files"
 	@echo "  make modernize   - Apply Go modernization fixes (go tool modernize)"
+	@echo "  make examples    - Run every example"
 	@echo "  make help        - Display this help message"
 
 ## test: Run all tests (excluding examples)
@@ -99,6 +100,13 @@ doc:
 modernize:
 	@echo "Running go modernize..."
 	$(GO) tool modernize -fix ./...
+
+## examples: Run every example (needs NATS with JetStream on $NATS_URL, default localhost:4222)
+examples:
+	@for d in examples/*/; do \
+		case $$d in examples/internal/) continue;; esac; \
+		echo "== $$d"; $(GO) run ./$$d || exit 1; \
+	done
 
 ## check: Run all checks (test + lint + vet)
 check: test lint vet

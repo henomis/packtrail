@@ -43,3 +43,19 @@ start: hello
 	fmt.Println(def.Name, def.StartNode(), def.Node("route").Type, def.Channels["log"].ReducerOrDefault())
 	// Output: greet hello choice append
 }
+
+func ExampleValidationErrors() {
+	_, err := flow.Parse([]byte(`
+name: greet
+nodes:
+  - {id: hello, type: task, kind: greeter, retry: {max_attempts: 100}, next: bye}
+  - {id: bye, type: task}
+`))
+
+	for _, e := range flow.ValidationErrors(err) {
+		fmt.Printf("%s [%s] %s\n", e.Node, e.Field, e.Msg)
+	}
+	// Output:
+	// hello [retry.max_attempts] must be between 0 and 64
+	// bye [kind] invalid worker kind "": must match [A-Za-z0-9_-]{1,128}
+}

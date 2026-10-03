@@ -229,10 +229,10 @@ func TestValidateRejects(t *testing.T) {
 		{"self next", "name: x\nstart: a\nnodes: [{id: a, type: task, kind: k, next: a}]", "itself"},
 		{"retry cap", "name: x\nnodes: [{id: a, type: task, kind: k, retry: {max_attempts: 65}}]", "between 0 and 64"},
 		{"retry contradiction", "name: x\nnodes: [{id: a, type: task, kind: k, retry: {backoff: fixed}}]", "never retry"},
-		{"bad backoff", "name: x\nnodes: [{id: a, type: task, kind: k, retry: {max_attempts: 2, backoff: x}}]", "unknown retry.backoff"},
+		{"bad backoff", "name: x\nnodes: [{id: a, type: task, kind: k, retry: {max_attempts: 2, backoff: x}}]", "retry.backoff: unknown backoff"},
 		{"bad schema", "name: x\nnodes: [{id: a, type: task, kind: k, output_schema: {type: 12}}]", "output_schema"},
 		{"remote ref", "name: x\nnodes: [{id: a, type: task, kind: k, output_schema: {$ref: 'file:///etc/passwd'}}]", "output_schema"},
-		{"meta not json", "name: x\nnodes: [{id: a, type: task, kind: k, meta: {cfg: {1: x}}}]", "meta must encode as JSON"},
+		{"meta not json", "name: x\nnodes: [{id: a, type: task, kind: k, meta: {cfg: {1: x}}}]", "meta: must encode as JSON"},
 		{"cache ttl", "name: x\nnodes: [{id: a, type: task, kind: k, cache: {ttl: 0s}}]", "cache.ttl"},
 		{"conc max", "name: x\nnodes: [{id: a, type: task, kind: k, concurrency: {key: input.x, max: 0}}]", "concurrency.max"},
 		{"choice no default", "name: x\nnodes: [{id: c, type: choice, rules: [{when: 'input.x', to: a}]}, {id: a, type: task, kind: k}]", "exactly one default"},
@@ -242,12 +242,12 @@ func TestValidateRejects(t *testing.T) {
 		{"choice next", "name: x\nnodes: [{id: c, type: choice, next: a, rules: [{default: true, to: a}]}, {id: a, type: task, kind: k}]", "do not apply"},
 		{"choice on_error", "name: x\nnodes: [{id: c, type: choice, on_error: x, rules: [{default: true, to: a}]}, {id: a, type: task, kind: k}]", "on_error"},
 		{"fanout to task", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: t}, {id: a, type: task, kind: k}, {id: t, type: task, kind: k}]", "must be a join"},
-		{"fanout no next", "name: x\nnodes: [{id: f, type: fanout, branches: [a]}, {id: a, type: task, kind: k}]", "next is required"},
+		{"fanout no next", "name: x\nnodes: [{id: f, type: fanout, branches: [a]}, {id: a, type: task, kind: k}]", "next: is required"},
 		{"branch twice", "name: x\nnodes: [{id: f, type: fanout, branches: [a, a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}]", "twice"},
 		{"shared branch", fanYAML("[{id: f, type: fanout, branches: [a], next: j}, {id: g, type: fanout, branches: [a], next: j2}, {id: a, type: task, kind: k}, {id: j, type: join, next: g}, {id: j2, type: join}]"), "at most one fanout"},
 		{"branch non-task", "name: x\nnodes: [{id: f, type: fanout, branches: [c], next: j}, {id: c, type: choice, rules: [{default: true, to: j}]}, {id: j, type: join}]", "must be task or subflow nodes"},
-		{"on_failure unknown", "name: x\nnodes: [{id: a, type: task, kind: k, on_failure: zz}]", "on_failure references unknown node"},
-		{"on_failure self", "name: x\nstart: a\nnodes: [{id: a, type: task, kind: k, on_failure: a}]", "on_failure points to itself"},
+		{"on_failure unknown", "name: x\nnodes: [{id: a, type: task, kind: k, on_failure: zz}]", "on_failure: references unknown node"},
+		{"on_failure self", "name: x\nstart: a\nnodes: [{id: a, type: task, kind: k, on_failure: a}]", "on_failure: points to itself"},
 		{"on_failure on await", "name: x\nnodes: [{id: w, type: await, signal: s, timeout: 1m, on_failure: a}, {id: a, type: task, kind: k}]", "do not apply"},
 		{"on_failure on branch", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k, on_failure: h}, {id: j, type: join}, {id: h, type: task, kind: k}]", "settled by its join's policy"},
 		{"on_failure into branch", "name: x\nnodes: [{id: t, type: task, kind: k, on_failure: a, next: f}, {id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}]", "a branch of fanout"},
@@ -258,14 +258,14 @@ func TestValidateRejects(t *testing.T) {
 		{"map neither", "name: x\nnodes: [{id: m, type: map, over: input.xs}]", "worker kind"},
 		{"map flow retry", "name: x\nnodes: [{id: m, type: map, flow: c, over: input.xs, retry: {max_attempts: 2}}]", "apply to tasks"},
 		{"map kind input", "name: x\nnodes: [{id: m, type: map, kind: k, over: input.xs, input: item}]", "need flow"},
-		{"map flow bad close", "name: x\nnodes: [{id: m, type: map, flow: c, over: input.xs, on_parent_close: keep}]", "unknown on_parent_close"},
+		{"map flow bad close", "name: x\nnodes: [{id: m, type: map, flow: c, over: input.xs, on_parent_close: keep}]", "on_parent_close: unknown value"},
 		{"wait foreign", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [t], next: t}, {id: t, type: task, kind: k}]", "not a branch of its fanout"},
 		{"wait dup", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [a, a]}]", "twice"},
 		{"quorum too big", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'quorum:2'}]", "exceeds"},
 		{"bad policy", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: some}]", "unknown policy"},
 		{"orphan join", "name: x\nnodes: [{id: t, type: task, kind: k, next: j}, {id: j, type: join}]", "join"},
 		{"route into branch", "name: x\nnodes: [{id: t, type: task, kind: k, next: f}, {id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}, {id: c, type: choice, rules: [{default: true, to: a}]}]", "a branch of fanout"},
-		{"await no timeout", "name: x\nnodes: [{id: w, type: await, signal: s}]", "timeout is required"},
+		{"await no timeout", "name: x\nnodes: [{id: w, type: await, signal: s}]", "timeout: is required"},
 		{"await bad signal", "name: x\nnodes: [{id: w, type: await, signal: 'a.b', timeout: 1s}]", "invalid signal name"},
 		{"map bad over", "name: x\nnodes: [{id: m, type: map, kind: k, over: '1..10'}]", "range"},
 		{"map no kind", "name: x\nnodes: [{id: m, type: map, over: input.x}]", "invalid worker kind"},
@@ -286,6 +286,10 @@ func TestValidateRejects(t *testing.T) {
 			_, err := Parse([]byte(c.yaml))
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+
+			if len(ValidationErrors(err)) == 0 {
+				t.Fatalf("err = %v carries no *ValidationError", err)
 			}
 		})
 	}

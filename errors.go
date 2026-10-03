@@ -40,4 +40,10 @@ var (
 	// ErrNoValue means a value State decodes (a result, a channel, a signal,
 	// the output) is absent.
 	ErrNoValue = fold.ErrNoValue
+	// ErrNotProvisioned means the namespace does not exist yet: no engine
+	// has run Init (or Run) on it. A Client or worker started before the
+	// engine gets it and may retry. It says nothing about whether an engine
+	// is running now: once provisioned, commands are accepted and wait for
+	// one.
+	ErrNotProvisioned = apierr.ErrNotProvisioned
 )

@@ -16,15 +16,17 @@ package acceptance
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/internal/natstest"
+	"github.com/henomis/packtrail/worker"
 )
 
 // TestClientAttachRetries: a standalone client used before the namespace
-// exists fails, and works once an engine has provisioned it; a call made with
+// exists fails with ErrNotProvisioned, and works once an engine has provisioned it; a call made with
 // an expired context does not break it either.
 func TestClientAttachRetries(t *testing.T) {
 	s := natstest.Start(t)
@@ -44,8 +46,8 @@ func TestClientAttachRetries(t *testing.T) {
 		t.Fatal("Flows with a cancelled context succeeded")
 	}
 
-	if _, err = c.Flows(ctx); err == nil {
-		t.Fatal("Flows before the namespace exists succeeded")
+	if _, err = c.Flows(ctx); !errors.Is(err, packtrail.ErrNotProvisioned) {
+		t.Fatalf("Flows before the namespace exists: %v, want ErrNotProvisioned", err)
 	}
 
 	eng, err := packtrail.New(s.Connect(t), packtrail.WithFlowYAML([]byte(wtOne)), packtrail.WithPartitions(1))
@@ -64,6 +66,25 @@ func TestClientAttachRetries(t *testing.T) {
 
 	if len(flows) != 1 {
 		t.Fatalf("flows %+v", flows)
+	}
+}
+
+// TestWorkerRunNotProvisioned: a worker started before the namespace exists
+// returns ErrNotProvisioned (the same value as packtrail.ErrNotProvisioned).
+func TestWorkerRunNotProvisioned(t *testing.T) {
+	s := natstest.Start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+
+	w, err := worker.New(s.Connect(t), "echo", Echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Run(ctx)
+	if !errors.Is(err, worker.ErrNotProvisioned) || !errors.Is(err, packtrail.ErrNotProvisioned) {
+		t.Fatalf("Run before the namespace exists: %v, want ErrNotProvisioned", err)
 	}
 }
 

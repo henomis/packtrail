@@ -24,4 +24,6 @@ var (
 	ErrNotFound = errors.New("packtrail: execution not found")
 	// ErrInvalidArgument is packtrail.ErrInvalidArgument.
 	ErrInvalidArgument = errors.New("packtrail: invalid argument")
+	// ErrNotProvisioned is packtrail.ErrNotProvisioned.
+	ErrNotProvisioned = errors.New("packtrail: namespace is not provisioned (run Engine.Init first)")
 )

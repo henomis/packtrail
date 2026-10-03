@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -31,130 +32,136 @@ import (
 // Validate checks structural and semantic correctness of the flow and builds
 // the indexes and compiled expressions the engine uses. It is called by Parse
 // and ParseJSON; a Flow built in Go must be validated before use.
+//
+// Validate reports every problem it finds, each a *ValidationError, joined
+// with errors.Join (list them with ValidationErrors), in a stable order:
+// flow-level problems, then nodes in declaration order, then the graph. Graph
+// checks (fans, start, reachability) run only once every node is valid on its
+// own and every reference resolves.
 func (f *Flow) Validate() error {
+	p := &problems{flow: f.Name}
+
 	if err := names.CheckToken("flow name", f.Name); err != nil {
-		return err
+		p.add("", "name", err, "")
 	}
 
 	if v := strings.TrimSpace(f.Version); v != "" && v != SupportedVersion {
-		return fmt.Errorf("flow %q: unsupported version %q (this build supports %q)", f.Name, f.Version, SupportedVersion)
+		p.add("", "version", nil, "unsupported version %q (this build supports %q)", f.Version, SupportedVersion)
 	}
 
 	if len(f.Nodes) == 0 {
-		return fmt.Errorf("flow %q: no nodes", f.Name)
+		p.add("", "nodes", nil, "no nodes")
+
+		return p.err()
 	}
 
-	steps := []func() error{
-		f.indexNodes,
-		f.validateFlowLevel,
-		f.validateNodes,
-		f.validateFans,
-		f.rejectBranchEntry,
-		f.resolveStart,
-		f.rejectUnreachable,
+	f.indexNodes(p)
+	f.validateFlowLevel(p)
+	f.validateNodes(p)
+
+	if len(p.list) > 0 {
+		return p.err()
 	}
 
-	for _, step := range steps {
-		if err := step(); err != nil {
-			return err
-		}
+	f.validateFans(p)
+	f.rejectBranchEntry(p)
+
+	if f.resolveStart(p) {
+		f.rejectUnreachable(p)
 	}
 
-	return nil
+	return p.err()
 }
 
-func (f *Flow) errorf(format string, args ...any) error {
-	return fmt.Errorf("flow %q: "+format, append([]any{f.Name}, args...)...)
-}
-
-func (f *Flow) indexNodes() error {
+// indexNodes builds byID. A duplicate id is reported and the first node with
+// that id is kept, so references still resolve while the rest is checked.
+func (f *Flow) indexNodes(p *problems) {
 	f.byID = make(map[string]*Node, len(f.Nodes))
 
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 		if err := names.CheckToken("node id", n.ID); err != nil {
-			return f.errorf("%w", err)
+			p.add(n.ID, "id", err, "")
 		}
 
 		if _, dup := f.byID[n.ID]; dup {
-			return f.errorf("duplicate node id %q", n.ID)
+			p.add(n.ID, "id", nil, "duplicate node id")
+
+			continue
 		}
 
 		f.byID[n.ID] = n
 	}
-
-	return nil
 }
 
-func (f *Flow) validateFlowLevel() error {
+func (f *Flow) validateFlowLevel(p *problems) {
 	if f.MaxSteps < 0 {
-		return f.errorf("max_steps must not be negative")
+		p.add("", "max_steps", nil, "must not be negative")
 	}
 
 	if f.Retention < 0 {
-		return f.errorf("retention must not be negative")
+		p.add("", "retention", nil, "must not be negative")
 	}
 
-	if err := f.validateChannels(); err != nil {
-		return err
-	}
-
-	if err := f.validateBudgetAndAttrs(); err != nil {
-		return err
-	}
-
-	return f.validateTriggers()
+	f.validateChannels(p)
+	f.validateBudgetAndAttrs(p)
+	f.validateTriggers(p)
 }
 
-func (f *Flow) validateBudgetAndAttrs() error {
-	for k, v := range f.Budget {
+func (f *Flow) validateBudgetAndAttrs(p *problems) {
+	for _, k := range slices.Sorted(maps.Keys(f.Budget)) {
+		field := "budget." + k
+
 		if err := names.CheckToken("budget counter", k); err != nil {
-			return f.errorf("%w", err)
+			p.add("", field, err, "")
 		}
 
-		if v <= 0 {
-			return f.errorf("budget %q must be positive", k)
+		if f.Budget[k] <= 0 {
+			p.add("", field, nil, "must be positive")
 		}
 	}
 
 	f.attrs = make(map[string]*expr.Program, len(f.SearchAttributes))
 
-	for k, src := range f.SearchAttributes {
+	for _, k := range slices.Sorted(maps.Keys(f.SearchAttributes)) {
+		field := "search_attributes." + k
+
 		if err := names.CheckToken("search attribute", k); err != nil {
-			return f.errorf("%w", err)
+			p.add("", field, err, "")
 		}
 
-		p, err := expr.CompileValue(src)
+		prog, err := expr.CompileValue(f.SearchAttributes[k])
 		if err != nil {
-			return f.errorf("search attribute %q: %w", k, err)
+			p.add("", field, err, "")
+
+			continue
 		}
 
-		f.attrs[k] = p
+		f.attrs[k] = prog
 	}
-
-	return nil
 }
 
-func (f *Flow) validateTriggers() error {
-	for _, tr := range f.Triggers {
+func (f *Flow) validateTriggers(p *problems) {
+	for i, tr := range f.Triggers {
 		if strings.TrimSpace(tr.Subject) == "" || strings.ContainsAny(tr.Subject, " \t\r\n") {
-			return f.errorf("trigger subject %q is invalid", tr.Subject)
+			p.add("", fmt.Sprintf("triggers[%d].subject", i), nil, "%q is not a valid subject", tr.Subject)
 		}
 
 		if tr.Stream != "" {
 			if err := names.CheckToken("trigger stream", tr.Stream); err != nil {
-				return f.errorf("%w", err)
+				p.add("", fmt.Sprintf("triggers[%d].stream", i), err, "")
 			}
 		}
 	}
-
-	return nil
 }
 
-func (f *Flow) validateChannels() error {
-	for name, c := range f.Channels {
+func (f *Flow) validateChannels(p *problems) {
+	for _, name := range slices.Sorted(maps.Keys(f.Channels)) {
+		c := f.Channels[name]
+		field := "channels." + name
+
 		if err := names.CheckToken("channel name", name); err != nil {
-			return f.errorf("%w", err)
+			p.add("", field, err, "")
 		}
 
 		var ok bool
@@ -172,107 +179,95 @@ func (f *Flow) validateChannels() error {
 			_, ok = c.Default.(float64)
 			ok = ok || c.Default == nil
 		default:
-			return f.errorf("channel %q: unknown reducer %q (want replace, append, merge or sum)", name, c.Reducer)
+			p.add("", field+".reducer", nil, "unknown reducer %q (want replace, append, merge or sum)", c.Reducer)
+
+			continue
 		}
 
 		if !ok {
-			return f.errorf("channel %q: default does not fit reducer %q", name, c.ReducerOrDefault())
+			p.add("", field+".default", nil, "does not fit reducer %q", c.ReducerOrDefault())
 		}
 	}
-
-	return nil
 }
 
-func (f *Flow) validateNodes() error {
+func (f *Flow) validateNodes(p *problems) {
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 
-		if err := f.validateNode(n); err != nil {
-			return err
-		}
+		f.validateNode(p, n)
 
 		if n.Next != "" {
-			if err := f.ref(n, fNext, n.Next); err != nil {
-				return err
-			}
+			f.ref(p, n, fNext, n.Next)
 
 			if n.Next == n.ID {
-				return f.errorf("node %q: next points to itself (would loop forever with no exit)", n.ID)
+				p.add(n.ID, fNext, nil, "points to itself (would loop forever with no exit)")
 			}
 		}
 
 		if n.OnFailure != "" {
-			if err := f.ref(n, fOnFailure, n.OnFailure); err != nil {
-				return err
-			}
+			f.ref(p, n, fOnFailure, n.OnFailure)
 
 			if n.OnFailure == n.ID {
-				return f.errorf("node %q: on_failure points to itself; to try again, use retry", n.ID)
+				p.add(n.ID, fOnFailure, nil, "points to itself; to try again, use retry")
 			}
 		}
 	}
-
-	return nil
 }
 
-func (f *Flow) ref(n *Node, field, id string) error {
+// ref checks that field of n names an existing node.
+func (f *Flow) ref(p *problems, n *Node, field, id string) {
 	if id == "" {
-		return f.errorf("node %q: %s is required", n.ID, field)
+		p.add(n.ID, field, nil, "is required")
+
+		return
 	}
 
 	if f.byID[id] == nil {
-		return f.errorf("node %q: %s references unknown node %q", n.ID, field, id)
+		p.add(n.ID, field, nil, "references unknown node %q", id)
 	}
-
-	return nil
 }
 
-func (f *Flow) validateNode(n *Node) error {
-	if err := f.rejectForeignFields(n); err != nil {
-		return err
-	}
-
-	if err := f.encodeMeta(n); err != nil {
-		return err
-	}
+func (f *Flow) validateNode(p *problems, n *Node) {
+	f.rejectForeignFields(p, n)
+	f.encodeMeta(p, n)
 
 	switch n.Type {
 	case NodeTask:
-		return f.validateTask(n)
+		f.validateTask(p, n)
 	case NodeChoice:
-		return f.validateChoice(n)
+		f.validateChoice(p, n)
 	case NodeFanout:
-		return f.validateFanout(n)
+		f.validateFanout(p, n)
 	case NodeJoin:
-		return f.validateJoin(n)
+		f.validateJoin(p, n)
 	case NodeAwait:
-		return f.validateAwait(n)
+		f.validateAwait(p, n)
 	case NodeMap:
-		return f.validateMap(n)
+		f.validateMap(p, n)
 	case NodeSubflow:
-		return f.validateSubflow(n)
+		f.validateSubflow(p, n)
 	default:
-		return f.errorf("node %q: unknown type %q", n.ID, n.Type)
+		p.add(n.ID, "type", nil, "unknown type %q", n.Type)
 	}
 }
 
 // encodeMeta checks that the node's meta encodes as JSON and keeps the
 // encoding for jobs.
-func (f *Flow) encodeMeta(n *Node) error {
+func (f *Flow) encodeMeta(p *problems, n *Node) {
 	n.meta = nil
 
 	if len(n.Meta) == 0 {
-		return nil
+		return
 	}
 
 	b, err := json.Marshal(n.Meta)
 	if err != nil {
-		return f.errorf("node %q: meta must encode as JSON (use string keys in nested maps): %w", n.ID, err)
+		p.add(n.ID, "meta", err, "must encode as JSON (use string keys in nested maps)")
+
+		return
 	}
 
 	n.meta = b
-
-	return nil
 }
 
 // Node field names, as written in YAML.
@@ -342,10 +337,10 @@ var allowedFields = map[string][]string{
 
 // rejectForeignFields refuses a field that does not belong to the node's type:
 // it would be silently ignored, which almost always hides a mistake.
-func (f *Flow) rejectForeignFields(n *Node) error {
+func (f *Flow) rejectForeignFields(p *problems, n *Node) {
 	allowed, known := allowedFields[n.Type]
 	if !known {
-		return nil
+		return
 	}
 
 	var foreign []string
@@ -359,102 +354,95 @@ func (f *Flow) rejectForeignFields(n *Node) error {
 	if len(foreign) > 0 {
 		sort.Strings(foreign)
 
-		return f.errorf("node %q: field(s) %v do not apply to a %s node", n.ID, foreign, n.Type)
+		p.add(n.ID, "", nil, "field(s) %v do not apply to a %s node", foreign, n.Type)
 	}
-
-	return nil
 }
 
-func (f *Flow) validateTask(n *Node) error {
+func (f *Flow) validateTask(p *problems, n *Node) {
 	if err := names.CheckToken("worker kind", n.Kind); err != nil {
-		return f.errorf("task node %q: %w", n.ID, err)
+		p.add(n.ID, fKind, err, "")
 	}
 
-	if err := f.validateAttemptPolicy(n); err != nil {
-		return err
-	}
+	f.validateAttemptPolicy(p, n)
 
 	if n.Cache != nil && n.Cache.TTL <= 0 {
-		return f.errorf("task node %q: cache.ttl must be positive", n.ID)
+		p.add(n.ID, "cache.ttl", nil, "must be positive")
 	}
+
+	n.conc = nil
 
 	if c := n.Concurrency; c != nil {
 		if c.Max <= 0 {
-			return f.errorf("task node %q: concurrency.max must be positive", n.ID)
+			p.add(n.ID, "concurrency.max", nil, "must be positive")
 		}
 
-		p, err := expr.CompileValue(c.Key)
+		prog, err := expr.CompileValue(c.Key)
 		if err != nil {
-			return f.errorf("task node %q: concurrency.key: %w", n.ID, err)
-		}
-
-		n.conc = p
-	}
-
-	for _, d := range n.Dynamic {
-		if err := f.ref(n, "dynamic", d); err != nil {
-			return err
+			p.add(n.ID, "concurrency.key", err, "")
+		} else {
+			n.conc = prog
 		}
 	}
 
-	return nil
+	for i, d := range n.Dynamic {
+		f.ref(p, n, fmt.Sprintf("dynamic[%d]", i), d)
+	}
 }
 
 // validateAttemptPolicy checks the per-attempt policies shared by task and map
 // nodes: timeout, retry and output schema.
-func (f *Flow) validateAttemptPolicy(n *Node) error {
+func (f *Flow) validateAttemptPolicy(p *problems, n *Node) {
 	if n.Timeout < 0 {
-		return f.errorf("node %q: timeout must not be negative", n.ID)
+		p.add(n.ID, fTimeout, nil, "must not be negative")
 	}
 
-	if err := f.validateRetry(n); err != nil {
-		return err
-	}
+	validateRetry(p, n)
+
+	n.schema = nil
 
 	if n.OutputSchema == nil {
-		n.schema = nil
-
-		return nil
+		return
 	}
 
 	sch, err := compileSchema(n.OutputSchema)
 	if err != nil {
-		return f.errorf("node %q: output_schema: %w", n.ID, err)
+		p.add(n.ID, fOutputSchema, err, "")
+
+		return
 	}
 
 	n.schema = sch
-
-	return nil
 }
 
-func (f *Flow) validateRetry(n *Node) error {
+func validateRetry(p *problems, n *Node) {
 	r := n.Retry
 	if r == nil {
-		return nil
+		return
 	}
 
 	if r.MaxAttempts < 0 || r.MaxAttempts > MaxRetryAttempts {
-		return f.errorf("node %q: retry.max_attempts must be between 0 and %d", n.ID, MaxRetryAttempts)
+		p.add(n.ID, "retry.max_attempts", nil, "must be between 0 and %d", MaxRetryAttempts)
 	}
 
 	switch r.Backoff {
 	case "", BackoffFixed, BackoffLinear, BackoffExponential:
+		// A backoff with no attempts contradicts itself: it would run once
+		// and never retry.
+		if r.Backoff != "" && r.MaxAttempts < 2 { //nolint:mnd // one retry needs two attempts.
+			p.add(n.ID, "retry.max_attempts", nil, "retry declares backoff %q but max_attempts < 2, "+
+				"so it would never retry", r.Backoff)
+		}
 	default:
-		return f.errorf("node %q: unknown retry.backoff %q (want fixed, linear or exponential)", n.ID, r.Backoff)
+		p.add(n.ID, "retry.backoff", nil, "unknown backoff %q (want fixed, linear or exponential)", r.Backoff)
 	}
 
-	if r.Delay < 0 || r.MaxDelay < 0 {
-		return f.errorf("node %q: retry delays must not be negative", n.ID)
+	if r.Delay < 0 {
+		p.add(n.ID, "retry.delay", nil, "must not be negative")
 	}
 
-	// A backoff with no attempts contradicts itself: it would run once and
-	// never retry.
-	if r.Backoff != "" && r.MaxAttempts < 2 { //nolint:mnd // one retry needs two attempts.
-		return f.errorf("node %q: retry declares backoff %q but max_attempts < 2, so it would never retry",
-			n.ID, r.Backoff)
+	if r.MaxDelay < 0 {
+		p.add(n.ID, "retry.max_delay", nil, "must not be negative")
 	}
-
-	return nil
 }
 
 var errRemoteRef = errors.New("output_schema may not load external references")
@@ -476,80 +464,75 @@ func compileSchema(doc any) (*jsonschema.Schema, error) {
 	return c.Compile(url)
 }
 
-func (f *Flow) validateChoice(n *Node) error {
+func (f *Flow) validateChoice(p *problems, n *Node) {
 	if len(n.Rules) == 0 {
-		return f.errorf("choice node %q: at least one rule is required", n.ID)
+		p.add(n.ID, fRules, nil, "at least one rule is required")
 	}
 
 	defaults := 0
 	n.rules = make([]*expr.Program, len(n.Rules))
 
 	for i, r := range n.Rules {
+		field := fmt.Sprintf("rules[%d]", i)
+
 		switch {
 		case r.Default && strings.TrimSpace(r.When) != "":
-			return f.errorf("choice node %q: a default rule must not also carry a when expression", n.ID)
+			p.add(n.ID, field+".when", nil, "a default rule must not also carry a when expression")
+
+			defaults++
 		case r.Default:
 			defaults++
 		case strings.TrimSpace(r.When) == "":
-			return f.errorf("choice node %q: non-default rule needs a when expression", n.ID)
+			p.add(n.ID, field+".when", nil, "non-default rule needs a when expression")
 		default:
-			p, err := expr.CompilePredicate(r.When)
+			prog, err := expr.CompilePredicate(r.When)
 			if err != nil {
-				return f.errorf("choice node %q: rule %d: %w", n.ID, i, err)
+				p.add(n.ID, field+".when", err, "")
+			} else {
+				n.rules[i] = prog
 			}
-
-			n.rules[i] = p
 		}
 
-		if err := f.ref(n, "rule.to", r.To); err != nil {
-			return err
-		}
+		f.ref(p, n, field+".to", r.To)
 	}
 
-	if defaults != 1 {
-		return f.errorf("choice node %q: exactly one default rule is required (got %d)", n.ID, defaults)
+	if len(n.Rules) > 0 && defaults != 1 {
+		p.add(n.ID, fRules, nil, "exactly one default rule is required (got %d)", defaults)
 	}
 
 	if n.OnError != OnErrorDefault && n.OnError != OnErrorFail {
-		return f.errorf("choice node %q: unknown on_error %q (want \"fail\" or omit)", n.ID, n.OnError)
+		p.add(n.ID, fOnError, nil, "unknown value %q (want \"fail\" or omit)", n.OnError)
 	}
-
-	return nil
 }
 
-func (f *Flow) validateFanout(n *Node) error {
-	if len(n.Branches) == 0 {
-		return f.errorf("fanout node %q: branches is required", n.ID)
+func (f *Flow) validateFanout(p *problems, n *Node) {
+	switch {
+	case len(n.Branches) == 0:
+		p.add(n.ID, fBranches, nil, "at least one branch is required")
+	case len(n.Branches) > MaxBranches:
+		p.add(n.ID, fBranches, nil, "at most %d branches (use a map node for wider fan-outs)", MaxBranches)
 	}
 
-	if len(n.Branches) > MaxBranches {
-		return f.errorf("fanout node %q: at most %d branches (use a map node for wider fan-outs)", n.ID, MaxBranches)
-	}
-
-	for _, b := range n.Branches {
-		if err := f.ref(n, "branch", b); err != nil {
-			return err
-		}
+	for i, b := range n.Branches {
+		f.ref(p, n, fmt.Sprintf("branches[%d]", i), b)
 	}
 
 	if n.Next == "" {
-		return f.errorf("fanout node %q: next is required and must be a join node", n.ID)
+		p.add(n.ID, fNext, nil, "is required and must be a join node")
 	}
-
-	return nil
 }
 
-func (f *Flow) validateJoin(n *Node) error {
+func (f *Flow) validateJoin(p *problems, n *Node) {
 	seen := map[string]bool{}
 
-	for _, w := range n.WaitFor {
-		if err := f.ref(n, "wait_for", w); err != nil {
-			return err
-		}
+	for i, w := range n.WaitFor {
+		field := fmt.Sprintf("wait_for[%d]", i)
+
+		f.ref(p, n, field, w)
 
 		// A duplicate would double-count that branch in the join tally.
 		if seen[w] {
-			return f.errorf("join node %q: wait_for lists %q twice", n.ID, w)
+			p.add(n.ID, field, nil, "lists %q twice", w)
 		}
 
 		seen[w] = true
@@ -560,108 +543,101 @@ func (f *Flow) validateJoin(n *Node) error {
 	case JoinAll, JoinAny:
 	case JoinQuorum:
 		if quorum <= 0 {
-			return f.errorf("join node %q: quorum:N needs N > 0", n.ID)
+			p.add(n.ID, fPolicy, nil, "quorum:N needs N > 0")
 		}
 	default:
-		return f.errorf("join node %q: unknown policy %q (want all, any or quorum:N)", n.ID, n.Policy)
+		p.add(n.ID, fPolicy, nil, "unknown policy %q (want all, any or quorum:N)", n.Policy)
 	}
-
-	return nil
 }
 
-func (f *Flow) validateAwait(n *Node) error {
+func (f *Flow) validateAwait(p *problems, n *Node) {
 	if err := names.CheckToken("signal name", n.Signal); err != nil {
-		return f.errorf("await node %q: %w", n.ID, err)
+		p.add(n.ID, fSignal, err, "")
 	}
 
 	// An await without a timeout can park an execution forever on a signal
 	// nobody sends; the deadline is mandatory and on_timeout chooses between
 	// failing and routing.
 	if n.Timeout <= 0 {
-		return f.errorf("await node %q: timeout is required and must be positive", n.ID)
+		p.add(n.ID, fTimeout, nil, "is required and must be positive")
 	}
 
 	if n.OnTimeout != "" {
-		return f.ref(n, "on_timeout", n.OnTimeout)
+		f.ref(p, n, fOnTimeout, n.OnTimeout)
 	}
-
-	return nil
 }
 
-func (f *Flow) validateMap(n *Node) error {
-	if err := f.validateMapItems(n); err != nil {
-		return err
-	}
+func (f *Flow) validateMap(p *problems, n *Node) {
+	f.validateMapItems(p, n)
 
-	p, err := expr.CompileValue(n.Over)
+	n.over = nil
+
+	prog, err := expr.CompileValue(n.Over)
 	if err != nil {
-		return f.errorf("map node %q: over: %w", n.ID, err)
+		p.add(n.ID, fOver, err, "")
+	} else {
+		n.over = prog
 	}
-
-	n.over = p
 
 	if n.MaxParallel < 0 || n.MaxParallel > MaxParallel {
-		return f.errorf("map node %q: max_parallel must be between 0 and %d", n.ID, MaxParallel)
+		p.add(n.ID, fMaxParallel, nil, "must be between 0 and %d", MaxParallel)
 	}
 
-	if n.Flow != "" {
-		return nil
+	if n.Flow == "" {
+		f.validateAttemptPolicy(p, n)
 	}
-
-	return f.validateAttemptPolicy(n)
 }
 
 // validateMapItems checks what runs each item of map n: a task of a worker
 // kind, or a child execution of a flow (with an optional input expression
 // that sees item and index).
-func (f *Flow) validateMapItems(n *Node) error {
+func (f *Flow) validateMapItems(p *problems, n *Node) {
 	switch {
 	case n.Kind != "" && n.Flow != "":
-		return f.errorf("map node %q: set kind (a task per item) or flow (a subflow per item), not both", n.ID)
+		p.add(n.ID, "", nil, "set kind (a task per item) or flow (a subflow per item), not both")
+
+		return
 	case n.Flow == "":
 		if n.Input != "" || n.OnParentClose != "" {
-			return f.errorf("map node %q: input and on_parent_close need flow (a subflow per item)", n.ID)
+			p.add(n.ID, "", nil, "input and on_parent_close need flow (a subflow per item)")
 		}
 
 		if err := names.CheckToken("worker kind", n.Kind); err != nil {
-			return f.errorf("map node %q: %w", n.ID, err)
+			p.add(n.ID, fKind, err, "")
 		}
 
-		return nil
+		return
 	}
 
 	if n.Timeout > 0 || n.Retry != nil || n.OutputSchema != nil {
-		return f.errorf("map node %q: timeout, retry and output_schema apply to tasks; "+
-			"with flow, set them on the child flow's nodes", n.ID)
+		p.add(n.ID, "", nil, "timeout, retry and output_schema apply to tasks; "+
+			"with flow, set them on the child flow's nodes")
 	}
 
-	return f.validateSubflow(n)
+	f.validateSubflow(p, n)
 }
 
 // validateSubflow checks the child-execution fields of a subflow node, or of
 // a map node with flow.
-func (f *Flow) validateSubflow(n *Node) error {
+func (f *Flow) validateSubflow(p *problems, n *Node) {
 	if err := names.CheckToken("subflow name", n.Flow); err != nil {
-		return f.errorf("%s node %q: %w", n.Type, n.ID, err)
+		p.add(n.ID, fFlow, err, "")
 	}
 
 	switch n.OnParentClose {
 	case "", ParentCloseCancel, ParentCloseAbandon:
 	default:
-		return f.errorf("%s node %q: unknown on_parent_close %q (want cancel or abandon)", n.Type, n.ID,
-			n.OnParentClose)
+		p.add(n.ID, fOnParentClose, nil, "unknown value %q (want cancel or abandon)", n.OnParentClose)
 	}
 
 	n.input = nil
 
 	if strings.TrimSpace(n.Input) != "" {
-		p, err := expr.CompileValue(n.Input)
+		prog, err := expr.CompileValue(n.Input)
 		if err != nil {
-			return f.errorf("%s node %q: input: %w", n.Type, n.ID, err)
+			p.add(n.ID, fInput, err, "")
+		} else {
+			n.input = prog
 		}
-
-		n.input = p
 	}
-
-	return nil
 }

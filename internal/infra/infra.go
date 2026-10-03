@@ -29,6 +29,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/henomis/packtrail/internal/apierr"
 	"github.com/henomis/packtrail/internal/names"
 )
 
@@ -134,7 +135,7 @@ func (i *Infra) EventSubject(execID string) string {
 }
 
 // ErrNotProvisioned is returned by Attach when the deployment does not exist.
-var ErrNotProvisioned = errors.New("packtrail: namespace is not provisioned (run Engine.Init first)")
+var ErrNotProvisioned = apierr.ErrNotProvisioned
 
 // Attach reads the partition count from a deployed command stream.
 func (i *Infra) Attach(ctx context.Context) error {

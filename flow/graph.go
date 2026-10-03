@@ -16,7 +16,6 @@ package flow
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -49,7 +48,9 @@ func (f *Flow) WaitFor(join string) []string {
 //   - a fanout's next is a join, each join closes exactly one fanout, and its
 //     wait_for is a subset of that fanout's branches;
 //   - a quorum fits the number of awaited branches.
-func (f *Flow) validateFans() error {
+//
+// It runs after every reference has resolved.
+func (f *Flow) validateFans(p *problems) {
 	f.branchOf = map[string]string{}
 	f.joinOf = map[string]string{}
 
@@ -59,19 +60,19 @@ func (f *Flow) validateFans() error {
 			continue
 		}
 
-		if err := f.validateFanBranches(n); err != nil {
-			return err
-		}
+		f.validateFanBranches(p, n)
 
 		j := f.byID[n.Next]
 		if j.Type != NodeJoin {
-			return f.errorf("fanout %q leads to %q, a %s node; a fanout's next must be a join", n.ID, j.ID, j.Type)
+			p.add(n.ID, fNext, nil, "leads to %q, a %s node; a fanout's next must be a join", j.ID, j.Type)
+
+			continue
 		}
 
-		for fan, other := range f.joinOf {
-			if other == j.ID {
-				return f.errorf("join %q closes both fanouts %q and %q; use one join per fanout", j.ID, fan, n.ID)
-			}
+		if fan, closed := f.fanOf(j.ID); closed {
+			p.add(j.ID, "", nil, "closes both fanouts %q and %q; use one join per fanout", fan, n.ID)
+
+			continue
 		}
 
 		f.joinOf[n.ID] = j.ID
@@ -79,62 +80,64 @@ func (f *Flow) validateFans() error {
 
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
-		if n.Type != NodeJoin {
-			continue
+		if n.Type == NodeJoin {
+			f.validateJoinFan(p, n)
 		}
+	}
+}
 
-		if err := f.validateJoinFan(n); err != nil {
-			return err
+// fanOf returns the fanout that join closes, if any.
+func (f *Flow) fanOf(join string) (string, bool) {
+	for fan, j := range f.joinOf {
+		if j == join {
+			return fan, true
 		}
 	}
 
-	return nil
+	return "", false
 }
 
-func (f *Flow) validateFanBranches(n *Node) error {
-	for _, b := range n.Branches {
+func (f *Flow) validateFanBranches(p *problems, n *Node) {
+	for i, b := range n.Branches {
+		field := fmt.Sprintf("branches[%d]", i)
+
 		if owner, seen := f.branchOf[b]; seen {
 			if owner == n.ID {
-				return f.errorf("fanout %q lists branch %q twice", n.ID, b)
+				p.add(n.ID, field, nil, "lists branch %q twice", b)
+			} else {
+				p.add(b, "", nil, "is a branch of fanouts %q and %q; a node may belong to at most one fanout",
+					owner, n.ID)
 			}
 
-			return f.errorf("node %q is a branch of fanouts %q and %q; a node may belong to at most one fanout",
-				b, owner, n.ID)
+			continue
 		}
 
 		f.branchOf[b] = n.ID
 
 		bn := f.byID[b]
 		if bn.Type != NodeTask && bn.Type != NodeSubflow {
-			return f.errorf("fanout %q: branch %q is a %s node; branches must be task or subflow nodes "+
-				"(a subflow can hold any graph)", n.ID, b, bn.Type)
+			p.add(n.ID, field, nil, "branch %q is a %s node; branches must be task or subflow nodes "+
+				"(a subflow can hold any graph)", b, bn.Type)
 		}
 
 		if bn.OnFailure != "" {
-			return f.errorf("node %q is a branch of fanout %q and has on_failure; a failed branch is settled "+
-				"by its join's policy — put on_failure on join %q instead", b, n.ID, n.Next)
+			p.add(b, fOnFailure, nil, "node is a branch of fanout %q; a failed branch is settled "+
+				"by its join's policy — put on_failure on join %q instead", n.ID, n.Next)
 		}
 
 		if bn.Next != "" || len(bn.Dynamic) > 0 {
-			return f.errorf("node %q is a branch of fanout %q and routes onward; a branch does not advance the "+
-				"execution (its join does) — put the successor after the join instead", b, n.ID)
+			p.add(b, "", nil, "node is a branch of fanout %q and routes onward; a branch does not advance the "+
+				"execution (its join does) — put the successor after the join instead", n.ID)
 		}
 	}
-
-	return nil
 }
 
-func (f *Flow) validateJoinFan(n *Node) error {
-	var fan string
+func (f *Flow) validateJoinFan(p *problems, n *Node) {
+	fan, ok := f.fanOf(n.ID)
+	if !ok {
+		p.add(n.ID, "", nil, "join is not the next of any fanout (it would never be reached)")
 
-	for fo, j := range f.joinOf {
-		if j == n.ID {
-			fan = fo
-		}
-	}
-
-	if fan == "" {
-		return f.errorf("join %q is not the next of any fanout (it would never be reached)", n.ID)
+		return
 	}
 
 	branches := map[string]bool{}
@@ -142,43 +145,62 @@ func (f *Flow) validateJoinFan(n *Node) error {
 		branches[b] = true
 	}
 
-	for _, w := range n.WaitFor {
+	for i, w := range n.WaitFor {
 		if !branches[w] {
-			return f.errorf("join %q waits for %q, which is not a branch of its fanout %q (it would never settle)",
-				n.ID, w, fan)
+			p.add(n.ID, fmt.Sprintf("wait_for[%d]", i), nil,
+				"waits for %q, which is not a branch of its fanout %q (it would never settle)", w, fan)
 		}
 	}
 
 	if kind, q := n.JoinKind(); kind == JoinQuorum && q > len(f.WaitFor(n.ID)) {
-		return f.errorf("join %q: quorum:%d exceeds the %d awaited branches", n.ID, q, len(f.WaitFor(n.ID)))
+		p.add(n.ID, fPolicy, nil, "quorum:%d exceeds the %d awaited branches", q, len(f.WaitFor(n.ID)))
 	}
-
-	return nil
 }
+
+// route is one ordinary routing transition: the field it is declared in and
+// its target node.
+type route struct{ field, to string }
 
 // routes returns every ordinary routing transition out of n (not fanout
 // branches): next, choice rule targets, await on_timeout, on_failure, dynamic
 // targets.
-func routes(n *Node) []string {
-	var out []string
+func routes(n *Node) []route {
+	var out []route
 
 	if n.Next != "" {
-		out = append(out, n.Next)
+		out = append(out, route{fNext, n.Next})
 	}
 
-	for _, r := range n.Rules {
-		out = append(out, r.To)
+	for i, r := range n.Rules {
+		out = append(out, route{fmt.Sprintf("rules[%d].to", i), r.To})
 	}
 
 	if n.OnTimeout != "" {
-		out = append(out, n.OnTimeout)
+		out = append(out, route{fOnTimeout, n.OnTimeout})
 	}
 
 	if n.OnFailure != "" {
-		out = append(out, n.OnFailure)
+		out = append(out, route{fOnFailure, n.OnFailure})
 	}
 
-	return append(out, n.Dynamic...)
+	for i, d := range n.Dynamic {
+		out = append(out, route{fmt.Sprintf("dynamic[%d]", i), d})
+	}
+
+	return out
+}
+
+// successors returns every node n can transfer control to: its routes and
+// its fanout branches.
+func successors(n *Node) []string {
+	rs := routes(n)
+	out := make([]string, 0, len(rs)+len(n.Branches))
+
+	for _, r := range rs {
+		out = append(out, r.to)
+	}
+
+	return append(out, n.Branches...)
 }
 
 // rejectBranchEntry refuses any ordinary routing into a fan-out branch or into
@@ -186,43 +208,48 @@ func routes(n *Node) []string {
 // would run alone with nowhere to advance, and the execution would report
 // completed with the fan and everything after it skipped — the worst outcome a
 // validator can permit.
-func (f *Flow) rejectBranchEntry() error {
+func (f *Flow) rejectBranchEntry(p *problems) {
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 
-		for _, to := range routes(n) {
-			if owner, isBranch := f.branchOf[to]; isBranch {
-				return f.errorf("node %q routes to %q, a branch of fanout %q; route to %q instead",
-					n.ID, to, owner, owner)
+		for _, r := range routes(n) {
+			if owner, isBranch := f.branchOf[r.to]; isBranch {
+				p.add(n.ID, r.field, nil, "routes to %q, a branch of fanout %q; route to %q instead",
+					r.to, owner, owner)
+
+				continue
 			}
 
-			if f.byID[to].Type == NodeJoin && f.joinOf[n.ID] != to {
-				return f.errorf("node %q routes to join %q; a join is reached only through its fanout", n.ID, to)
+			if f.byID[r.to].Type == NodeJoin && f.joinOf[n.ID] != r.to {
+				p.add(n.ID, r.field, nil, "routes to join %q; a join is reached only through its fanout", r.to)
 			}
 		}
 	}
-
-	return nil
 }
 
 // resolveStart sets the entry node: the explicit start, or the unique node
 // with no inbound transition. The no-start error names what routes into each
 // node, because the usual cause is a retry loop back to the first node and the
-// author needs the reference to change (or an explicit start).
-func (f *Flow) resolveStart() error {
+// author needs the reference to change (or an explicit start). It reports
+// whether a start was resolved.
+func (f *Flow) resolveStart(p *problems) bool {
 	if f.Start != "" {
 		n := f.byID[f.Start]
 		if n == nil {
-			return f.errorf("start references unknown node %q", f.Start)
+			p.add("", "start", nil, "references unknown node %q", f.Start)
+
+			return false
 		}
 
 		if _, isBranch := f.branchOf[n.ID]; isBranch || n.Type == NodeJoin {
-			return f.errorf("start node %q must not be a fanout branch or a join", n.ID)
+			p.add("", "start", nil, "start node %q must not be a fanout branch or a join", n.ID)
+
+			return false
 		}
 
 		f.startID = n.ID
 
-		return nil
+		return true
 	}
 
 	inbound := map[string]string{}
@@ -230,7 +257,7 @@ func (f *Flow) resolveStart() error {
 	for i := range f.Nodes {
 		n := &f.Nodes[i]
 
-		for _, to := range append(routes(n), n.Branches...) {
+		for _, to := range successors(n) {
 			if _, seen := inbound[to]; !seen {
 				inbound[to] = n.ID
 			}
@@ -249,32 +276,34 @@ func (f *Flow) resolveStart() error {
 	case 1:
 		f.startID = starts[0]
 
-		return nil
+		return true
 	case 0:
 		parts := make([]string, 0, len(f.Nodes))
 		for i := range f.Nodes {
 			parts = append(parts, fmt.Sprintf("%q by %q", f.Nodes[i].ID, inbound[f.Nodes[i].ID]))
 		}
 
-		return f.errorf("no start node (every node is routed into: %s); set start: explicitly",
+		p.add("", "start", nil, "no start node (every node is routed into: %s); set start: explicitly",
 			strings.Join(parts, ", "))
 	default:
-		return f.errorf("multiple start nodes %v; set start: explicitly or connect them", starts)
+		p.add("", "start", nil, "multiple start nodes %v; set start: explicitly or connect them", starts)
 	}
+
+	return false
 }
 
 // rejectUnreachable refuses nodes no execution can ever visit: dead
-// configuration is almost always a typo'd route.
-func (f *Flow) rejectUnreachable() error {
+// configuration is almost always a typo'd route. Each unreachable node is
+// reported on its own.
+func (f *Flow) rejectUnreachable(p *problems) {
 	seen := map[string]bool{f.startID: true}
 	stack := []string{f.startID}
 
 	for len(stack) > 0 {
 		id := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		n := f.byID[id]
 
-		for _, next := range append(routes(n), n.Branches...) {
+		for _, next := range successors(f.byID[id]) {
 			if !seen[next] {
 				seen[next] = true
 
@@ -283,19 +312,9 @@ func (f *Flow) rejectUnreachable() error {
 		}
 	}
 
-	var unreachable []string
-
 	for i := range f.Nodes {
 		if !seen[f.Nodes[i].ID] {
-			unreachable = append(unreachable, f.Nodes[i].ID)
+			p.add(f.Nodes[i].ID, "", nil, "unreachable node: not connected to the start node %q", f.startID)
 		}
 	}
-
-	if len(unreachable) > 0 {
-		sort.Strings(unreachable)
-
-		return f.errorf("unreachable node(s) %v: not connected to the start node %q", unreachable, f.startID)
-	}
-
-	return nil
 }

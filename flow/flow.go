@@ -18,6 +18,9 @@
 // built in Go), validated, hashed and stored immutably; every execution is bound
 // to the hash of the definition it started with.
 //
+// Validation reports every problem at once; each is a *ValidationError naming
+// the node and YAML field at fault (see ValidationErrors).
+//
 // packtrail is agnostic: a task is a unit of work executed by a worker of the
 // given kind, whatever that worker does.
 package flow

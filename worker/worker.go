@@ -29,6 +29,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/henomis/packtrail/internal/apierr"
 	"github.com/henomis/packtrail/internal/blob"
 	"github.com/henomis/packtrail/internal/cmd"
 	"github.com/henomis/packtrail/internal/consume"
@@ -225,7 +226,13 @@ func New(nc *nats.Conn, kind string, handler Handler, opts ...Option) (*Worker, 
 	return w, nil
 }
 
-// Run serves jobs until ctx is done, then drains in-flight jobs.
+// ErrNotProvisioned is returned by Run when the namespace does not exist yet
+// (no engine has run Init or Run on it). It is the same value as
+// packtrail.ErrNotProvisioned; a worker started before the engine may retry.
+var ErrNotProvisioned = apierr.ErrNotProvisioned
+
+// Run serves jobs until ctx is done, then drains in-flight jobs. It returns
+// ErrNotProvisioned if the namespace does not exist.
 func (w *Worker) Run(ctx context.Context) error {
 	in, err := infra.New(w.nc, names.New(w.ns), w.logger)
 	if err != nil {

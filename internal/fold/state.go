@@ -76,7 +76,10 @@ type Task struct {
 	Status     string          `json:"status"`
 	Item       json.RawMessage `json:"item,omitempty"`
 	Resume     json.RawMessage `json:"resume,omitempty"`
-	Interrupt  json.RawMessage `json:"interrupt,omitempty"`
+	// Interrupt is the payload of the instance's last interrupt: what it is
+	// waiting on while interrupted, then, once resumed, what it was resumed
+	// from (kept across the attempts of the resumed run, absent otherwise).
+	Interrupt json.RawMessage `json:"interrupt,omitempty"`
 }
 
 // Fan is an open fan-out.
@@ -456,6 +459,7 @@ func (s *State) applyNode(def *flow.Flow, ev event.Event) error {
 
 		t.Status = TaskInterrupted
 		t.Interrupt = d.Payload
+		s.addUsage(d.Usage)
 	case *event.NodeCancel:
 		s.settleTask(d.Key, BranchCancelled)
 	case *event.Choice:
@@ -470,10 +474,18 @@ func (s *State) applyNode(def *flow.Flow, ev event.Event) error {
 }
 
 func (s *State) applyScheduled(d *event.Scheduled) {
-	s.Tasks[d.Key] = &Task{
+	t := &Task{
 		Key: d.Key, Node: d.Node, Kind: d.Kind, Index: d.Index, Owner: d.Owner,
 		Generation: d.Generation, Attempt: d.Attempt, Status: TaskScheduled, Item: d.Item, Resume: d.Resume,
 	}
+
+	// A resumed instance (the resume itself, its retries, a fork's re-dispatch)
+	// keeps the payload it was interrupted with; a fresh one starts without.
+	if prev := s.Tasks[d.Key]; prev != nil && len(d.Resume) > 0 {
+		t.Interrupt = prev.Interrupt
+	}
+
+	s.Tasks[d.Key] = t
 	s.N = max(s.N, d.Generation)
 
 	if m := s.Maps[d.Owner]; m != nil && d.Node == d.Owner {
@@ -501,9 +513,7 @@ func (s *State) applyNodeDone(def *flow.Flow, d *event.NodeDone) error {
 		s.Channels[name] = v
 	}
 
-	for k, v := range d.Usage {
-		s.Counters[k] += v
-	}
+	s.addUsage(d.Usage)
 
 	if m := s.Maps[t.Owner]; m != nil && t.Node == t.Owner {
 		m.Outputs[t.Index] = d.Output
@@ -525,6 +535,8 @@ func (s *State) applyNodeFail(d *event.NodeFail) {
 		return
 	}
 
+	s.addUsage(d.Usage)
+
 	if d.WillRetry {
 		t.Status = TaskRetrying
 
@@ -541,6 +553,13 @@ func (s *State) applyNodeFail(d *event.NodeFail) {
 	s.Errors[t.Node] = ne
 	s.LastNode = t.Node
 	s.settleTask(d.Key, BranchFailed)
+}
+
+// addUsage adds the usage an attempt reported to the counters.
+func (s *State) addUsage(u map[string]float64) {
+	for k, v := range u {
+		s.Counters[k] += v
+	}
 }
 
 // settleTask removes an instance and records its outcome on its fan-out.

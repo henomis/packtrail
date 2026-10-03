@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -138,6 +140,134 @@ nodes:
 	st = e.Completed(id)
 	if string(st.Results["draft"]) != `{"answer":"yes"}` {
 		t.Fatalf("draft %s", st.Results["draft"])
+	}
+}
+
+// TestM2ResumedJobSeesInterruptPayload: every attempt of a resumed job gets
+// the payload it interrupted with, claim-checked when large; a rerun of the
+// node starts without it.
+func TestM2ResumedJobSeesInterruptPayload(t *testing.T) {
+	e := NewEnv(t, []string{`
+name: ask
+nodes:
+  - id: draft
+    type: task
+    kind: asker
+    retry: {max_attempts: 2, delay: 50ms}
+`})
+
+	size := 2 * 1024 * 1024
+	if raceEnabled {
+		size = 1536 * 1024
+	}
+
+	question := strings.Repeat("q", size)
+
+	var bad atomic.Value
+
+	e.Worker("asker", func(_ context.Context, j *worker.Job) (*worker.Result, error) {
+		var asked struct{ Question string }
+
+		interrupted, err := j.Interrupted(&asked)
+		if err != nil {
+			return nil, worker.Permanent(err)
+		}
+
+		resumed, _ := j.Resumed(nil)
+
+		switch {
+		case resumed != interrupted:
+			bad.Store("resumed " + strconv.FormatBool(resumed) + ", interrupted " + strconv.FormatBool(interrupted))
+		case !resumed:
+			return nil, worker.Interrupt(map[string]any{"question": question})
+		case asked.Question != question:
+			bad.Store("attempt " + strconv.Itoa(j.Attempt) + ": payload of " + strconv.Itoa(len(asked.Question)))
+		case j.Attempt == 1:
+			return nil, errors.New("transient")
+		}
+
+		return &worker.Result{Output: map[string]any{"asked": len(asked.Question)}}, nil
+	}, worker.WithAckWait(10*time.Second))
+
+	id := e.Start("ask", nil)
+	e.WaitStatus(id, packtrail.StatusWaiting)
+
+	if err := e.Client.Resume(e.Ctx, id, "draft", "yes"); err != nil {
+		t.Fatal(err)
+	}
+
+	st := e.Completed(id)
+
+	if v := bad.Load(); v != nil {
+		t.Fatal(v)
+	}
+
+	if string(st.Results["draft"]) != `{"asked":`+strconv.Itoa(size)+`}` {
+		t.Fatalf("draft %s", st.Results["draft"])
+	}
+
+	re, err := e.Client.Rerun(e.Ctx, id, "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.WaitStatus(re, packtrail.StatusWaiting)
+
+	if v := bad.Load(); v != nil {
+		t.Fatal(v)
+	}
+}
+
+// TestM2UsageOfFailedAndInterruptedRuns: worker.WithUsage counts the spend of
+// runs that fail or interrupt, and a budget exceeded by an interrupt fails the
+// execution at that node instead of pausing it.
+func TestM2UsageOfFailedAndInterruptedRuns(t *testing.T) {
+	e := NewEnv(t, []string{`
+name: spend
+budget: {tokens: 35}
+nodes:
+  - id: agent
+    type: task
+    kind: spender
+    retry: {max_attempts: 3, delay: 50ms}
+`})
+	e.Worker("spender", func(_ context.Context, j *worker.Job) (*worker.Result, error) {
+		var in struct{ Cost float64 }
+
+		_ = j.Input(&in)
+		usage := map[string]float64{"tokens": in.Cost}
+
+		if resumed, _ := j.Resumed(nil); resumed {
+			return &worker.Result{Usage: usage}, nil
+		}
+
+		if j.Attempt == 1 {
+			return nil, fmt.Errorf("llm: %w", worker.WithUsage(errors.New("schema mismatch"), usage))
+		}
+
+		return nil, worker.WithUsage(worker.Interrupt("which color?"), usage)
+	})
+
+	// 10 (failed) + 10 (interrupted) + 10 (completed).
+	id := e.Start("spend", map[string]any{"cost": 10})
+	st := e.WaitStatus(id, packtrail.StatusWaiting)
+
+	if st.Counters["tokens"] != 20 {
+		t.Fatalf("tokens while paused %g", st.Counters["tokens"])
+	}
+
+	if err := e.Client.Resume(e.Ctx, id, "agent", "red"); err != nil {
+		t.Fatal(err)
+	}
+
+	if st = e.Completed(id); st.Counters["tokens"] != 30 {
+		t.Fatalf("tokens %g", st.Counters["tokens"])
+	}
+
+	// 20 (failed) + 20 (interrupted) > 35: no question is asked.
+	st = e.Wait(e.Start("spend", map[string]any{"cost": 20}))
+	if st.Status != packtrail.StatusFailed || st.Reason != event.ReasonBudget || st.FailedNode != "agent" {
+		t.Fatalf("status %s reason %s node %q", st.Status, st.Reason, st.FailedNode)
 	}
 }
 

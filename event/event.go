@@ -220,21 +220,23 @@ type NodeDone struct {
 // NodeFail is the payload of NodeFailed. WillRetry says whether another
 // attempt follows (immediately or after a retry timer).
 type NodeFail struct {
-	Key        string `json:"key"`
-	Node       string `json:"node"`
-	Generation int    `json:"generation"`
-	Attempt    int    `json:"attempt"`
-	Error      string `json:"error"`
-	Reason     string `json:"reason"`
-	WillRetry  bool   `json:"will_retry"`
+	Key        string             `json:"key"`
+	Node       string             `json:"node"`
+	Generation int                `json:"generation"`
+	Attempt    int                `json:"attempt"`
+	Error      string             `json:"error"`
+	Reason     string             `json:"reason"`
+	WillRetry  bool               `json:"will_retry"`
+	Usage      map[string]float64 `json:"usage,omitempty"`
 }
 
 // Interrupted is the payload of NodeInterrupted.
 type Interrupted struct {
-	Key        string          `json:"key"`
-	Node       string          `json:"node"`
-	Generation int             `json:"generation"`
-	Payload    json.RawMessage `json:"payload,omitempty"`
+	Key        string             `json:"key"`
+	Node       string             `json:"node"`
+	Generation int                `json:"generation"`
+	Payload    json.RawMessage    `json:"payload,omitempty"`
+	Usage      map[string]float64 `json:"usage,omitempty"`
 }
 
 // NodeCancel is the payload of NodeCancelled: an in-flight instance abandoned

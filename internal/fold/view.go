@@ -22,18 +22,19 @@ import (
 
 // Context is the view of an execution handed to a worker and to expressions.
 type Context struct {
-	Input    json.RawMessage            `json:"input"`
-	Channels map[string]json.RawMessage `json:"channels"`
-	Results  map[string]json.RawMessage `json:"results"`
-	LastNode string                     `json:"last_node"`
-	Visits   map[string]int             `json:"visits"`
-	Signals  map[string]json.RawMessage `json:"signals"`
-	Branches map[string]string          `json:"branches"`
-	Counters map[string]float64         `json:"counters"`
-	Errors   map[string]NodeError       `json:"errors"`
-	Item     json.RawMessage            `json:"item,omitempty"`
-	Index    *int                       `json:"index,omitempty"`
-	Resume   json.RawMessage            `json:"resume,omitempty"`
+	Input     json.RawMessage            `json:"input"`
+	Channels  map[string]json.RawMessage `json:"channels"`
+	Results   map[string]json.RawMessage `json:"results"`
+	LastNode  string                     `json:"last_node"`
+	Visits    map[string]int             `json:"visits"`
+	Signals   map[string]json.RawMessage `json:"signals"`
+	Branches  map[string]string          `json:"branches"`
+	Counters  map[string]float64         `json:"counters"`
+	Errors    map[string]NodeError       `json:"errors"`
+	Item      json.RawMessage            `json:"item,omitempty"`
+	Index     *int                       `json:"index,omitempty"`
+	Resume    json.RawMessage            `json:"resume,omitempty"`
+	Interrupt json.RawMessage            `json:"interrupt,omitempty"`
 }
 
 // ContextView returns the context view of the state. For a task instance,
@@ -50,6 +51,9 @@ func (s *State) ContextView(t *Task) Context {
 
 	if t != nil {
 		c.Resume = t.Resume
+		if len(t.Resume) > 0 {
+			c.Interrupt = t.Interrupt
+		}
 
 		if m := s.Maps[t.Owner]; m != nil && t.Node == t.Owner {
 			idx := t.Index

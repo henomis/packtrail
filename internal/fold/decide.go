@@ -503,7 +503,7 @@ func (d *decider) complete(p *cmd.CompleteData) error {
 	if problem, retryable := d.checkCompletion(n, t, output, p); problem != "" {
 		reason := event.ReasonInvalidOutput
 
-		return d.taskFailed(t, problem, retryable, reason)
+		return d.taskFailed(t, problem, retryable, reason, p.Usage)
 	}
 
 	err := d.emit(event.NodeCompleted, &event.NodeDone{
@@ -549,10 +549,14 @@ func (d *decider) checkCompletion(n *flow.Node, t *Task, output json.RawMessage,
 	return "", false
 }
 
-func (d *decider) overBudget() string {
+func (d *decider) overBudget() string { return d.overBudgetWith(nil) }
+
+// overBudgetWith reports the first budget the counters exceed once usage is
+// added to them.
+func (d *decider) overBudgetWith(usage map[string]float64) string {
 	for _, k := range slices.Sorted(maps.Keys(d.def.Budget)) {
-		if d.st.Counters[k] > d.def.Budget[k] {
-			return fmt.Sprintf("counter %q = %g exceeds budget %g", k, d.st.Counters[k], d.def.Budget[k])
+		if v := d.st.Counters[k] + usage[k]; v > d.def.Budget[k] {
+			return fmt.Sprintf("counter %q = %g exceeds budget %g", k, v, d.def.Budget[k])
 		}
 	}
 
@@ -587,24 +591,30 @@ func (d *decider) failTask(p *cmd.FailData) error {
 		reason = event.ReasonError
 	}
 
-	return d.taskFailed(t, p.Error, p.Retryable, reason)
+	return d.taskFailed(t, p.Error, p.Retryable, reason, p.Usage)
 }
 
-// taskFailed records a failed attempt: retry when allowed, otherwise settle
-// the instance as failed and let its owner react.
-func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string) error {
+// taskFailed records a failed attempt and the usage it reported: retry when
+// allowed, otherwise settle the instance as failed and let its owner react. A
+// usage that exceeds the budget fails the execution instead.
+func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string, usage map[string]float64) error {
 	n := d.def.Node(t.Node)
-	willRetry := retryable && t.Attempt < n.MaxAttempts()
+	over := d.overBudgetWith(usage)
+	willRetry := retryable && t.Attempt < n.MaxAttempts() && over == ""
 
 	// Copy what we need: Apply removes a settled task.
 	tc := *t
 
 	err := d.emit(event.NodeFailed, &event.NodeFail{
 		Key: tc.Key, Node: tc.Node, Generation: tc.Generation, Attempt: tc.Attempt, Error: msg, Reason: reason,
-		WillRetry: willRetry,
+		WillRetry: willRetry, Usage: usage,
 	})
 	if err != nil {
 		return err
+	}
+
+	if over != "" {
+		return d.fail(event.ReasonBudget, over, tc.Node)
 	}
 
 	if willRetry {
@@ -658,9 +668,21 @@ func (d *decider) interrupt(p *cmd.InterruptData) error {
 		return nil
 	}
 
-	return d.emit(event.NodeInterrupted, &event.Interrupted{
-		Key: t.Key, Node: t.Node, Generation: t.Generation, Payload: p.Payload,
+	node := t.Node
+
+	err := d.emit(event.NodeInterrupted, &event.Interrupted{
+		Key: t.Key, Node: node, Generation: t.Generation, Payload: p.Payload, Usage: p.Usage,
 	})
+	if err != nil {
+		return err
+	}
+
+	// Nobody is asked a question the budget can no longer pay for.
+	if over := d.overBudget(); over != "" {
+		return d.fail(event.ReasonBudget, over, node)
+	}
+
+	return nil
 }
 
 func (d *decider) resume(p *cmd.ResumeData) error {
@@ -713,7 +735,7 @@ func (d *decider) timer(p *cmd.TimerData) error {
 			return nil
 		}
 
-		return d.taskFailed(t, "attempt timed out", true, event.ReasonTimeout)
+		return d.taskFailed(t, "attempt timed out", true, event.ReasonTimeout, nil)
 	case event.TimerAwait:
 		return d.awaitTimeout(tc)
 	default:

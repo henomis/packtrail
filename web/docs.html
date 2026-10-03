@@ -280,7 +280,7 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
           <tr><td>start</td><td>Entry node. When omitted, the unique node with no inbound route.</td></tr>
           <tr><td>channels</td><td>Typed state: <code>{reducer, default}</code> per channel — see <a href="#channels">channels</a>.</td></tr>
           <tr><td>nodes</td><td>The graph. Node ids are tokens and unique; <code>next</code> is the static successor (empty on a terminal node).</td></tr>
-          <tr><td>budget</td><td>Caps on generic counters reported by workers (<code>Result.Usage</code>) and the built-in <code>steps</code>. Exceeding one fails the execution with <code>budget_exceeded</code>.</td></tr>
+          <tr><td>budget</td><td>Caps on generic counters reported by workers (<code>Result.Usage</code>, <code>worker.WithUsage</code> for runs that fail or interrupt) and the built-in <code>steps</code>. Exceeding one fails the execution with <code>budget_exceeded</code>.</td></tr>
           <tr><td>max_steps</td><td>Recursion limit: total node entries (default 1000). Exceeding it fails with <code>max_steps</code>.</td></tr>
           <tr><td>search_attributes</td><td>Expressions evaluated on the start input and indexed, for <code>List</code> / <code>packtrail list -attr</code>.</td></tr>
           <tr><td>retention</td><td>Archive a finished execution after this long (default: never). Archived executions stay readable.</td></tr>
@@ -700,6 +700,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Context</td><td>The raw execution view (<a href="#expressions">context variables</a>).</td></tr>
           <tr><td>Input, Channel, Result, Signal, Item</td><td>Decode a part of the context into a Go value.</td></tr>
           <tr><td>Resumed(&amp;v)</td><td>Whether this run resumes an interrupt, and the resume value.</td></tr>
+          <tr><td>Interrupted(&amp;v)</td><td>On a resumed run (every attempt), the payload this node interrupted with.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
           <tr><td>Traceparent</td><td>W3C trace context propagated from the start command.</td></tr>
@@ -714,6 +715,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>nil, err</td><td>Fail the attempt; retried by the node's policy.</td></tr>
           <tr><td>worker.Permanent(err)</td><td>Fail without retry; <code>on_failure</code> or execution failure follows.</td></tr>
           <tr><td>worker.Interrupt(payload)</td><td>Pause at this node until <code>Client.Resume</code> — see <a href="#human">human in the loop</a>.</td></tr>
+          <tr><td>worker.WithUsage(err, usage)</td><td>Any of the errors above, plus the usage the run spent: added to the counters like <code>Result.Usage</code>, for every attempt. It composes with <code>Permanent</code>, <code>Interrupt</code> and <code>%w</code> in any order (the outermost counts). A counter past its budget fails the execution at this node: no retry, no pause. A run that never returns (cancelled, timed out) reports nothing.</td></tr>
         </tbody>
       </table>
       <h3>Cancellation</h3>
@@ -784,7 +786,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
         <thead><tr><th>Mechanism</th><th>Use it when</th></tr></thead>
         <tbody>
           <tr><td>await + Signal</td><td>The graph knows it has to wait for an external event (an approval, a webhook). Durable timeout and route.</td></tr>
-          <tr><td>Interrupt + Resume</td><td>A worker discovers mid-task that it needs input. It returns <code>worker.Interrupt(question)</code>; the execution is <code>waiting</code>; <code>Client.Resume(exec, node, answer)</code> runs the node again, where <code>j.Resumed(&amp;answer)</code> is true.</td></tr>
+          <tr><td>Interrupt + Resume</td><td>A worker discovers mid-task that it needs input. It returns <code>worker.Interrupt(question)</code>; the execution is <code>waiting</code>; <code>Client.Resume(exec, node, answer)</code> runs the node again, where <code>j.Resumed(&amp;answer)</code> is true and <code>j.Interrupted(&amp;question)</code> returns the question, on every attempt.</td></tr>
           <tr><td>Update</td><td>Someone outside the graph corrects the state of a running execution. Validated against the channels, applied once per update id, synchronous.</td></tr>
         </tbody>
       </table>
@@ -1159,7 +1161,7 @@ unquarantine &lt;exec&gt;</code></pre>
  <span class="s">"key"</span>: <span class="s">"n"</span>, <span class="s">"index"</span>: <span class="num">0</span>, <span class="s">"generation"</span>: <span class="num">3</span>, <span class="s">"attempt"</span>: <span class="num">1</span>,
  <span class="s">"context"</span>: {<span class="s">"input"</span>: {}, <span class="s">"channels"</span>: {}, <span class="s">"results"</span>: {}, <span class="s">"last_node"</span>: <span class="s">""</span>, <span class="s">"visits"</span>: {},
              <span class="s">"signals"</span>: {}, <span class="s">"branches"</span>: {}, <span class="s">"counters"</span>: {}, <span class="s">"errors"</span>: {},
-             <span class="s">"item"</span>: …, <span class="s">"index"</span>: …, <span class="s">"resume"</span>: …},
+             <span class="s">"item"</span>: …, <span class="s">"index"</span>: …, <span class="s">"resume"</span>: …, <span class="s">"interrupt"</span>: …},
  <span class="s">"reply"</span>: <span class="s">"&lt;ns&gt;.cmd.&lt;p&gt;.e1"</span>, <span class="s">"cache_key"</span>: <span class="s">"…"</span>, <span class="s">"concurrency"</span>: {<span class="s">"key"</span>: <span class="s">"…"</span>, <span class="s">"max"</span>: <span class="num">2</span>},
  <span class="s">"traceparent"</span>: <span class="s">"…"</span>}</code></pre>
       </div>

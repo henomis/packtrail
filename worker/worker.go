@@ -431,26 +431,34 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 	id := wire.CmdID(wj.ExecID, wj.Key, wj.Generation, wj.Attempt)
 
 	if err := json.Unmarshal(wj.Context, &job.Context); err != nil {
-		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error(), false)
+		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error())
 	}
 
 	res, err := w.call(ctx, job)
 
+	return resultCmd(id, wj, ref, res, err)
+}
+
+// resultCmd turns what a handler returned into the command answering its job.
+func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error) (cmd.Command, error) {
 	var (
 		intr *InterruptError
 		c    cmd.Command
+		err  error
 	)
 
 	switch {
-	case errors.As(err, &intr):
+	case errors.As(herr, &intr):
 		p, merr := marshalOutput(intr.Payload)
 		if merr != nil {
-			return failCmd(id, wj.ExecID, ref, merr.Error(), false)
+			return failCmd(id, wj.ExecID, ref, merr.Error())
 		}
 
-		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p})
-	case err != nil:
-		return failCmd(id, wj.ExecID, ref, err.Error(), !IsPermanent(err))
+		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p, Usage: usageOf(herr)})
+	case herr != nil:
+		c, err = cmd.New(id, cmd.Fail, wj.ExecID, cmd.FailData{
+			TaskRef: ref, Error: herr.Error(), Retryable: !IsPermanent(herr), Usage: usageOf(herr),
+		})
 	default:
 		c, err = completeCmd(id, wj, ref, res)
 	}
@@ -458,7 +466,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 	// A result that cannot be encoded (NaN usage, invalid raw JSON) would
 	// otherwise leave an empty command and a task that never settles.
 	if err != nil {
-		return failCmd(id, wj.ExecID, ref, err.Error(), false)
+		return failCmd(id, wj.ExecID, ref, err.Error())
 	}
 
 	return c, nil
@@ -477,8 +485,9 @@ func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {
 	return w.handler(ctx, job)
 }
 
-func failCmd(id, execID string, ref cmd.TaskRef, msg string, retryable bool) (cmd.Command, error) {
-	return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg, Retryable: retryable})
+// failCmd fails an attempt without retry: its answer cannot be encoded.
+func failCmd(id, execID string, ref cmd.TaskRef, msg string) (cmd.Command, error) {
+	return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg})
 }
 
 func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Command, error) {
@@ -488,7 +497,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 
 	out, err := marshalOutput(res.Output)
 	if err != nil {
-		return failCmd(id, wj.ExecID, ref, err.Error(), false)
+		return failCmd(id, wj.ExecID, ref, err.Error())
 	}
 
 	var writes map[string]json.RawMessage
@@ -499,7 +508,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 		for k, v := range res.Writes {
 			b, lerr := marshalOutput(v)
 			if lerr != nil {
-				return failCmd(id, wj.ExecID, ref, lerr.Error(), false)
+				return failCmd(id, wj.ExecID, ref, lerr.Error())
 			}
 
 			if b == nil {

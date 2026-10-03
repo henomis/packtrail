@@ -88,6 +88,9 @@ type Context struct {
 	Item   json.RawMessage      `json:"item,omitempty"`
 	Index  *int                 `json:"index,omitempty"`
 	Resume json.RawMessage      `json:"resume,omitempty"`
+	// Interrupt is the payload the instance interrupted with, on every
+	// attempt of its resumed run; absent otherwise.
+	Interrupt json.RawMessage `json:"interrupt,omitempty"`
 }
 
 func decodeInto(raw json.RawMessage, v any) error {
@@ -130,6 +133,21 @@ func (j *Job) Resumed(v any) (bool, error) {
 	return true, json.Unmarshal(j.Context.Resume, v)
 }
 
+// Interrupted reports whether the job is a resumed run carrying the payload
+// its instance interrupted with (Interrupt(payload)), and decodes it into v
+// (when v is non-nil). An interrupt without payload resumes with false.
+func (j *Job) Interrupted(v any) (bool, error) {
+	if len(j.Context.Interrupt) == 0 {
+		return false, nil
+	}
+
+	if v == nil {
+		return true, nil
+	}
+
+	return true, json.Unmarshal(j.Context.Interrupt, v)
+}
+
 // Result is the outcome of a successful job.
 type Result struct {
 	// Output is the node output: a JSON object (a map, a struct, or a
@@ -165,6 +183,40 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &p)
 }
 
+// UsageError carries the usage of a run that ended with an error (see
+// WithUsage). It unwraps to Err, so the error is classified as Err is.
+type UsageError struct {
+	Err   error
+	Usage map[string]float64
+}
+
+func (e *UsageError) Error() string { return e.Err.Error() }
+func (e *UsageError) Unwrap() error { return e.Err }
+
+// WithUsage attaches usage counters to the error a handler returns, so a run
+// that interrupts or fails still adds what it spent to the execution's
+// counters (budgets), as Result.Usage does for a run that completes. It
+// composes with Interrupt, Permanent and %w wrapping in any order; when
+// several are nested, the outermost counts. Every attempt's usage is added,
+// once. WithUsage(nil, …) is nil: a successful run reports Result.Usage.
+func WithUsage(err error, usage map[string]float64) error {
+	if err == nil {
+		return nil
+	}
+
+	return &UsageError{Err: err, Usage: usage}
+}
+
+// usageOf returns the usage attached to err, if any.
+func usageOf(err error) map[string]float64 {
+	var u *UsageError
+	if errors.As(err, &u) {
+		return u.Usage
+	}
+
+	return nil
+}
+
 // InterruptError pauses the execution at this node until Client.Resume.
 type InterruptError struct {
 	Payload any
@@ -173,7 +225,8 @@ type InterruptError struct {
 func (e *InterruptError) Error() string { return "worker: interrupted" }
 
 // Interrupt returns an error that interrupts the node with payload (shown to
-// whoever resumes it). On resume the node runs again with Job.Resumed true.
+// whoever resumes it). On resume the node runs again with Job.Resumed true
+// and the payload in Job.Interrupted.
 func Interrupt(payload any) error { return &InterruptError{Payload: payload} }
 
 func marshalOutput(v any) (json.RawMessage, error) {

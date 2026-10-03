@@ -513,7 +513,8 @@ func CacheKey(flowHash, node string, v fold.Context) string {
 		S      map[string]json.RawMessage
 		It, Re json.RawMessage
 		Idx    *int
-	}{flowHash, node, v.Input, v.Channels, v.Results, v.Signals, v.Item, v.Resume, v.Index})
+		In     json.RawMessage `json:",omitempty"`
+	}{flowHash, node, v.Input, v.Channels, v.Results, v.Signals, v.Item, v.Resume, v.Index, v.Interrupt})
 
 	sum := sha256.Sum256(b)
 

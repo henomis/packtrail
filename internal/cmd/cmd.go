@@ -122,16 +122,18 @@ type CompleteData struct {
 type FailData struct {
 	TaskRef
 
-	Error     string `json:"error"`
-	Retryable bool   `json:"retryable"`
-	Reason    string `json:"reason,omitempty"`
+	Error     string             `json:"error"`
+	Retryable bool               `json:"retryable"`
+	Reason    string             `json:"reason,omitempty"`
+	Usage     map[string]float64 `json:"usage,omitempty"`
 }
 
 // InterruptData is the payload of Interrupt.
 type InterruptData struct {
 	TaskRef
 
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Payload json.RawMessage    `json:"payload,omitempty"`
+	Usage   map[string]float64 `json:"usage,omitempty"`
 }
 
 // ResumeData is the payload of Resume: re-run the interrupted node with Value

@@ -245,13 +245,20 @@ func TestValidateRejects(t *testing.T) {
 		{"fanout no next", "name: x\nnodes: [{id: f, type: fanout, branches: [a]}, {id: a, type: task, kind: k}]", "next is required"},
 		{"branch twice", "name: x\nnodes: [{id: f, type: fanout, branches: [a, a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}]", "twice"},
 		{"shared branch", fanYAML("[{id: f, type: fanout, branches: [a], next: j}, {id: g, type: fanout, branches: [a], next: j2}, {id: a, type: task, kind: k}, {id: j, type: join, next: g}, {id: j2, type: join}]"), "at most one fanout"},
-		{"branch non-task", "name: x\nnodes: [{id: f, type: fanout, branches: [c], next: j}, {id: c, type: choice, rules: [{default: true, to: j}]}, {id: j, type: join}]", "must be task nodes"},
+		{"branch non-task", "name: x\nnodes: [{id: f, type: fanout, branches: [c], next: j}, {id: c, type: choice, rules: [{default: true, to: j}]}, {id: j, type: join}]", "must be task or subflow nodes"},
 		{"on_failure unknown", "name: x\nnodes: [{id: a, type: task, kind: k, on_failure: zz}]", "on_failure references unknown node"},
 		{"on_failure self", "name: x\nstart: a\nnodes: [{id: a, type: task, kind: k, on_failure: a}]", "on_failure points to itself"},
 		{"on_failure on await", "name: x\nnodes: [{id: w, type: await, signal: s, timeout: 1m, on_failure: a}, {id: a, type: task, kind: k}]", "do not apply"},
 		{"on_failure on branch", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k, on_failure: h}, {id: j, type: join}, {id: h, type: task, kind: k}]", "settled by its join's policy"},
 		{"on_failure into branch", "name: x\nnodes: [{id: t, type: task, kind: k, on_failure: a, next: f}, {id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}]", "a branch of fanout"},
 		{"branch exit", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k, next: t}, {id: j, type: join, next: t}, {id: t, type: task, kind: k}]", "routes onward"},
+		{"subflow branch exit", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: subflow, flow: c, next: t}, {id: j, type: join, next: t}, {id: t, type: task, kind: k}]", "routes onward"},
+		{"subflow branch on_failure", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: subflow, flow: c, on_failure: h}, {id: j, type: join}, {id: h, type: task, kind: k}]", "settled by its join's policy"},
+		{"map kind and flow", "name: x\nnodes: [{id: m, type: map, kind: k, flow: c, over: input.xs}]", "not both"},
+		{"map neither", "name: x\nnodes: [{id: m, type: map, over: input.xs}]", "worker kind"},
+		{"map flow retry", "name: x\nnodes: [{id: m, type: map, flow: c, over: input.xs, retry: {max_attempts: 2}}]", "apply to tasks"},
+		{"map kind input", "name: x\nnodes: [{id: m, type: map, kind: k, over: input.xs, input: item}]", "need flow"},
+		{"map flow bad close", "name: x\nnodes: [{id: m, type: map, flow: c, over: input.xs, on_parent_close: keep}]", "unknown on_parent_close"},
 		{"wait foreign", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [t], next: t}, {id: t, type: task, kind: k}]", "not a branch of its fanout"},
 		{"wait dup", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [a, a]}]", "twice"},
 		{"quorum too big", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'quorum:2'}]", "exceeds"},
@@ -399,5 +406,24 @@ func TestNodeMeta(t *testing.T) {
 
 	if pb, _ := plain.JSON(); strings.Contains(string(pb), "meta") || plain.Node("a").MetaJSON() != nil {
 		t.Fatalf("empty meta encoded: %s", pb)
+	}
+}
+
+func TestSubflowBranchesAndMaps(t *testing.T) {
+	f, err := Parse([]byte(`
+name: x
+nodes:
+  - {id: f, type: fanout, branches: [a, b], next: j}
+  - {id: a, type: task, kind: k}
+  - {id: b, type: subflow, flow: child, on_parent_close: abandon}
+  - {id: j, type: join, policy: any, next: m}
+  - {id: m, type: map, flow: child, over: input.xs, input: "{'n': item, 'i': index}", max_parallel: 2}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m := f.Node("m"); m.InputProgram() == nil || m.OverProgram() == nil || m.ParentClose() != ParentCloseCancel {
+		t.Fatal("map with flow not compiled")
 	}
 }

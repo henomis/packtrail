@@ -373,7 +373,7 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
           <tr><td>timeout</td><td>Per-attempt deadline. A late result is ignored; the attempt counts as failed and is retried by the policy.</td></tr>
           <tr><td>retry</td><td><code>{max_attempts, backoff, delay, max_delay}</code>. <code>max_attempts</code> is the total (1 = no retry, at most 64). <code>backoff</code>: <code>fixed</code> (default), <code>linear</code> or <code>exponential</code>; <code>delay</code> defaults to 1s, <code>max_delay</code> to 5m. Backoff waits are durable timers.</td></tr>
           <tr><td>output_schema</td><td>A JSON Schema the output must match; a mismatch fails the attempt with <code>invalid_output</code>. External <code>$ref</code>s are not loaded.</td></tr>
-          <tr><td>cache</td><td><code>{ttl}</code>: reuse a previous result for the same flow version, node and inputs (input, channels, results, signals, item, resume) within the TTL, instead of dispatching a job.</td></tr>
+          <tr><td>cache</td><td><code>{ttl}</code>: reuse a previous result for the same flow version, node and inputs (input, channels, results, signals, item, resume) within the TTL, instead of dispatching a job. A result is stored once its node completes, so runs with the same inputs that start while the first is still working each miss and run the job too: the cache saves repeated work over time, it does not merge concurrent work.</td></tr>
           <tr><td>concurrency</td><td><code>{key, max}</code>: at most <code>max</code> jobs of this node run at once per value of the <code>key</code> expression, across all executions (e.g. per customer).</td></tr>
           <tr><td>dynamic</td><td>Nodes the worker may route to by returning <code>Result.Next</code> (a dynamic edge). Without a <code>next</code> from the worker, <code>next</code> applies.</td></tr>
           <tr><td>next</td><td>Static successor.</td></tr>
@@ -445,14 +445,16 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <h2><span class="dot dot--fan"></span> fanout &amp; join</h2>
       <p>
         A <code>fanout</code> starts its <code>branches</code> in parallel; its <code>next</code> must be the
-        <code>join</code> that closes it. Each branch is a <code>task</code> node with no successor of its own
-        — the join owns what happens after the fan. At most 256 branches; use a <a href="#node-map">map</a>
-        for wider or data-driven fan-outs.
+        <code>join</code> that closes it. Each branch is a <code>task</code> or a
+        <a href="#node-subflow"><code>subflow</code></a> node with no successor of its own — the join owns
+        what happens after the fan. A subflow branch runs any graph (a chain, an await, a nested fan-out)
+        as a child execution and settles with the child. At most 256 branches; use a
+        <a href="#node-map">map</a> for wider or data-driven fan-outs.
       </p>
       <table class="doctable">
         <thead><tr><th>join field</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. Once settled, branches still running are cancelled.</td></tr>
+          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. Once settled, branches still running are cancelled — a subflow branch's child too, unless its <code>on_parent_close</code> is <code>abandon</code>: then it carries on, unlinked from the join.</td></tr>
           <tr><td>wait_for</td><td>The branches the policy counts (default: all branches of the fanout).</td></tr>
           <tr><td>next</td><td>Successor once the policy is met.</td></tr>
           <tr><td>on_failure</td><td>Handler when the policy can no longer be met; without it the execution fails with <code>join_failed</code>.</td></tr>
@@ -506,6 +508,15 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
         position as <code>index</code> (<code>j.Item(&amp;v)</code>, <code>j.Context.Index</code> in Go).
         <code>results.&lt;map&gt;</code> is the list of outputs in item order.
       </p>
+      <p>
+        With <code>flow</code> instead of <code>kind</code>, each item runs that flow as a child execution
+        (LangGraph's <code>Send</code> to a subgraph). The child's input is the item itself when it is an
+        object, or what the <code>input</code> expression returns — it sees <code>item</code> and
+        <code>index</code> besides the parent's context, e.g.
+        <code>input: "{'name': item, 'slot': index}"</code>. <code>on_parent_close</code> applies to every
+        item's child; <code>timeout</code>, <code>retry</code> and <code>output_schema</code> belong on the
+        child flow's nodes.
+      </p>
       <div class="codecard">
         <div class="codecard__bar">
           <span class="codecard__dots"><i></i><i></i><i></i></span>
@@ -521,7 +532,8 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <p>
         <code>max_parallel</code> bounds the instances in flight (default 100, at most 256).
         <code>timeout</code>, <code>retry</code> and <code>output_schema</code> apply to each instance. When
-        an item fails permanently the map is aborted: items in flight are cancelled and
+        an item fails permanently (or its child does not complete) the map is aborted: items in flight are
+        cancelled (children too, unless abandoned) and
         <code>on_failure</code> (if set) is entered with <code>errors.&lt;map&gt;.index</code> naming the item.
       </p>
     </section>
@@ -618,8 +630,12 @@ c.<span class="fn">Unschedule</span>(ctx, <span class="s">"nightly"</span>)</cod
         A flow's <code>triggers</code> start it for every message on a subject; the message body is the
         input. With <code>stream</code> set, the trigger is a durable JetStream consumer of that stream
         (at-least-once); without it, a core NATS queue subscription (at-most-once). The execution id
-        is taken from the message's <code>Nats-Msg-Id</code> when present (or the stream sequence), so
-        a duplicate message starts nothing twice.
+        is <code>&lt;flow&gt;-&lt;Nats-Msg-Id&gt;</code>, so a duplicate message starts nothing twice and
+        several flows triggered by the same message each run once; without a <code>Nats-Msg-Id</code>
+        it is <code>&lt;flow&gt;-&lt;stream&gt;-&lt;sequence&gt;</code> (stream) or a fresh id (core).
+        A stream message that still cannot be started after its redeliveries is dead-lettered
+        (<code>trigger</code>). Create the stream yourself: until it exists the trigger keeps retrying
+        and <code>Engine.Ready()</code> stays open.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -1237,7 +1253,7 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>NodeCancelled</td><td><code>key, node, reason</code></td></tr>
           <tr><td>ChoiceEvaluated</td><td><code>node, rule, to, error?</code></td></tr>
           <tr><td>FanoutStarted</td><td><code>node, join, branches[]</code></td></tr>
-          <tr><td>JoinCompleted</td><td><code>node, fanout, succeeded[], failed[], ok, output</code></td></tr>
+          <tr><td>JoinCompleted</td><td><code>node, fanout, succeeded[], failed[], ok, output, cancel_children[]?</code></td></tr>
           <tr><td>AwaitStarted</td><td><code>node, signal, timer_id</code></td></tr>
           <tr><td>AwaitTimedOut</td><td><code>node, to?</code></td></tr>
           <tr><td>SignalReceived</td><td><code>name, id, payload?</code></td></tr>
@@ -1245,9 +1261,9 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>ChannelsUpdated</td><td><code>id, writes</code></td></tr>
           <tr><td>MapStarted</td><td><code>node, items[], max_parallel</code></td></tr>
           <tr><td>MapCompleted</td><td><code>node</code></td></tr>
-          <tr><td>MapAborted</td><td><code>node, index</code></td></tr>
-          <tr><td>ChildStarted</td><td><code>node, child_id, child_n, flow, input, policy</code></td></tr>
-          <tr><td>ChildCompleted</td><td><code>node, child_id, status, output?, error?, counters?</code></td></tr>
+          <tr><td>MapAborted</td><td><code>node, index, cancel_children[]?</code></td></tr>
+          <tr><td>ChildStarted</td><td><code>node, child_id, child_n, flow, input, policy, key?, owner?, index?</code></td></tr>
+          <tr><td>ChildCompleted</td><td><code>node, key?, child_id, status, output?, error?, counters?</code></td></tr>
           <tr><td>TimerScheduled</td><td><code>id, n, at, purpose, key?, node?, generation?, attempt?</code></td></tr>
           <tr><td>TimerFired</td><td><code>id</code></td></tr>
         </tbody>

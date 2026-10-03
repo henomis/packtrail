@@ -100,11 +100,26 @@ type AwaitState struct {
 	TimerID string `json:"timer_id"`
 }
 
-// ChildState is a running subflow.
+// ChildState is a running child execution: of a subflow node, of a fan-out
+// branch (Owner is the fanout) or of a map item (Owner is the map, Index the
+// item). Children are keyed by instance: the node, or "node#i" for an item.
 type ChildState struct {
 	ChildID string `json:"child_id"`
 	Flow    string `json:"flow"`
 	Policy  string `json:"policy"`
+	Node    string `json:"node,omitempty"`
+	Owner   string `json:"owner,omitempty"`
+	Index   int    `json:"index,omitempty"`
+}
+
+// NodeOf returns the node of the child keyed key (states written before
+// children recorded their node are keyed by node).
+func (c *ChildState) NodeOf(key string) string {
+	if c.Node == "" {
+		return key
+	}
+
+	return c.Node
 }
 
 // Buffered is a received signal not consumed yet.
@@ -553,6 +568,11 @@ func (s *State) applyStructure(ev event.Event) error {
 		s.Fans[d.Node] = f
 	case *event.Join:
 		if f := s.Fans[d.Fanout]; f != nil {
+			// Branch children still running are no longer wanted.
+			for _, key := range s.dropChildren(d.Fanout) {
+				f.Branches[key] = BranchCancelled
+			}
+
 			s.Branches = f.Branches
 		}
 
@@ -587,6 +607,7 @@ func (s *State) applyStructure(ev event.Event) error {
 		delete(s.Maps, d.Node)
 		delete(s.Errors, d.Node)
 	case *event.MapAbort:
+		s.dropChildren(d.Node)
 		delete(s.Maps, d.Node)
 	default:
 		return s.applyWait(ev)
@@ -611,22 +632,16 @@ func (s *State) applyWait(ev event.Event) error {
 	case *event.SignalUse:
 		return s.applySignalUse(d)
 	case *event.Child:
-		s.Children[d.Node] = &ChildState{ChildID: d.ChildID, Flow: d.Flow, Policy: d.Policy}
+		s.Children[d.InstanceKey()] = &ChildState{
+			ChildID: d.ChildID, Flow: d.Flow, Policy: d.Policy, Node: d.Node, Owner: d.Owner, Index: d.Index,
+		}
 		s.N = max(s.N, d.ChildN)
+
+		if m := s.Maps[d.Owner]; m != nil && d.Owner == d.Node {
+			m.Next = max(m.Next, d.Index+1)
+		}
 	case *event.ChildDone:
-		delete(s.Children, d.Node)
-		s.Results[d.Node] = d.Output
-		s.LastNode = d.Node
-
-		if d.Status == string(StatusCompleted) {
-			delete(s.Errors, d.Node)
-		} else {
-			s.Errors[d.Node] = NodeError{Error: d.Error, Reason: event.ReasonChild}
-		}
-
-		for k, v := range d.Counters {
-			s.Counters[k] += v
-		}
+		s.applyChildDone(d)
 	case *event.Timer:
 		t := *d
 		s.Timers[d.ID] = &t
@@ -638,6 +653,71 @@ func (s *State) applyWait(ev event.Event) error {
 	}
 
 	return nil
+}
+
+func (s *State) applyChildDone(d *event.ChildDone) {
+	key := d.Key
+	if key == "" {
+		key = d.Node
+	}
+
+	c := s.Children[key]
+	delete(s.Children, key)
+
+	for k, v := range d.Counters {
+		s.Counters[k] += v
+	}
+
+	ok := d.Status == string(StatusCompleted)
+
+	if c != nil && c.Owner == d.Node {
+		// A map item: its output goes to the map's results, in item order.
+		if m := s.Maps[c.Owner]; m != nil {
+			if ok {
+				m.Outputs[c.Index] = d.Output
+				m.Done++
+			} else {
+				idx := c.Index
+				s.Errors[d.Node] = NodeError{Error: d.Error, Reason: event.ReasonChild, Index: &idx}
+				s.LastNode = d.Node
+			}
+
+			return
+		}
+	}
+
+	if c != nil {
+		if f := s.Fans[c.Owner]; f != nil {
+			f.Branches[d.Node] = BranchFailed
+			if ok {
+				f.Branches[d.Node] = BranchCompleted
+			}
+		}
+	}
+
+	s.Results[d.Node] = d.Output
+	s.LastNode = d.Node
+
+	if ok {
+		delete(s.Errors, d.Node)
+	} else {
+		s.Errors[d.Node] = NodeError{Error: d.Error, Reason: event.ReasonChild}
+	}
+}
+
+// dropChildren forgets the children owned by owner (their late completions
+// become stale) and returns their nodes.
+func (s *State) dropChildren(owner string) []string {
+	var nodes []string
+
+	for _, key := range slices.Sorted(maps.Keys(s.Children)) {
+		if c := s.Children[key]; c.Owner == owner {
+			nodes = append(nodes, c.NodeOf(key))
+			delete(s.Children, key)
+		}
+	}
+
+	return nodes
 }
 
 func (s *State) applyUpdate(def *flow.Flow, d *event.Update, at time.Time) error {

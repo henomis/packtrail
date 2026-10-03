@@ -204,7 +204,7 @@ function renderGraph(def, start, st) {
     }
     svg.append(mk("path", { class: joinOf.get(id) === s ? "edge join" : "edge", d, "marker-end": "url(#arrow)" }));
   }
-  const active = new Set(Object.values(st.tasks || {}).map((t) => t.node).concat(Object.keys(st.awaits || {}), Object.keys(st.children || {}), Object.keys(st.maps || {})));
+  const active = new Set(Object.values(st.tasks || {}).map((t) => t.node).concat(Object.keys(st.awaits || {}), Object.entries(st.children || {}).map(([k, c]) => c.node || k), Object.keys(st.maps || {})));
   for (const [id, p] of pos) {
     const g = mk("g", { transform: `translate(${p.x},${p.y})` });
     if (active.has(id)) g.classList.add("n-active");

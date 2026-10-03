@@ -75,6 +75,10 @@ type Engine struct {
 	// Redispatch lifts the quarantine of an execution (wired to the
 	// dispatcher's replay).
 	Redispatch func(ctx context.Context, execID string) error
+
+	// triggerMaxDeliver overrides maxDeliver for stream trigger messages
+	// (tests; 0 = maxDeliver).
+	triggerMaxDeliver uint64
 }
 
 func (e *Engine) maxEvents() int {
@@ -283,19 +287,28 @@ func delivered(msg jetstream.Msg) uint64 {
 }
 
 func (e *Engine) deadLetter(ctx context.Context, msg jetstream.Msg, execID, reason string) {
-	md, _ := msg.Metadata()
+	var seq uint64
+	if md, err := msg.Metadata(); err == nil {
+		seq = md.Sequence.Stream
+	}
 
-	var deliveries, seq uint64
-	if md != nil {
-		deliveries, seq = md.NumDelivered, md.Sequence.Stream
+	e.deadLetterAs(ctx, msg, wire.DLQCommand, execID, reason, "cmd."+strconv.FormatUint(seq, 10))
+}
+
+// deadLetterAs records msg as a dead letter of kind (deduplicated by dedup)
+// and terminates it; if the record fails, msg is redelivered instead.
+func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, kind, key, reason, dedup string) {
+	var deliveries uint64
+	if md, err := msg.Metadata(); err == nil {
+		deliveries = md.NumDelivered
 	}
 
 	d := wire.DeadLetter{
-		Kind: wire.DLQCommand, Key: execID, Reason: reason, Deliveries: deliveries, Subject: msg.Subject(),
+		Kind: kind, Key: key, Reason: reason, Deliveries: deliveries, Subject: msg.Subject(),
 		Header: msg.Headers(), Body: msg.Data(),
 	}
 
-	if err := wire.PublishDLQ(ctx, e.In, d, "cmd."+strconv.FormatUint(seq, 10)); err != nil {
+	if err := wire.PublishDLQ(ctx, e.In, d, dedup); err != nil {
 		e.In.Logger.Error("packtrail: dead letter failed", "err", err)
 
 		_ = msg.NakWithDelay(nakDelay)
@@ -304,7 +317,7 @@ func (e *Engine) deadLetter(ctx context.Context, msg jetstream.Msg, execID, reas
 	}
 
 	e.Metrics.DeadLetters.Add(1)
-	e.In.Logger.Warn("packtrail: command dead-lettered", "exec", execID, "reason", reason)
+	e.In.Logger.Warn("packtrail: dead-lettered", "kind", kind, "key", key, "reason", reason)
 
 	if err := msg.Term(); err != nil {
 		e.In.Logger.Warn("packtrail: term failed", "err", err)

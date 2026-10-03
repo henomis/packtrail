@@ -329,6 +329,10 @@ func (d *Dispatcher) effects(ctx context.Context, e statecache.Entry, ev event.E
 		return d.startChild(ctx, e.State, ev, data)
 	case *event.NodeDone:
 		return d.storeCache(ctx, e.Def, data)
+	case *event.Join:
+		return d.cancelChildren(ctx, data.CancelChildren, "join settled", ev.Trace)
+	case *event.MapAbort:
+		return d.cancelChildren(ctx, data.CancelChildren, "map aborted", ev.Trace)
 	case *event.Completed, *event.Failed, *event.Cancelled:
 		return d.terminal(ctx, e, ev)
 	default:
@@ -643,6 +647,23 @@ func (d *Dispatcher) startChild(ctx context.Context, st *fold.State, ev event.Ev
 	return wire.PublishCmd(ctx, d.In, start, ev.Trace)
 }
 
+// cancelChildren cancels child executions their parent no longer wants. The
+// command id depends on the child only: a child is cancelled at most once.
+func (d *Dispatcher) cancelChildren(ctx context.Context, children []string, reason, trace string) error {
+	for _, child := range children {
+		c, err := cmd.New("parent-closed."+child, cmd.Cancel, child, cmd.CancelData{Reason: reason})
+		if err != nil {
+			return err
+		}
+
+		if err = wire.PublishCmd(ctx, d.In, c, trace); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (d *Dispatcher) terminal(ctx context.Context, e statecache.Entry, ev event.Event) error {
 	st := e.State
 
@@ -655,15 +676,8 @@ func (d *Dispatcher) terminal(ctx context.Context, e statecache.Entry, ev event.
 		children = data.CancelChildren
 	}
 
-	for _, child := range children {
-		c, err := cmd.New("parent-closed."+child, cmd.Cancel, child, cmd.CancelData{Reason: "parent closed"})
-		if err != nil {
-			return err
-		}
-
-		if err = wire.PublishCmd(ctx, d.In, c, ev.Trace); err != nil {
-			return err
-		}
+	if err := d.cancelChildren(ctx, children, "parent closed", ev.Trace); err != nil {
+		return err
 	}
 
 	if st.Parent != nil {

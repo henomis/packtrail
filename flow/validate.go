@@ -328,12 +328,15 @@ func fieldSet(n *Node) map[string]bool {
 }
 
 var allowedFields = map[string][]string{
-	NodeTask:    {fKind, fTimeout, fRetry, fOutputSchema, fCache, fConcurrency, fDynamic, fNext, fOnFailure},
-	NodeChoice:  {fRules, fOnError},
-	NodeFanout:  {fBranches, fNext},
-	NodeJoin:    {fWaitFor, fPolicy, fNext, fOnFailure},
-	NodeAwait:   {fSignal, fTimeout, fOnTimeout, fNext},
-	NodeMap:     {fKind, fOver, fMaxParallel, fTimeout, fRetry, fOutputSchema, fNext, fOnFailure},
+	NodeTask:   {fKind, fTimeout, fRetry, fOutputSchema, fCache, fConcurrency, fDynamic, fNext, fOnFailure},
+	NodeChoice: {fRules, fOnError},
+	NodeFanout: {fBranches, fNext},
+	NodeJoin:   {fWaitFor, fPolicy, fNext, fOnFailure},
+	NodeAwait:  {fSignal, fTimeout, fOnTimeout, fNext},
+	NodeMap: {
+		fKind, fOver, fMaxParallel, fTimeout, fRetry, fOutputSchema, fNext, fOnFailure,
+		fFlow, fInput, fOnParentClose,
+	},
 	NodeSubflow: {fFlow, fInput, fOnParentClose, fNext, fOnFailure},
 }
 
@@ -586,8 +589,8 @@ func (f *Flow) validateAwait(n *Node) error {
 }
 
 func (f *Flow) validateMap(n *Node) error {
-	if err := names.CheckToken("worker kind", n.Kind); err != nil {
-		return f.errorf("map node %q: %w", n.ID, err)
+	if err := f.validateMapItems(n); err != nil {
+		return err
 	}
 
 	p, err := expr.CompileValue(n.Over)
@@ -601,18 +604,52 @@ func (f *Flow) validateMap(n *Node) error {
 		return f.errorf("map node %q: max_parallel must be between 0 and %d", n.ID, MaxParallel)
 	}
 
+	if n.Flow != "" {
+		return nil
+	}
+
 	return f.validateAttemptPolicy(n)
 }
 
+// validateMapItems checks what runs each item of map n: a task of a worker
+// kind, or a child execution of a flow (with an optional input expression
+// that sees item and index).
+func (f *Flow) validateMapItems(n *Node) error {
+	switch {
+	case n.Kind != "" && n.Flow != "":
+		return f.errorf("map node %q: set kind (a task per item) or flow (a subflow per item), not both", n.ID)
+	case n.Flow == "":
+		if n.Input != "" || n.OnParentClose != "" {
+			return f.errorf("map node %q: input and on_parent_close need flow (a subflow per item)", n.ID)
+		}
+
+		if err := names.CheckToken("worker kind", n.Kind); err != nil {
+			return f.errorf("map node %q: %w", n.ID, err)
+		}
+
+		return nil
+	}
+
+	if n.Timeout > 0 || n.Retry != nil || n.OutputSchema != nil {
+		return f.errorf("map node %q: timeout, retry and output_schema apply to tasks; "+
+			"with flow, set them on the child flow's nodes", n.ID)
+	}
+
+	return f.validateSubflow(n)
+}
+
+// validateSubflow checks the child-execution fields of a subflow node, or of
+// a map node with flow.
 func (f *Flow) validateSubflow(n *Node) error {
 	if err := names.CheckToken("subflow name", n.Flow); err != nil {
-		return f.errorf("subflow node %q: %w", n.ID, err)
+		return f.errorf("%s node %q: %w", n.Type, n.ID, err)
 	}
 
 	switch n.OnParentClose {
 	case "", ParentCloseCancel, ParentCloseAbandon:
 	default:
-		return f.errorf("subflow node %q: unknown on_parent_close %q (want cancel or abandon)", n.ID, n.OnParentClose)
+		return f.errorf("%s node %q: unknown on_parent_close %q (want cancel or abandon)", n.Type, n.ID,
+			n.OnParentClose)
 	}
 
 	n.input = nil
@@ -620,7 +657,7 @@ func (f *Flow) validateSubflow(n *Node) error {
 	if strings.TrimSpace(n.Input) != "" {
 		p, err := expr.CompileValue(n.Input)
 		if err != nil {
-			return f.errorf("subflow node %q: input: %w", n.ID, err)
+			return f.errorf("%s node %q: input: %w", n.Type, n.ID, err)
 		}
 
 		n.input = p

@@ -44,7 +44,7 @@ func (f *Flow) WaitFor(join string) []string {
 // validateFans ties every fanout to the join that closes it and rejects shapes
 // the engine could never drive to completion:
 //   - a node is a branch of at most one fanout, listed once;
-//   - every branch is a task node with no successor of its own (the join owns
+//   - every branch is a task or subflow node with no successor of its own (the join owns
 //     what happens after the fan);
 //   - a fanout's next is a join, each join closes exactly one fanout, and its
 //     wait_for is a subset of that fanout's branches;
@@ -105,8 +105,9 @@ func (f *Flow) validateFanBranches(n *Node) error {
 		f.branchOf[b] = n.ID
 
 		bn := f.byID[b]
-		if bn.Type != NodeTask {
-			return f.errorf("fanout %q: branch %q is a %s node; branches must be task nodes", n.ID, b, bn.Type)
+		if bn.Type != NodeTask && bn.Type != NodeSubflow {
+			return f.errorf("fanout %q: branch %q is a %s node; branches must be task or subflow nodes "+
+				"(a subflow can hold any graph)", n.ID, b, bn.Type)
 		}
 
 		if bn.OnFailure != "" {

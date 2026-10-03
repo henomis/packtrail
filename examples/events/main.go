@@ -19,7 +19,7 @@
 //     "<schedule>-<sequence>".
 //
 //   - A trigger starts `order` for every message published on orders.created;
-//     a message's Nats-Msg-Id becomes the execution id, so a redelivered or
+//     the execution id is "order-<Nats-Msg-Id>", so a redelivered or
 //     republished message starts nothing twice.
 //
 //     go run ./examples/events

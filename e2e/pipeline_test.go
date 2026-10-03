@@ -167,7 +167,7 @@ func TestEventDrivenPipeline(t *testing.T) {
 		for _, tenant := range tenants {
 			for _, topic := range topics {
 				id := fmt.Sprintf("req-%s-%s-%s", round, tenant, topic)
-				ids = append(ids, id)
+				ids = append(ids, "digest-"+id)                                      // the trigger's execution id is <flow>-<Nats-Msg-Id>
 				body, _ := json.Marshal(digestRequest{Tenant: tenant, Topic: topic}) //nolint:errchkjson // plain struct.
 
 				for range 2 {
@@ -251,7 +251,7 @@ func TestEventDrivenPipeline(t *testing.T) {
 	}
 
 	// Exactly the requests published, each once.
-	if n := ends.count("req-"); n != len(first)+len(again)+len(fresh) {
+	if n := ends.count("digest-req-"); n != len(first)+len(again)+len(fresh) {
 		t.Fatalf("%d request executions, want %d", n, len(first)+len(again)+len(fresh))
 	}
 

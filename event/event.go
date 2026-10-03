@@ -268,6 +268,9 @@ type Join struct {
 	Failed    []string        `json:"failed,omitempty"`
 	OK        bool            `json:"ok"`
 	Output    json.RawMessage `json:"output,omitempty"`
+	// CancelChildren lists the child executions of branches still running
+	// when the join settled (unless on_parent_close: abandon).
+	CancelChildren []string `json:"cancel_children,omitempty"`
 }
 
 // Await is the payload of AwaitStarted.
@@ -323,6 +326,9 @@ type Update struct {
 type MapAbort struct {
 	Node  string `json:"node"`
 	Index int    `json:"index"`
+	// CancelChildren lists the child executions of items still running
+	// (unless on_parent_close: abandon).
+	CancelChildren []string `json:"cancel_children,omitempty"`
 }
 
 // Child is the payload of ChildStarted.
@@ -333,11 +339,29 @@ type Child struct {
 	Flow    string          `json:"flow"`
 	Input   json.RawMessage `json:"input"`
 	Policy  string          `json:"policy"`
+	// Key identifies the instance: "node#i" for a map item; empty means Node.
+	Key string `json:"key,omitempty"`
+	// Owner is the fanout (for a branch) or map (for an item) the child
+	// settles into; empty for a plain subflow node.
+	Owner string `json:"owner,omitempty"`
+	// Index is the map item the child runs.
+	Index int `json:"index,omitempty"`
+}
+
+// InstanceKey returns the key of the child instance.
+func (c *Child) InstanceKey() string {
+	if c.Key == "" {
+		return c.Node
+	}
+
+	return c.Key
 }
 
 // ChildDone is the payload of ChildCompleted.
 type ChildDone struct {
-	Node     string             `json:"node"`
+	Node string `json:"node"`
+	// Key is the instance (see Child.Key); empty means Node.
+	Key      string             `json:"key,omitempty"`
 	ChildID  string             `json:"child_id"`
 	Status   string             `json:"status"`
 	Output   json.RawMessage    `json:"output,omitempty"`

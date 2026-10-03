@@ -412,6 +412,20 @@ func (d *decider) cancelChildren() []string {
 	return out
 }
 
+// ownedChildren lists the running children of fanout or map owner that must
+// be cancelled now that it settled: all but the abandoned ones.
+func (d *decider) ownedChildren(owner string) []string {
+	var out []string
+
+	for _, key := range slices.Sorted(maps.Keys(d.st.Children)) {
+		if c := d.st.Children[key]; c.Owner == owner && c.Policy != flow.ParentCloseAbandon {
+			out = append(out, c.ChildID)
+		}
+	}
+
+	return out
+}
+
 func (d *decider) fail(reason, msg, node string) error {
 	return d.emit(event.ExecutionFailed, &event.Failed{
 		Error: msg, Reason: reason, Node: node, CancelChildren: d.cancelChildren(),
@@ -630,7 +644,8 @@ func (d *decider) abortMap(n *flow.Node, index int) error {
 		}
 	}
 
-	if err := d.emit(event.MapAborted, &event.MapAbort{Node: n.ID, Index: index}); err != nil {
+	abort := &event.MapAbort{Node: n.ID, Index: index, CancelChildren: d.ownedChildren(n.ID)}
+	if err := d.emit(event.MapAborted, abort); err != nil {
 		return err
 	}
 
@@ -765,7 +780,16 @@ func (d *decider) fanout(n *flow.Node) error {
 			return err
 		}
 
-		if err := d.schedule(d.def.Node(b), b, n.ID, 0, nil, nil, 0, 1); err != nil {
+		bn := d.def.Node(b)
+
+		var err error
+		if bn.Type == flow.NodeSubflow {
+			err = d.startChild(bn, b, n.ID, 0, nil)
+		} else {
+			err = d.schedule(bn, b, n.ID, 0, nil, nil, 0, 1)
+		}
+
+		if err != nil || d.st.Status.Terminal() {
 			return err
 		}
 	}
@@ -814,6 +838,8 @@ func (d *decider) evalJoin(fan string) error {
 }
 
 func (d *decider) closeJoin(fan string, join *flow.Node, succeeded, failed []string, ok bool) error {
+	cancel := d.ownedChildren(fan)
+
 	for _, k := range slices.Sorted(maps.Keys(d.st.Tasks)) {
 		if t := d.st.Tasks[k]; t.Owner == fan {
 			err := d.emit(event.NodeCancelled, &event.NodeCancel{Key: k, Node: t.Node, Reason: "join settled"})
@@ -839,6 +865,7 @@ func (d *decider) closeJoin(fan string, join *flow.Node, succeeded, failed []str
 
 	err = d.emit(event.JoinCompleted, &event.Join{
 		Node: join.ID, Fanout: fan, Succeeded: succeeded, Failed: failed, OK: ok, Output: out,
+		CancelChildren: cancel,
 	})
 	if err != nil {
 		return err
@@ -988,8 +1015,16 @@ func (d *decider) mapProgress(n *flow.Node) error {
 
 	for m.Next < len(m.Items) && m.Next-m.Done < limit {
 		i := m.Next
+		key := n.ID + "#" + strconv.Itoa(i)
 
-		if err := d.schedule(n, n.ID+"#"+strconv.Itoa(i), n.ID, i, m.Items[i], nil, 0, 1); err != nil {
+		var err error
+		if n.Flow != "" {
+			err = d.startChild(n, key, n.ID, i, m.Items[i])
+		} else {
+			err = d.schedule(n, key, n.ID, i, m.Items[i], nil, 0, 1)
+		}
+
+		if err != nil || d.st.Status.Terminal() {
 			return err
 		}
 	}
@@ -1001,27 +1036,56 @@ func (d *decider) mapProgress(n *flow.Node) error {
 // Subflows
 
 func (d *decider) subflow(n *flow.Node) error {
+	return d.startChild(n, n.ID, "", 0, nil)
+}
+
+// startChild starts the child execution of instance key of node n: a
+// subflow node, a fan-out branch (owner is the fanout) or a map item (owner
+// is the map; item and index are what the input expression sees, and the
+// item itself is the input without one).
+func (d *decider) startChild(n *flow.Node, key, owner string, index int, item json.RawMessage) error {
 	input := d.st.Input
+	what := fmt.Sprintf("subflow %q", n.ID)
+	isItem := owner == n.ID
+
+	var view *Task
+	if isItem {
+		view = &Task{Node: n.ID, Owner: n.ID, Index: index, Item: item}
+		what = fmt.Sprintf("map %q: item %d", n.ID, index)
+		input = item
+	}
 
 	if p := n.InputProgram(); p != nil {
-		v, err := p.Eval(context.Background(), d.st.Env(nil))
+		v, err := p.Eval(context.Background(), d.st.Env(view))
 		if err != nil {
-			return d.fail(event.ReasonExpression, fmt.Sprintf("subflow %q: input: %v", n.ID, err), n.ID)
+			return d.fail(event.ReasonExpression, fmt.Sprintf("%s: input: %v", what, err), n.ID)
 		}
 
-		b, err := json.Marshal(v)
-		if err != nil || !isObject(b) {
-			return d.fail(event.ReasonExpression, fmt.Sprintf("subflow %q: input must be an object", n.ID), n.ID)
+		if input, err = json.Marshal(v); err != nil {
+			return d.fail(event.ReasonExpression, fmt.Sprintf("%s: input: %v", what, err), n.ID)
+		}
+	}
+
+	if !isObject(input) {
+		hint := ""
+		if isItem && n.InputProgram() == nil {
+			hint = " (map the item to one with input)"
 		}
 
-		input = b
+		return d.fail(event.ReasonExpression, fmt.Sprintf("%s: input must be an object%s", what, hint), n.ID)
 	}
 
 	nr := d.alloc()
 
-	return d.emit(event.ChildStarted, &event.Child{
+	c := &event.Child{
 		Node: n.ID, ChildID: ChildID(d.st.ExecID, nr), ChildN: nr, Flow: n.Flow, Input: input, Policy: n.ParentClose(),
-	})
+		Owner: owner, Index: index,
+	}
+	if key != n.ID {
+		c.Key = key
+	}
+
+	return d.emit(event.ChildStarted, c)
 }
 
 // ChildID derives the id of a subflow execution: deterministic, so a
@@ -1038,22 +1102,32 @@ func ChildID(parent string, n int) string {
 }
 
 func (d *decider) childDone(p *cmd.ChildDoneData) error {
-	var node string
+	var (
+		key string
+		c   *ChildState
+	)
 
-	for k, c := range d.st.Children {
-		if c.ChildID == p.ChildID {
-			node = k
+	for k, cs := range d.st.Children {
+		if cs.ChildID == p.ChildID {
+			key, c = k, cs
 		}
 	}
 
-	if node == "" {
-		return nil
+	if c == nil {
+		return nil // stale: settled, cancelled or no longer wanted
 	}
 
-	err := d.emit(event.ChildCompleted, &event.ChildDone{
+	cc := *c
+	node := cc.NodeOf(key)
+
+	done := &event.ChildDone{
 		Node: node, ChildID: p.ChildID, Status: p.Status, Output: p.Output, Error: p.Error, Counters: p.Counters,
-	})
-	if err != nil {
+	}
+	if key != node {
+		done.Key = key
+	}
+
+	if err := d.emit(event.ChildCompleted, done); err != nil {
 		return err
 	}
 
@@ -1061,8 +1135,28 @@ func (d *decider) childDone(p *cmd.ChildDoneData) error {
 		return d.fail(event.ReasonBudget, over, node)
 	}
 
-	if p.Status != string(StatusCompleted) {
-		if n := d.def.Node(node); n.OnFailure != "" {
+	n := d.def.Node(node)
+	ok := p.Status == string(StatusCompleted)
+
+	if _, isFan := d.st.Fans[cc.Owner]; isFan {
+		return d.evalJoin(cc.Owner)
+	}
+
+	if _, isMap := d.st.Maps[cc.Owner]; isMap && cc.Owner == node {
+		if ok {
+			return d.mapProgress(n)
+		}
+
+		if n.OnFailure != "" {
+			return d.abortMap(n, cc.Index)
+		}
+
+		return d.fail(event.ReasonChild, fmt.Sprintf("map %q: item %d (%s) %s: %s", node, cc.Index, p.ChildID,
+			p.Status, p.Error), node)
+	}
+
+	if !ok {
+		if n.OnFailure != "" {
 			return d.enter(n.OnFailure)
 		}
 
@@ -1070,7 +1164,7 @@ func (d *decider) childDone(p *cmd.ChildDoneData) error {
 			node)
 	}
 
-	return d.advance(d.def.Node(node), "")
+	return d.advance(n, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,8 +1190,15 @@ func (d *decider) rekick() error {
 		}
 	}
 
-	for _, node := range slices.Sorted(maps.Keys(d.st.Children)) {
-		if err := d.subflow(d.def.Node(node)); err != nil {
+	for _, key := range slices.Sorted(maps.Keys(d.st.Children)) {
+		c := d.st.Children[key]
+
+		var item json.RawMessage
+		if m := d.st.Maps[c.Owner]; m != nil && c.Index < len(m.Items) {
+			item = m.Items[c.Index]
+		}
+
+		if err := d.startChild(d.def.Node(c.NodeOf(key)), key, c.Owner, c.Index, item); err != nil {
 			return err
 		}
 	}

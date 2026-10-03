@@ -102,10 +102,14 @@ func (e *Engine) handleCron(ctx context.Context, msg jetstream.Msg) {
 const flushTimeout = time.Second
 
 // RunTrigger starts def whenever a message arrives on one of its triggers.
-// With a stream the trigger is a durable consumer (at-least-once; the
-// execution id comes from Nats-Msg-Id or the stream sequence, so redelivery
-// starts nothing twice); otherwise a core queue subscription (at-most-once).
-// ready is called once it receives.
+// The execution id is "<flow>-<Nats-Msg-Id>" (see triggerExecID), so a
+// duplicate message starts nothing twice and every flow triggered by one
+// message gets its own execution. With a stream the trigger is a durable
+// consumer (at-least-once; without a usable Msg-Id the id is
+// "<flow>-<stream>-<sequence>", stable across redelivery): a message that
+// cannot be started after the redelivery budget is dead-lettered. Otherwise
+// it is a core queue subscription (at-most-once). ready is called once it
+// receives.
 func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.Trigger, ready func()) error {
 	if tr.Stream == "" {
 		return e.runCoreTrigger(ctx, def, tr, ready)
@@ -130,13 +134,23 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 				return
 			}
 
-			execID := msg.Headers().Get(wire.HeaderMsgID)
-			if !names.ValidToken(execID) {
+			execID, ok := triggerExecID(def, msg.Headers().Get(wire.HeaderMsgID))
+			if !ok {
 				execID = def.Name + "-" + tr.Stream + "-" + strconv.FormatUint(md.Sequence.Stream, 10)
 			}
 
 			if err = e.startFromTrigger(ctx, def, execID, msg.Data()); err != nil {
-				_ = msg.NakWithDelay(nakDelay)
+				if md.NumDelivered >= e.triggerDeliveries() {
+					e.deadLetterAs(ctx, msg, wire.DLQTrigger, execID, "delivery attempts exhausted: "+err.Error(),
+						"trigger."+tr.Stream+"."+strconv.FormatUint(md.Sequence.Stream, 10))
+
+					return
+				}
+
+				e.In.Logger.Warn("packtrail: trigger start failed, will retry", "flow", def.Name, "exec", execID,
+					"deliveries", md.NumDelivered, "err", err)
+
+				_ = msg.NakWithDelay(retryDelay(md.NumDelivered))
 
 				return
 			}
@@ -146,6 +160,30 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 	})
 }
 
+// triggerExecID is the execution a trigger message with Nats-Msg-Id msgID
+// starts: "<flow>-<msgID>", so flows triggered by the same message do not
+// share an id (nor a start command id). ok is false without a Msg-Id or when
+// the result is not a valid token.
+func triggerExecID(def *flow.Flow, msgID string) (string, bool) {
+	if msgID == "" {
+		return "", false
+	}
+
+	id := def.Name + "-" + msgID
+
+	return id, names.ValidToken(id)
+}
+
+// triggerDeliveries is how many deliveries a stream trigger message gets
+// before it is dead-lettered.
+func (e *Engine) triggerDeliveries() uint64 {
+	if e.triggerMaxDeliver > 0 {
+		return e.triggerMaxDeliver
+	}
+
+	return maxDeliver
+}
+
 // triggerDataKey wraps a trigger message that is not a JSON object.
 const triggerDataKey = "data"
 
@@ -153,8 +191,8 @@ const triggerDataKey = "data"
 // subscription.
 func (e *Engine) runCoreTrigger(ctx context.Context, def *flow.Flow, tr flow.Trigger, ready func()) error {
 	sub, err := e.In.NC.QueueSubscribe(tr.Subject, e.In.Names.Prefix+"-trigger-"+def.Name, func(m *nats.Msg) {
-		execID := m.Header.Get(wire.HeaderMsgID)
-		if !names.ValidToken(execID) {
+		execID, ok := triggerExecID(def, m.Header.Get(wire.HeaderMsgID))
+		if !ok {
 			execID = def.Name + "-" + nuid.Next()
 		}
 

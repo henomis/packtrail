@@ -16,6 +16,7 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -202,20 +203,16 @@ func TestFirstResponderWins(t *testing.T) {
 	}
 }
 
-// campaignFlow runs a mailing as a child that is abandoned when the campaign
-// closes (it must still go out); auditFlow runs one that is cancelled with
-// its parent (the default). Fan-out branches must be tasks, so each parent
-// runs one child.
+// campaignFlow runs two child flows in parallel: the mailing is abandoned
+// when the campaign closes (it must still go out), the audit is cancelled
+// with it.
 const campaignFlow = `
 name: campaign
 nodes:
+  - {id: split, type: fanout, branches: [mail, audit], next: done}
   - {id: mail, type: subflow, flow: mailing, input: input, on_parent_close: abandon}
-`
-
-const auditFlow = `
-name: audit
-nodes:
-  - {id: check, type: subflow, flow: mailing, input: input}
+  - {id: audit, type: subflow, flow: mailing, input: input}
+  - {id: done, type: join, policy: all}
 `
 
 const mailingFlow = `
@@ -225,28 +222,34 @@ nodes:
   - {id: send, type: task, kind: mailer}
 `
 
-// childOf waits until parent runs its child and returns the child id.
-func (cl *cluster) childOf(parent string) string {
+// children waits until parent runs n children and returns them by node.
+func (cl *cluster) children(parent string, n int) map[string]string {
 	cl.t.Helper()
 
-	st := cl.waitUntil(parent, "running its child", func(st *packtrail.State) bool { return len(st.Children) == 1 })
-	for _, c := range st.Children {
-		return c.ChildID
+	st := cl.waitUntil(parent, fmt.Sprintf("running %d children", n),
+		func(st *packtrail.State) bool { return len(st.Children) == n })
+
+	out := map[string]string{}
+	for key, c := range st.Children {
+		out[key] = c.ChildID
 	}
 
-	return ""
+	return out
 }
 
-// TestAbandonedChildOutlivesParent cancels two parents while their children
-// wait: the child with on_parent_close: cancel is cancelled with its parent,
-// the abandoned one carries on and completes later, and its completion does
-// not touch its cancelled parent.
-func TestAbandonedChildOutlivesParent(t *testing.T) {
-	cl := newCluster(t, []string{campaignFlow, auditFlow, mailingFlow})
-
+func mailerWorker(cl *cluster) {
 	cl.worker("mailer", func(_ context.Context, j *worker.Job) (*worker.Result, error) {
 		return &worker.Result{Output: map[string]any{"sent": j.ExecID}}, nil
 	})
+}
+
+// TestAbandonedChildOutlivesParent cancels a parent while both its child
+// branches wait: the child with on_parent_close: cancel is cancelled with
+// it, the abandoned one carries on and completes later, and its completion
+// does not touch the cancelled parent.
+func TestAbandonedChildOutlivesParent(t *testing.T) {
+	cl := newCluster(t, []string{campaignFlow, mailingFlow})
+	mailerWorker(cl)
 
 	ends, err := cl.c.WatchTerminal(cl.ctx, 0)
 	if err != nil {
@@ -254,19 +257,17 @@ func TestAbandonedChildOutlivesParent(t *testing.T) {
 	}
 
 	campaign := cl.start("campaign", map[string]any{"list": "spring"})
-	audit := cl.start("audit", map[string]any{"list": "spring"})
-	mail, check := cl.childOf(campaign), cl.childOf(audit)
+	kids := cl.children(campaign, 2)
+	mail, audit := kids["mail"], kids["audit"]
 
 	cl.parkedAt(mail, "hold")
-	cl.parkedAt(check, "hold")
+	cl.parkedAt(audit, "hold")
 
-	for _, p := range []string{campaign, audit} {
-		if err = cl.c.Cancel(cl.ctx, p, "campaign withdrawn"); err != nil {
-			t.Fatal(err)
-		}
+	if err = cl.c.Cancel(cl.ctx, campaign, "campaign withdrawn"); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, x := range []string{campaign, audit, check} {
+	for _, x := range []string{campaign, audit} {
 		if st := cl.wait(x); st.Status != packtrail.StatusCancelled {
 			t.Fatalf("%s: %s, want cancelled", x, st.Status)
 		}
@@ -286,7 +287,7 @@ func TestAbandonedChildOutlivesParent(t *testing.T) {
 		t.Fatalf("abandoned child: %s (%s)", st.Status, st.Error)
 	}
 
-	for _, x := range []string{campaign, audit, check, mail} {
+	for _, x := range []string{campaign, audit, mail} {
 		cl.check(x)
 	}
 
@@ -295,7 +296,7 @@ func TestAbandonedChildOutlivesParent(t *testing.T) {
 	}
 
 	seen := map[string]packtrail.Status{}
-	for len(seen) < 4 {
+	for len(seen) < 3 {
 		select {
 		case e := <-ends:
 			seen[e.ExecID] = e.Status
@@ -305,10 +306,92 @@ func TestAbandonedChildOutlivesParent(t *testing.T) {
 	}
 
 	want := map[string]packtrail.Status{
-		campaign: packtrail.StatusCancelled, audit: packtrail.StatusCancelled,
-		check: packtrail.StatusCancelled, mail: packtrail.StatusCompleted,
+		campaign: packtrail.StatusCancelled, audit: packtrail.StatusCancelled, mail: packtrail.StatusCompleted,
 	}
 	if !maps.Equal(seen, want) {
 		t.Fatalf("WatchTerminal reported %v, want %v", seen, want)
+	}
+}
+
+// tenderFlow invites three bids, each a child flow waiting for an offer, and
+// awards the first: the losing bids are cancelled, except the one marked
+// abandon, which may still be submitted.
+const tenderFlow = `
+name: tender
+nodes:
+  - {id: invite, type: fanout, branches: [bid-a, bid-b, bid-c], next: first}
+  - {id: bid-a, type: subflow, flow: bid}
+  - {id: bid-b, type: subflow, flow: bid}
+  - {id: bid-c, type: subflow, flow: bid, on_parent_close: abandon}
+  - {id: first, type: join, policy: any, next: award}
+  - {id: award, type: task, kind: mailer}
+`
+
+const bidFlow = `
+name: bid
+nodes:
+  - {id: hold, type: await, signal: offer, timeout: 1h, next: send}
+  - {id: send, type: task, kind: mailer}
+`
+
+// TestSubflowBranchesRace: the first child branch to finish settles an any
+// join; the losing children are cancelled (or left running when abandoned)
+// and the parent moves on with the winner's result only.
+func TestSubflowBranchesRace(t *testing.T) {
+	cl := newCluster(t, []string{tenderFlow, bidFlow})
+	mailerWorker(cl)
+
+	id := cl.start("tender", nil)
+	kids := cl.children(id, 3)
+
+	for _, k := range kids {
+		cl.parkedAt(k, "hold")
+	}
+
+	if err := cl.c.Signal(cl.ctx, kids["bid-b"], "offer", map[string]any{"price": 90}); err != nil {
+		t.Fatal(err)
+	}
+
+	st := cl.wait(id)
+	f := cl.check(id)
+
+	if st.Status != packtrail.StatusCompleted || st.LastNode != "award" {
+		t.Fatalf("tender: %s at %s (%s)", st.Status, st.LastNode, st.Error)
+	}
+
+	var first map[string]json.RawMessage
+	if err := st.Result("first", &first); err != nil || len(first) != 1 || first["bid-b"] == nil {
+		t.Fatalf("join result %s", st.Results["first"])
+	}
+
+	if st.Branches["bid-a"] != "cancelled" || st.Branches["bid-c"] != "cancelled" || st.Branches["bid-b"] != "completed" {
+		t.Fatalf("branches %v", st.Branches)
+	}
+
+	if f.count[event.ChildCompleted] != 1 {
+		t.Fatalf("%d children reported back, want 1", f.count[event.ChildCompleted])
+	}
+
+	if a := cl.wait(kids["bid-a"]); a.Status != packtrail.StatusCancelled {
+		t.Fatalf("losing bid-a: %s", a.Status)
+	}
+
+	// The abandoned loser is still open, and finishing it changes nothing.
+	if c, err := cl.c.Get(cl.ctx, kids["bid-c"]); err != nil || c.Status != packtrail.StatusWaiting {
+		t.Fatalf("abandoned bid-c: %+v %v", c, err)
+	}
+
+	if err := cl.c.Signal(cl.ctx, kids["bid-c"], "offer", map[string]any{"price": 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	cl.wait(kids["bid-c"])
+
+	for _, k := range kids {
+		cl.check(k)
+	}
+
+	if again := cl.check(id); len(again.events) != len(f.events) {
+		t.Fatalf("the parent changed after the race: %d events, then %d", len(f.events), len(again.events))
 	}
 }

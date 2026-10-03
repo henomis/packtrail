@@ -222,7 +222,11 @@ func (c Channel) ReducerOrDefault() string {
 
 // Trigger starts the flow when a message arrives on Subject. When Stream is
 // set the trigger is a durable JetStream consumer of that stream (at-least
-// once); otherwise a core NATS queue subscription (at-most-once).
+// once; a message that cannot be started is eventually dead-lettered);
+// otherwise a core NATS queue subscription (at-most-once). The execution id
+// is "<flow>-<Nats-Msg-Id>", so a duplicate message starts nothing twice and
+// every flow triggered by the same message runs; without a Msg-Id it is
+// "<flow>-<stream>-<sequence>" (stream) or a fresh id (core).
 type Trigger struct {
 	Subject string `yaml:"subject" json:"subject"`
 	Stream  string `yaml:"stream,omitempty" json:"stream,omitempty"`
@@ -298,7 +302,9 @@ type Retry struct {
 	MaxDelay    Duration `yaml:"max_delay,omitempty" json:"max_delay,omitempty"`
 }
 
-// Cache enables the result cache of a task node.
+// Cache enables the result cache of a task node. A result is stored once the
+// node completes, so concurrent runs with the same key all miss and all run
+// the job (no single-flight).
 type Cache struct {
 	TTL Duration `yaml:"ttl" json:"ttl"`
 }

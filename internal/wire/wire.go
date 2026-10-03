@@ -117,6 +117,8 @@ type Job struct {
 	Generation int             `json:"generation"`
 	Attempt    int             `json:"attempt"`
 	Context    json.RawMessage `json:"context"`
+	// Meta is the node's meta from the execution's flow version.
+	Meta json.RawMessage `json:"meta,omitempty"`
 	// Reply is the command subject the worker publishes its result to.
 	Reply       string       `json:"reply"`
 	CacheKey    string       `json:"cache_key,omitempty"`

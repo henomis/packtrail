@@ -378,8 +378,16 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
           <tr><td>dynamic</td><td>Nodes the worker may route to by returning <code>Result.Next</code> (a dynamic edge). Without a <code>next</code> from the worker, <code>next</code> applies.</td></tr>
           <tr><td>next</td><td>Static successor.</td></tr>
           <tr><td>on_failure</td><td>Handler node for a permanent failure — see <a href="#on-failure">failure routing</a>.</td></tr>
+          <tr><td>meta</td><td>Free-form configuration for the worker (any JSON object), handed over as <code>Job.Meta</code>. See below.</td></tr>
         </tbody>
       </table>
+      <p>
+        Any node may carry <code>meta</code>; the engine ignores it. It is part of the definition, so it
+        changes the flow hash and is returned by <code>Client.Flow(name, version)</code>, and each job of a
+        task or map node carries the <code>meta</code> of the version its execution runs: a redeploy
+        never changes it under a running execution, a fork or a rerun. Keep secrets out of it, since
+        it is stored with the flow and sent with every job.
+      </p>
       <div class="codecard">
         <div class="codecard__bar">
           <span class="codecard__dots"><i></i><i></i><i></i></span>
@@ -678,6 +686,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Resumed(&amp;v)</td><td>Whether this run resumes an interrupt, and the resume value.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Traceparent</td><td>W3C trace context propagated from the start command.</td></tr>
+          <tr><td>Meta, DecodeMeta(&amp;v)</td><td>The node's <code>meta</code> from the execution's flow version (raw JSON, nil when absent), and a decoder for it.</td></tr>
         </tbody>
       </table>
       <h3>Outcomes</h3>

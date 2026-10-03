@@ -53,6 +53,10 @@ type Job struct {
 	// visits, signals, branches, counters, errors, and item/index/resume when
 	// set.
 	Context Context
+	// Meta is the node's meta (flow.Node.Meta) as defined in the flow version
+	// the execution runs, so a redeploy never changes it under a running
+	// execution, a fork or a rerun. Nil when the node has none.
+	Meta json.RawMessage
 
 	progress *progressSink
 }
@@ -92,6 +96,9 @@ func decodeInto(raw json.RawMessage, v any) error {
 
 	return json.Unmarshal(raw, v)
 }
+
+// DecodeMeta decodes the node's meta into v.
+func (j *Job) DecodeMeta(v any) error { return decodeInto(j.Meta, v) }
 
 // Input decodes the execution input.
 func (j *Job) Input(v any) error { return decodeInto(j.Context.Input, v) }

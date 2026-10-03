@@ -364,7 +364,7 @@ func (d *Dispatcher) job(ctx context.Context, e statecache.Entry, ev event.Event
 
 	job := wire.Job{
 		ExecID: st.ExecID, Flow: st.Flow, FlowHash: st.FlowHash, Node: s.Node, Kind: s.Kind, Key: s.Key,
-		Index: s.Index, Generation: s.Generation, Attempt: s.Attempt, Context: ctxJSON,
+		Index: s.Index, Generation: s.Generation, Attempt: s.Attempt, Context: ctxJSON, Meta: n.MetaJSON(),
 		Reply: d.In.CmdSubject(st.ExecID), Traceparent: ev.Trace,
 	}
 

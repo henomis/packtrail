@@ -212,7 +212,7 @@ function renderGraph(def, start, st) {
     else if (st.results && id in st.results) g.classList.add("n-done");
     const r = mk("rect", { width: W, height: H, rx: 5 });
     const t = mk("text", { x: 8, y: 21 }); t.textContent = label(id);
-    const tip = mk("title", {}); tip.textContent = label(id);
+    const tip = mk("title", {}); tip.textContent = JSON.stringify(nodes.get(id), null, 2);
     g.append(r, t, tip); svg.append(g);
   }
   const key = `${current}|${st.flow_hash}`;

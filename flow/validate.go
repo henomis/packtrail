@@ -15,6 +15,7 @@
 package flow
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -231,6 +232,10 @@ func (f *Flow) validateNode(n *Node) error {
 		return err
 	}
 
+	if err := f.encodeMeta(n); err != nil {
+		return err
+	}
+
 	switch n.Type {
 	case NodeTask:
 		return f.validateTask(n)
@@ -249,6 +254,25 @@ func (f *Flow) validateNode(n *Node) error {
 	default:
 		return f.errorf("node %q: unknown type %q", n.ID, n.Type)
 	}
+}
+
+// encodeMeta checks that the node's meta encodes as JSON and keeps the
+// encoding for jobs.
+func (f *Flow) encodeMeta(n *Node) error {
+	n.meta = nil
+
+	if len(n.Meta) == 0 {
+		return nil
+	}
+
+	b, err := json.Marshal(n.Meta)
+	if err != nil {
+		return f.errorf("node %q: meta must encode as JSON (use string keys in nested maps): %w", n.ID, err)
+	}
+
+	n.meta = b
+
+	return nil
 }
 
 // Node field names, as written in YAML.

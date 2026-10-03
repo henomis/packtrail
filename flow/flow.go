@@ -240,6 +240,11 @@ type Node struct {
 	// exhausted, a permanent error, an invalid output, a failed child, a join
 	// whose policy was not met. The handler sees errors.<node>.
 	OnFailure string `yaml:"on_failure,omitempty" json:"on_failure,omitempty"`
+	// Meta is free-form configuration for whoever runs or shows the node: the
+	// engine ignores it, but it is part of the definition, so it is versioned
+	// with the flow hash and handed to the worker of each job (Job.Meta). It
+	// must encode as JSON.
+	Meta map[string]any `yaml:"meta,omitempty" json:"meta,omitempty"`
 
 	// task, map: the worker kind and per-attempt policies.
 	Kind         string       `yaml:"kind,omitempty" json:"kind,omitempty"`
@@ -281,6 +286,7 @@ type Node struct {
 	input  *expr.Program
 	conc   *expr.Program
 	schema *jsonschema.Schema
+	meta   json.RawMessage
 }
 
 // Retry is a task retry policy.
@@ -479,6 +485,9 @@ func (n *Node) ValidateOutput(raw []byte) error {
 
 	return nil
 }
+
+// MetaJSON returns the JSON encoding of Meta (nil when there is none).
+func (n *Node) MetaJSON() json.RawMessage { return n.meta }
 
 // AllowsDynamic reports whether target is a declared dynamic successor.
 func (n *Node) AllowsDynamic(target string) bool {

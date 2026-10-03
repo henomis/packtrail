@@ -232,6 +232,7 @@ func TestValidateRejects(t *testing.T) {
 		{"bad backoff", "name: x\nnodes: [{id: a, type: task, kind: k, retry: {max_attempts: 2, backoff: x}}]", "unknown retry.backoff"},
 		{"bad schema", "name: x\nnodes: [{id: a, type: task, kind: k, output_schema: {type: 12}}]", "output_schema"},
 		{"remote ref", "name: x\nnodes: [{id: a, type: task, kind: k, output_schema: {$ref: 'file:///etc/passwd'}}]", "output_schema"},
+		{"meta not json", "name: x\nnodes: [{id: a, type: task, kind: k, meta: {cfg: {1: x}}}]", "meta must encode as JSON"},
 		{"cache ttl", "name: x\nnodes: [{id: a, type: task, kind: k, cache: {ttl: 0s}}]", "cache.ttl"},
 		{"conc max", "name: x\nnodes: [{id: a, type: task, kind: k, concurrency: {key: input.x, max: 0}}]", "concurrency.max"},
 		{"choice no default", "name: x\nnodes: [{id: c, type: choice, rules: [{when: 'input.x', to: a}]}, {id: a, type: task, kind: k}]", "exactly one default"},
@@ -325,4 +326,78 @@ func fanWide(n int) string {
 	}
 
 	return b.String()
+}
+
+const metaFlow = `
+name: m
+nodes:
+  - id: a
+    type: task
+    kind: k
+    next: c
+    meta:
+      agent: writer
+      prompt: "Summarise {{ .input }}"
+      routes: [b, c]
+      limits: {tokens: 1000, temperature: 0.2}
+  - {id: b, type: task, kind: k, meta: {agent: b}}
+  - id: c
+    type: choice
+    meta: {note: shown by tools, ignored by the engine}
+    rules: [{default: true, to: b}]
+`
+
+func TestNodeMeta(t *testing.T) {
+	f, err := Parse([]byte(metaFlow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := `{"agent":"writer","limits":{"temperature":0.2,"tokens":1000},"prompt":"Summarise {{ .input }}","routes":["b","c"]}`
+	if got := string(f.Node("a").MetaJSON()); got != want {
+		t.Fatalf("meta %s, want %s", got, want)
+	}
+
+	h1, _ := f.Hash()
+
+	// The JSON form round-trips the meta and the hash.
+	b, _ := f.JSON()
+
+	g, err := ParseJSON(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if h2, _ := g.Hash(); h2 != h1 || string(g.Node("a").MetaJSON()) != want {
+		t.Fatalf("round trip: hash %s != %s, meta %s", h2, h1, g.Node("a").MetaJSON())
+	}
+
+	c, err := f.Clone()
+	if err != nil || string(c.Node("a").MetaJSON()) != want {
+		t.Fatalf("clone meta %s %v", c.Node("a").MetaJSON(), err)
+	}
+
+	// A meta change is a new version.
+	g.Nodes[0].Meta["prompt"] = "Translate {{ .input }}"
+	if err = g.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if h3, _ := g.Hash(); h3 == h1 {
+		t.Fatal("hash ignores meta")
+	}
+
+	if !strings.Contains(string(g.Node("a").MetaJSON()), "Translate") {
+		t.Fatalf("validate did not refresh meta: %s", g.Node("a").MetaJSON())
+	}
+
+	// No meta leaves the definition (and every existing hash) as it was.
+	plain, err := Parse([]byte("name: p\nnodes: [{id: a, type: task, kind: k}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if pb, _ := plain.JSON(); strings.Contains(string(pb), "meta") || plain.Node("a").MetaJSON() != nil {
+		t.Fatalf("empty meta encoded: %s", pb)
+	}
 }

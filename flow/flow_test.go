@@ -274,6 +274,8 @@ func TestValidateRejects(t *testing.T) {
 		{"two starts", "name: x\nnodes: [{id: a, type: task, kind: k}, {id: b, type: task, kind: k}]", "multiple start nodes"},
 		{"unreachable", "name: x\nstart: a\nnodes: [{id: a, type: task, kind: k}, {id: b, type: task, kind: k, next: a}]", "unreachable"},
 		{"channel reducer", "name: x\nchannels: {c: {reducer: max}}\nnodes: [{id: a, type: task, kind: k}]", "unknown reducer"},
+		{"output expr", "name: x\noutput: 'results['\nnodes: [{id: a, type: task, kind: k}]", "output: expr: compile"},
+		{"output iteration", "name: x\noutput: 'map(input.xs, #)'\nnodes: [{id: a, type: task, kind: k}]", "output: expr"},
 		{"channel default", "name: x\nchannels: {c: {reducer: append, default: 3}}\nnodes: [{id: a, type: task, kind: k}]", "does not fit"},
 		{"budget", "name: x\nbudget: {tokens: 0}\nnodes: [{id: a, type: task, kind: k}]", "must be positive"},
 		{"map parallel cap", "name: x\nnodes: [{id: m, type: map, kind: k, over: input.x, max_parallel: 257}]", "max_parallel"},

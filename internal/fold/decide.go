@@ -385,10 +385,29 @@ func (d *decider) advance(n *flow.Node, dyn string) error {
 	return d.enter(next)
 }
 
+// complete0 completes the execution. Its output is the flow's output
+// expression when set; otherwise every channel, or the last node's result when
+// the flow declares no channels.
 func (d *decider) complete0() error {
 	out := d.st.Results[d.st.LastNode]
 
-	if len(d.def.Channels) > 0 {
+	switch {
+	case d.def.OutputProgram() != nil:
+		v, err := d.def.OutputProgram().Eval(context.Background(), d.st.Env(nil))
+		if err != nil {
+			return d.fail(event.ReasonExpression, fmt.Sprintf("output: %v", err), "")
+		}
+
+		if out, err = json.Marshal(v); err != nil {
+			return d.fail(event.ReasonExpression, fmt.Sprintf("output: %v", err), "")
+		}
+
+		if isNull(out) {
+			out = nil
+		} else if !isObject(out) {
+			return d.fail(event.ReasonExpression, "output must be an object or nil", "")
+		}
+	case len(d.def.Channels) > 0:
 		b, err := json.Marshal(d.st.Channels)
 		if err != nil {
 			return err

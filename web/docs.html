@@ -279,6 +279,7 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
           <tr><td>description</td><td>Free text.</td></tr>
           <tr><td>start</td><td>Entry node. When omitted, the unique node with no inbound route.</td></tr>
           <tr><td>channels</td><td>Typed state: <code>{reducer, default}</code> per channel — see <a href="#channels">channels</a>.</td></tr>
+          <tr><td>output</td><td>An <a href="#expressions">expression</a> evaluated on completion that yields what the execution returns: an object or null. Default: every channel, or the last node's result when the flow declares none — see <a href="#channels">channels</a>.</td></tr>
           <tr><td>nodes</td><td>The graph. Node ids are tokens and unique; <code>next</code> is the static successor (empty on a terminal node).</td></tr>
           <tr><td>budget</td><td>Caps on generic counters reported by workers (<code>Result.Usage</code>, <code>worker.WithUsage</code> for runs that fail or interrupt) and the built-in <code>steps</code>. Exceeding one fails the execution with <code>budget_exceeded</code>.</td></tr>
           <tr><td>max_steps</td><td>Recursion limit: total node entries (default 1000). Exceeding it fails with <code>max_steps</code>.</td></tr>
@@ -318,6 +319,16 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
         Channels can also be written from outside the graph: synchronously on a running execution with
         <a href="#human"><code>Client.Update</code></a>, or on a fork with
         <a href="#timetravel"><code>WithForkWrites</code></a>. Both go through the reducers.
+      </p>
+      <p>
+        A completed execution returns its channels as an object keyed by channel name (a flow with no
+        channels returns its last node's result). To keep working state such as an agent's memory out of
+        the output, set the flow's <code>output</code> expression: <code>output: "{answer: channels.answer}"</code>
+        returns only <code>answer</code>, and <code>output: "results[last_node]"</code> returns the last
+        node's result even though channels exist. Quote it, since YAML would read a bare <code>{…}</code> as
+        a map. Channels the output leaves out stay in the state, so <code>State</code>, history and forks
+        still see them. An output that is not an object or null fails the execution with reason
+        <code>expression_error</code>.
       </p>
     </section>
 

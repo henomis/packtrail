@@ -184,7 +184,14 @@ type Flow struct {
 	// Channels declares the typed state of the flow. Nodes write deltas to
 	// channels and each channel folds them with its reducer.
 	Channels map[string]Channel `yaml:"channels,omitempty" json:"channels,omitempty"`
-	Nodes    []Node             `yaml:"nodes" json:"nodes"`
+	// Output is an expression, evaluated on the context when the execution
+	// completes, that yields its output: an object or null. It picks what the
+	// execution returns, e.g. "{answer: channels.answer}" to keep working
+	// memory out, or "results[last_node]" for the last node's result. When
+	// empty the output is every channel, or the last node's result if the flow
+	// declares no channels.
+	Output string `yaml:"output,omitempty" json:"output,omitempty"`
+	Nodes  []Node `yaml:"nodes" json:"nodes"`
 	// Budget caps generic usage counters reported by workers (and the
 	// built-in "steps" counter): exceeding one fails the execution with reason
 	// budget_exceeded.
@@ -204,6 +211,7 @@ type Flow struct {
 	branchOf map[string]string // branch id -> owning fanout
 	joinOf   map[string]string // fanout id -> join id
 	attrs    map[string]*expr.Program
+	output   *expr.Program
 }
 
 // Channel declares one state channel.
@@ -459,6 +467,10 @@ func (n *Node) RulePrograms() []*expr.Program { return n.rules }
 
 // OverProgram returns the compiled map source expression.
 func (n *Node) OverProgram() *expr.Program { return n.over }
+
+// OutputProgram returns the compiled output expression (nil = the default
+// output).
+func (f *Flow) OutputProgram() *expr.Program { return f.output }
 
 // InputProgram returns the compiled subflow input expression (nil = pass the
 // parent input through).

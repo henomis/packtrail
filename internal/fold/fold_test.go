@@ -726,6 +726,52 @@ nodes:
 	}
 }
 
+// TestOutputExpression: the flow's output expression picks what a completed
+// execution returns — a subset of channels or the last node's result even when
+// channels exist; channels left out stay in the state. Anything but an object
+// or null fails the execution.
+func TestOutputExpression(t *testing.T) {
+	cases := []struct {
+		name, output, want string
+		status             Status
+	}{
+		{"channel subset", "{answer: channels.answer, score: channels.score}", `{"answer":"42","score":3}`, StatusCompleted},
+		{"last result despite channels", "results[last_node]", `{"r":1}`, StatusCompleted},
+		{"named result", "results.a", `{"r":1}`, StatusCompleted},
+		{"nil", "nil", ``, StatusCompleted},
+		{"not an object", "channels.answer", ``, StatusFailed},
+		{"eval error", "channels.answer.x.y", ``, StatusFailed},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newH(t, fmt.Sprintf(`
+name: ch
+channels:
+  memory: {reducer: append}
+  answer: {}
+  score: {reducer: sum, default: 3}
+output: %q
+nodes:
+  - {id: a, type: task, kind: k}
+`, tc.output))
+			x.start(`{}`)
+			x.okWith("a", cmd.CompleteData{Output: json.RawMessage(`{"r":1}`), Writes: map[string]json.RawMessage{
+				"memory": json.RawMessage(`"secret"`), "answer": json.RawMessage(`"42"`),
+			}})
+			x.status(tc.status)
+
+			if string(x.st.Output) != tc.want {
+				t.Fatalf("output = %s, want %s", x.st.Output, tc.want)
+			}
+
+			if string(x.st.Channels["memory"]) != `["secret"]` {
+				t.Fatalf("memory = %s", x.st.Channels["memory"])
+			}
+		})
+	}
+}
+
 func TestInvalidWriteFailsNode(t *testing.T) {
 	x := newH(t, `
 name: ch

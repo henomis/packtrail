@@ -104,6 +104,7 @@ func (f *Flow) validateFlowLevel(p *problems) {
 	}
 
 	f.validateChannels(p)
+	f.validateOutput(p)
 	f.validateBudgetAndAttrs(p)
 	f.validateTriggers(p)
 }
@@ -153,6 +154,23 @@ func (f *Flow) validateTriggers(p *problems) {
 			}
 		}
 	}
+}
+
+func (f *Flow) validateOutput(p *problems) {
+	f.output = nil
+
+	if strings.TrimSpace(f.Output) == "" {
+		return
+	}
+
+	prog, err := expr.CompileValue(f.Output)
+	if err != nil {
+		p.add("", "output", err, "")
+
+		return
+	}
+
+	f.output = prog
 }
 
 func (f *Flow) validateChannels(p *problems) {

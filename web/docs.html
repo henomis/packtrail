@@ -330,6 +330,15 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
         still see them. An output that is not an object or null fails the execution with reason
         <code>expression_error</code>.
       </p>
+      <p>
+        <code>last_node</code> is the last task, join, map, subflow or await to settle: an await's result
+        is the signal payload, and a node that failed into <code>on_failure</code> counts too. A choice
+        never sets it. So when a flow ends from a
+        <a href="#node-choice">choice</a> the default output is the result of whatever ran just before
+        it: in an evaluator-optimizer loop or behind a guardrail that is the verdict, not the work
+        being judged, and after an approval await it is the signal payload. Name the result you want,
+        as in <code>output: "results.generate"</code>.
+      </p>
     </section>
 
     <hr class="docs__hr" />
@@ -339,7 +348,8 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <span class="eyebrow">Flow definitions</span>
       <h2>Expressions &amp; context</h2>
       <p>
-        Choice rules, map sources, subflow inputs, concurrency keys and search attributes are
+        Choice rules, map sources, subflow inputs, concurrency keys, search attributes and the flow's
+        <code>output</code> are
         <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">expr</a> expressions,
         compiled when the flow is validated. They see the execution context:
       </p>
@@ -440,6 +450,29 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
     - {<span class="k">when</span>: <span class="s">"signals['manager-decision'].approved"</span>, <span class="k">to</span>: pay}
     - {<span class="k">when</span>: <span class="s">"results.check.amount > 1000 &amp;&amp; visits.check &lt; 3"</span>, <span class="k">to</span>: check}
     - {<span class="k">default</span>: true, <span class="k">to</span>: reject}</code></pre>
+      </div>
+      <p>
+        A rule's <code>to</code> may be <code>$end</code> instead of a node: the execution completes
+        right there, with the flow's <a href="#channels"><code>output</code></a>. <code>$end</code> is not
+        a node, so it is never entered and does not count towards <code>visits</code> or
+        <code>max_steps</code>. In a <a href="#node-subflow">subflow</a>'s child it ends the child; the
+        parent goes on. This is how a loop such as evaluator-optimizer finishes without a no-op task:
+      </p>
+      <div class="codecard">
+        <div class="codecard__bar">
+          <span class="codecard__dots"><i></i><i></i><i></i></span>
+          <span class="codecard__name">yaml</span>
+        </div>
+<pre class="codecard__body"><code><span class="k">start</span>: generate
+<span class="k">output</span>: <span class="s">"results.generate"</span>
+<span class="k">nodes</span>:
+  - {<span class="k">id</span>: generate, <span class="k">type</span>: <span class="t">task</span>, <span class="k">kind</span>: writer, <span class="k">next</span>: evaluate}
+  - {<span class="k">id</span>: evaluate, <span class="k">type</span>: <span class="t">task</span>, <span class="k">kind</span>: judge, <span class="k">next</span>: check}
+  - <span class="k">id</span>: check
+    <span class="k">type</span>: <span class="t">choice</span>
+    <span class="k">rules</span>:
+      - {<span class="k">when</span>: <span class="s">"results.evaluate.pass || visits.generate >= 3"</span>, <span class="k">to</span>: $end}
+      - {<span class="k">default</span>: true, <span class="k">to</span>: generate}</code></pre>
       </div>
       <p>
         <code>on_error</code> decides what an expression error (typically a missing field) does. By
@@ -877,7 +910,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
           <tr><td>await_timeout</td><td>An await timed out with no <code>on_timeout</code>.</td></tr>
           <tr><td>join_failed</td><td>A join's policy could not be met.</td></tr>
           <tr><td>child_failed</td><td>A subflow's child did not complete.</td></tr>
-          <tr><td>expression_error</td><td>A choice rule failed with <code>on_error: fail</code>.</td></tr>
+          <tr><td>expression_error</td><td>A choice rule failed with <code>on_error: fail</code>, a map's <code>over</code> or a subflow or map input could not be built, or the flow's <code>output</code> failed or was not an object.</td></tr>
           <tr><td>budget_exceeded</td><td>A counter passed its budget.</td></tr>
           <tr><td>max_steps</td><td>The recursion limit was reached.</td></tr>
           <tr><td>delivery_failed</td><td>A job exhausted its deliveries (worker crashes); it is dead-lettered.</td></tr>

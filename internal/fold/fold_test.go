@@ -420,6 +420,76 @@ func TestChoice(t *testing.T) {
 	}
 }
 
+// evalOpt is evaluator-optimizer: generate, evaluate, and a choice that loops
+// back or ends the execution.
+const evalOpt = `
+name: eo
+start: gen
+nodes:
+  - {id: gen, type: task, kind: k, next: eval}
+  - {id: eval, type: task, kind: k, next: check}
+  - id: check
+    type: choice
+    rules: [{when: "results.eval.pass", to: $end}, {default: true, to: gen}]
+`
+
+// TestChoiceEnd: a choice rule to $end completes the execution. $end is not a
+// node: no NodeEntered, no step, no visit. The default output is the result of
+// the last task before the choice (here the evaluator's verdict); an output
+// expression picks the generation instead.
+func TestChoiceEnd(t *testing.T) {
+	for _, tc := range []struct{ output, want string }{
+		{"", `{"pass":true}`},
+		{`output: "results.gen"`, `{"v":2}`},
+	} {
+		x := newH(t, evalOpt+tc.output)
+		x.start(`{}`)
+		x.ok("gen", `{"v":1}`)
+		x.ok("eval", `{"pass":false}`)
+		x.ok("gen", `{"v":2}`)
+
+		evs := x.ok("eval", `{"pass":true}`)
+		x.status(StatusCompleted)
+
+		if string(x.st.Output) != tc.want {
+			t.Fatalf("output = %s, want %s", x.st.Output, tc.want)
+		}
+
+		if got := types(evs); !slices.Equal(got, []event.Type{
+			event.NodeCompleted, event.NodeEntered, event.ChoiceEvaluated, event.ExecutionCompleted,
+		}) {
+			t.Fatalf("events %v", got)
+		}
+
+		if _, ok := x.st.Visits[flow.End]; ok || x.st.Steps != 6 || x.st.LastNode != "eval" {
+			t.Fatalf("visits %v steps %d last %s", x.st.Visits, x.st.Steps, x.st.LastNode)
+		}
+	}
+}
+
+// TestChoiceEndAfterAwait: after an await, last_node is the await, so ending
+// from the choice that follows returns the signal payload by default.
+func TestChoiceEndAfterAwait(t *testing.T) {
+	x := newH(t, `
+name: ap
+start: draft
+nodes:
+  - {id: draft, type: task, kind: k, next: approve}
+  - {id: approve, type: await, signal: approval, timeout: 1h, next: check}
+  - id: check
+    type: choice
+    rules: [{when: "signals.approval.ok", to: $end}, {default: true, to: draft}]
+`)
+	x.start(`{}`)
+	x.ok("draft", `{"text":"x"}`)
+	x.do(cmd.Signal, cmd.SignalData{Name: "approval", Payload: json.RawMessage(`{"ok":true}`)})
+	x.status(StatusCompleted)
+
+	if string(x.st.Output) != `{"ok":true}` || x.st.LastNode != "approve" {
+		t.Fatalf("output %s last %s", x.st.Output, x.st.LastNode)
+	}
+}
+
 func TestChoiceOnErrorFail(t *testing.T) {
 	x := newH(t, `
 name: ch

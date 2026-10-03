@@ -299,6 +299,32 @@ func TestValidateRejects(t *testing.T) {
 
 func fanYAML(nodes string) string { return "name: x\nstart: f\nnodes: " + nodes }
 
+// TestChoiceEndIsAnExit: a flow whose only exit is a choice to $end
+// validates; $end is a choice target only.
+func TestChoiceEndIsAnExit(t *testing.T) {
+	y := `
+name: eo
+start: gen
+nodes:
+  - {id: gen, type: task, kind: k, next: check}
+  - id: check
+    type: choice
+    rules: [{when: "visits.gen < 3", to: gen}, {default: true, to: $end}]
+`
+	if _, err := Parse([]byte(y)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{
+		"name: x\nnodes: [{id: a, type: task, kind: k, next: $end}]",
+		"name: x\nstart: $end\nnodes: [{id: a, type: task, kind: k}]",
+	} {
+		if _, err := Parse([]byte(bad)); err == nil || !strings.Contains(err.Error(), `unknown node "$end"`) {
+			t.Fatalf("%q: err = %v", bad, err)
+		}
+	}
+}
+
 func TestLoopsAreAllowed(t *testing.T) {
 	// Per-visit state (generations) makes revisiting a fan legal.
 	y := `

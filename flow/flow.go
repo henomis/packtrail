@@ -54,6 +54,12 @@ const (
 	NodeSubflow = "subflow"
 )
 
+// End is the reserved choice target that completes the execution, with the
+// output of the flow's output expression. It is not a node: it is never
+// entered, counted in steps or visited. In a child execution it ends the child,
+// and the parent continues.
+const End = "$end"
+
 // Join policies.
 const (
 	JoinAll    = "all"
@@ -331,7 +337,8 @@ type Concurrency struct {
 type Rule struct {
 	When    string `yaml:"when,omitempty" json:"when,omitempty"`
 	Default bool   `yaml:"default,omitempty" json:"default,omitempty"`
-	To      string `yaml:"to" json:"to"`
+	// To is the node the rule routes to, or End to complete the execution.
+	To string `yaml:"to" json:"to"`
 }
 
 // Node returns the node with the given id, or nil. Valid after Validate.

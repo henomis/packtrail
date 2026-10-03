@@ -371,6 +371,28 @@ func TestM2SubflowCompletes(t *testing.T) {
 	}
 }
 
+// TestM2ChoiceEndEndsOnlyTheChild: a choice to $end in a child execution
+// completes the child; the parent continues past the subflow.
+func TestM2ChoiceEndEndsOnlyTheChild(t *testing.T) {
+	e := NewEnv(t, []string{m2Parent, `
+name: child
+nodes:
+  - {id: work, type: task, kind: child-work, next: check}
+  - id: check
+    type: choice
+    rules: [{default: true, to: $end}]
+`})
+	e.Worker("echo", Echo)
+	e.Worker("child-work", func(context.Context, *worker.Job) (*worker.Result, error) {
+		return &worker.Result{Output: map[string]any{"done": true}}, nil
+	})
+
+	st := e.Completed(e.Start("parent", map[string]any{"child": map[string]any{}}))
+	if string(st.Results["sub"]) != `{"done":true}` || st.Results["after"] == nil {
+		t.Fatalf("results %v", st.Results)
+	}
+}
+
 func TestM2ChildCancelledWithParent(t *testing.T) {
 	e := NewEnv(t, []string{m2Parent, m2Child})
 

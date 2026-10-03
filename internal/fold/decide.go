@@ -798,9 +798,16 @@ func (d *decider) choose(n *flow.Node) error {
 	return d.route(n, def, n.Rules[def].To)
 }
 
+// route records the choice and follows it: into node to, or, for flow.End,
+// to completion. Nothing else is in flight when a choice runs (a choice is
+// never a fan-out branch), so completing here strands no work.
 func (d *decider) route(n *flow.Node, rule int, to string) error {
 	if err := d.emit(event.ChoiceEvaluated, &event.Choice{Node: n.ID, Rule: rule, To: to}); err != nil {
 		return err
+	}
+
+	if to == flow.End {
+		return d.complete0()
 	}
 
 	return d.enter(to)

@@ -163,7 +163,7 @@ type route struct{ field, to string }
 
 // routes returns every ordinary routing transition out of n (not fanout
 // branches): next, choice rule targets, await on_timeout, on_failure, dynamic
-// targets.
+// targets. A choice rule to End completes the execution: it leads to no node.
 func routes(n *Node) []route {
 	var out []route
 
@@ -172,7 +172,9 @@ func routes(n *Node) []route {
 	}
 
 	for i, r := range n.Rules {
-		out = append(out, route{fmt.Sprintf("rules[%d].to", i), r.To})
+		if r.To != End {
+			out = append(out, route{fmt.Sprintf("rules[%d].to", i), r.To})
+		}
 	}
 
 	if n.OnTimeout != "" {

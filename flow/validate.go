@@ -511,7 +511,9 @@ func (f *Flow) validateChoice(p *problems, n *Node) {
 			}
 		}
 
-		f.ref(p, n, field+".to", r.To)
+		if r.To != End {
+			f.ref(p, n, field+".to", r.To)
+		}
 	}
 
 	if len(n.Rules) > 0 && defaults != 1 {

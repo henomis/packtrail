@@ -165,7 +165,7 @@ function renderGraph(def, start, st) {
   const joinOf = new Map();
   for (const n of def.nodes) if (n.branches?.length && n.next) for (const b of n.branches) joinOf.set(b, n.next);
   const succ = (n) => [n.branches?.length ? null : n.next, ...(n.rules || []).map((r) => r.to), n.on_timeout, n.on_failure,
-    ...(n.dynamic || []), ...(n.branches || []), joinOf.get(n.id)].filter(Boolean);
+    ...(n.dynamic || []), ...(n.branches || []), joinOf.get(n.id)].filter((s) => nodes.has(s)); // drops "$end"
   const depth = new Map([[start, 0]]); const queue = [start];
   while (queue.length) {
     const id = queue.shift();

@@ -1,4 +1,4 @@
-.PHONY: examples all test lint fmt vet clean coverage help license tidy fix doc check ui build-ui modernize
+.PHONY: examples all test e2e lint fmt vet clean coverage help license tidy fix doc check ui build-ui modernize
 
 # Variables
 GO := go
@@ -15,6 +15,7 @@ all: test lint
 help:
 	@echo "Available targets:"
 	@echo "  make test        - Run all tests"
+	@echo "  make e2e         - Run the end-to-end workflows (chaos included) three times"
 	@echo "  make lint        - Run golangci-lint"
 	@echo "  make fmt         - Format all Go files"
 	@echo "  make fix         - Run go fix on all packages"
@@ -33,6 +34,11 @@ help:
 test:
 	@echo "Running tests..."
 	$(GO) test $(GOFLAGS) -race -timeout 5m $(PKGS)
+
+## e2e: Run the end-to-end workflows repeatedly: chaos bugs show up across runs
+e2e:
+	@echo "Running end-to-end workflows..."
+	$(GO) test $(GOFLAGS) -race -count=3 -timeout 20m ./e2e/
 
 ## coverage: Generate test coverage report
 coverage:

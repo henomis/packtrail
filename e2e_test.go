@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/henomis/packtrail"
-	"github.com/henomis/packtrail/internal/natstest"
+	"github.com/henomis/packtrail/packtrailtest"
 	"github.com/henomis/packtrail/worker"
 )
 
@@ -33,12 +33,12 @@ nodes:
 `
 
 func TestEndToEndLinear(t *testing.T) {
-	s := natstest.Start(t)
+	s := packtrailtest.Start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	eng, err := packtrail.New(s.NC, packtrail.WithFlowYAML([]byte(linearFlow)), packtrail.WithPartitions(2))
+	eng, err := packtrail.New(s.Connect(t), packtrail.WithFlowYAML([]byte(linearFlow)), packtrail.WithPartitions(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,12 +86,12 @@ nodes:
 // TestDriveRightAfterStart drives executions the moment Start returns, waits
 // for a point inside one, and decodes what it produced.
 func TestDriveRightAfterStart(t *testing.T) {
-	s := natstest.Start(t)
+	s := packtrailtest.Start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	eng, err := packtrail.New(s.NC, packtrail.WithFlowYAML([]byte(gatedFlow)), packtrail.WithPartitions(2))
+	eng, err := packtrail.New(s.Connect(t), packtrail.WithFlowYAML([]byte(gatedFlow)), packtrail.WithPartitions(2))
 	if err != nil {
 		t.Fatal(err)
 	}

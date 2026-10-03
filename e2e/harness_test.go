@@ -19,8 +19,8 @@
 //
 // Every process (engine, worker, client) has its own NATS connection, so a
 // test can crash one — close its connection under it — as well as stop it.
-// Only the harness reaches inside: a test NATS server it can restart, and the
-// diagnosis of a stalled execution (diagnose_test.go).
+// The NATS server is packtrailtest's, so a test can restart it; a stalled
+// execution is diagnosed through the same public API (diagnose_test.go).
 // Run with: go test ./e2e/ (add -short to skip the chaos runs).
 package e2e_test
 
@@ -33,7 +33,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail"
-	"github.com/henomis/packtrail/internal/natstest"
+	"github.com/henomis/packtrail/packtrailtest"
 	"github.com/henomis/packtrail/worker"
 )
 
@@ -47,12 +47,15 @@ const (
 // cluster is one namespace served by engine and worker processes.
 type cluster struct {
 	t   *testing.T
-	s   *natstest.Server
+	s   *packtrailtest.Server
 	ctx context.Context //nolint:containedctx // test-scoped context.
 	// c is a standalone client (its own connection, like an API process).
 	c *packtrail.Client
 
 	opts []packtrail.Option
+
+	// root is the cluster a view (with) was taken from: it owns the processes.
+	root *cluster
 
 	mu      sync.Mutex
 	engines []*proc
@@ -61,8 +64,10 @@ type cluster struct {
 
 // proc is a running engine or worker process.
 type proc struct {
-	name   string
-	nc     *nats.Conn
+	name string
+	nc   *nats.Conn
+	// eng is the engine an engine process runs.
+	eng    *packtrail.Engine
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -70,7 +75,7 @@ type proc struct {
 func newCluster(t *testing.T, flows []string, opts ...packtrail.Option) *cluster {
 	t.Helper()
 
-	s := natstest.Start(t)
+	s := packtrailtest.Start(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	t.Cleanup(cancel)
@@ -105,7 +110,29 @@ func newCluster(t *testing.T, flows []string, opts ...packtrail.Option) *cluster
 // with returns a view of the cluster reporting to t (a subtest). It shares
 // the processes but must not start or stop any.
 func (cl *cluster) with(t *testing.T) *cluster {
-	return &cluster{t: t, s: cl.s, ctx: cl.ctx, c: cl.c, opts: cl.opts}
+	return &cluster{t: t, s: cl.s, ctx: cl.ctx, c: cl.c, opts: cl.opts, root: cl}
+}
+
+// liveEngines returns the engines of the processes still running.
+func (cl *cluster) liveEngines() []*packtrail.Engine {
+	if cl.root != nil {
+		return cl.root.liveEngines()
+	}
+
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	var out []*packtrail.Engine
+
+	for _, p := range cl.engines {
+		select {
+		case <-p.done:
+		default:
+			out = append(out, p.eng)
+		}
+	}
+
+	return out
 }
 
 // startEngine starts an engine process and waits until it pulls.
@@ -120,6 +147,7 @@ func (cl *cluster) startEngine() *proc {
 	}
 
 	p := cl.spawn("engine", nc, eng.Run)
+	p.eng = eng
 
 	select {
 	case <-eng.Ready():

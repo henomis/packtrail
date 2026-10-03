@@ -20,38 +20,31 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/nats-io/nats.go/jetstream"
-
-	"github.com/henomis/packtrail/internal/names"
 )
 
-// diagnose describes why id may be stuck: the end of its log, its open
-// work, and the streams and consumers its work goes through.
+// diagnose describes why id may be stuck, through the public API: its open
+// work, the end of its log, what the engines report about dispatching, and
+// any dead letter or quarantine.
 func (cl *cluster) diagnose(id string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	var b strings.Builder
 
-	n := names.New(names.Default)
-	p := names.Partition(id, partitions)
-
-	fmt.Fprintf(&b, "\n=== diagnosis of %s (partition %d)\n", id, p)
+	fmt.Fprintf(&b, "\n=== diagnosis of %s\n", id)
 
 	if st, err := cl.c.Get(ctx, id); err == nil {
 		fmt.Fprintf(&b, "status %s steps %d last %s updated %s lastSeq %d\n", st.Status, st.Steps, st.LastNode,
 			st.Updated.Format(time.RFC3339Nano), st.LastSeq)
 
-		for k, task := range st.Tasks {
-			tj, _ := json.Marshal(task) //nolint:errchkjson // diagnostics.
-			fmt.Fprintf(&b, "open task %s: %s\n", k, tj)
+		for name, open := range map[string]any{"tasks": st.Tasks, "timers": st.Timers, "awaits": st.Awaits,
+			"fans": st.Fans, "maps": st.Maps, "children": st.Children} {
+			if j, _ := json.Marshal(open); string(j) != "null" && string(j) != "{}" { //nolint:errchkjson // diagnostics.
+				fmt.Fprintf(&b, "open %s: %s\n", name, j)
+			}
 		}
-
-		for k, tm := range st.Timers {
-			tj, _ := json.Marshal(tm) //nolint:errchkjson // diagnostics.
-			fmt.Fprintf(&b, "timer %s: %s\n", k, tj)
-		}
+	} else {
+		fmt.Fprintf(&b, "get: %v\n", err)
 	}
 
 	if evs, err := cl.c.History(ctx, id); err == nil {
@@ -62,38 +55,10 @@ func (cl *cluster) diagnose(id string) string {
 		}
 	}
 
-	consumer := func(stream, durable string) {
-		c, err := cl.s.JS.Consumer(ctx, stream, durable)
-		if err != nil {
-			fmt.Fprintf(&b, "consumer %s/%s: %v\n", stream, durable, err)
-
-			return
-		}
-
-		i, err := c.Info(ctx)
-		if err != nil {
-			fmt.Fprintf(&b, "consumer %s/%s info: %v\n", stream, durable, err)
-
-			return
-		}
-
-		fmt.Fprintf(&b, "consumer %s: pending %d ack-pending %d redelivered %d waiting %d delivered %d/%d ackfloor %d/%d\n",
-			durable, i.NumPending, i.NumAckPending, i.NumRedelivered, i.NumWaiting,
-			i.Delivered.Consumer, i.Delivered.Stream, i.AckFloor.Consumer, i.AckFloor.Stream)
-	}
-
-	consumer(n.StreamCmd, n.DurEngine(p))
-	consumer(n.StreamEvents, n.DurDispatch(p))
-
-	if ws, err := cl.s.JS.Stream(ctx, n.StreamWork); err == nil {
-		lister := ws.ListConsumers(ctx)
-		for ci := range lister.Info() {
-			consumer(n.StreamWork, ci.Name)
-		}
-
-		if info, ierr := ws.Info(ctx, jetstream.WithSubjectFilter(n.Prefix+".work.>")); ierr == nil {
-			fmt.Fprintf(&b, "work stream: msgs %d subjects %v\n", info.State.Msgs, info.State.Subjects)
-		}
+	for i, eng := range cl.liveEngines() {
+		m := eng.Metrics(ctx)
+		fmt.Fprintf(&b, "engine %d: commands %d conflicts %d dead letters %d dispatched %d projection lag %d stall %s %v\n",
+			i, m.Commands, m.Conflicts, m.DeadLetters, m.JobsDispatched, m.ProjectionLag, m.DispatchStall, m.DispatchStalls)
 	}
 
 	if dl, err := cl.c.DeadLetters(ctx, 20); err == nil {

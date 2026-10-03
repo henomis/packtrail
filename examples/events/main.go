@@ -75,8 +75,15 @@ func main() {
 		return &worker.Result{Output: map[string]any{"ok": true}}, nil
 	})
 
-	time.Sleep(300 * time.Millisecond) // let the trigger subscription start
+	c := eng.Client()
 
+	// Follow every execution that ends from now on.
+	ended, err := c.WatchTerminal(ctx, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// The engine is ready, so the trigger is already subscribed.
 	for i, id := range []string{"order-1001", "order-1002", "order-1001"} { // the last one is a duplicate
 		m := nats.NewMsg("orders.created")
 		m.Header.Set("Nats-Msg-Id", id)
@@ -87,20 +94,30 @@ func main() {
 		}
 	}
 
-	time.Sleep(3 * time.Second)
+	// Two orders (the duplicate starts nothing) and a few cron firings.
+	done := map[string]int{}
 
-	c := eng.Client()
+	for done["order"] < 2 || done["report"] < 3 {
+		var e packtrail.Ended
+
+		select {
+		case e = <-ended:
+		case <-ctx.Done():
+			log.Fatalf("still waiting: %v", done)
+		}
+
+		st, err := c.Get(ctx, e.ExecID)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Printf("  %s %s %s\n", st.Flow, e.ExecID, e.Status)
+		done[st.Flow]++
+	}
 
 	if err := c.Unschedule(ctx, "every-second"); err != nil {
 		log.Fatal(err)
 	}
 
-	for _, f := range []string{"report", "order"} {
-		list, err := c.List(ctx, packtrail.ListFilter{Flow: f, Status: packtrail.StatusCompleted})
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Printf("%s: %d completed executions\n", f, len(list))
-	}
+	fmt.Printf("orders: %d, reports: %d\n", done["order"], done["report"])
 }

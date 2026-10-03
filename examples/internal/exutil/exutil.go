@@ -48,22 +48,33 @@ func (g *Group) Stop() {
 	g.wg.Wait()
 }
 
-// Engine creates, provisions and runs an engine.
+// Engine creates and runs an engine, and returns once it is ready: the
+// namespace is provisioned and its consumers (cron and triggers included)
+// are pulling.
 func (g *Group) Engine(nc *nats.Conn, opts ...packtrail.Option) *packtrail.Engine {
 	eng, err := packtrail.New(nc, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := eng.Init(g.ctx); err != nil {
-		log.Fatal(err)
-	}
+	done := make(chan error, 1)
 
 	g.wg.Go(func() {
-		if err := eng.Run(g.ctx); err != nil {
+		err := eng.Run(g.ctx)
+		if err != nil {
 			log.Print(err)
 		}
+
+		done <- err
 	})
+
+	select {
+	case <-eng.Ready():
+	case err := <-done:
+		log.Fatalf("engine stopped before it was ready: %v", err)
+	case <-g.ctx.Done():
+		log.Fatal("engine never ready")
+	}
 
 	return eng
 }

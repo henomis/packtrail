@@ -197,7 +197,8 @@ API reference on [pkg.go.dev](https://pkg.go.dev/github.com/henomis/packtrail).
 make check   # go test -race + golangci-lint + go vet
 ```
 
-Tests run against a real embedded nats-server. The acceptance suite
+Tests run against a real embedded nats-server; `packtrailtest.Start(t)` gives
+your own tests the same one (with `Restart` to simulate an outage). The acceptance suite
 (`internal/acceptance`) injects faults: engine kills, NATS restarts, duplicate
 and reordered completions. `PT_CONFORMANCE_WORKER="<command>"` runs the
 conformance suite against a worker written in another language.

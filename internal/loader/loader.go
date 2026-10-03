@@ -72,6 +72,16 @@ func (l *Loader) Load(ctx context.Context, execID string, upTo uint64) (*fold.St
 		return fold.New(execID), nil, nil
 	}
 
+	// A continuation leaves the messages its dispatcher has not processed in
+	// front of itself (they are in the archived segment): a live log may
+	// begin with them. Fold from the last event that bases a state; with none
+	// in range, the state is older than the live log's base.
+	if i := lastBase(evs); i >= 0 {
+		st, evs = nil, evs[i:]
+	} else if st == nil {
+		return l.loadFromHistory(ctx, execID, upTo)
+	}
+
 	var def *flow.Flow
 
 	if st != nil {
@@ -97,6 +107,19 @@ func (l *Loader) Load(ctx context.Context, execID string, upTo uint64) (*fold.St
 	}
 
 	return st, def, nil
+}
+
+// lastBase returns the index in evs of the last event a state can be folded
+// from without what precedes it, or -1.
+func lastBase(evs []event.Event) int {
+	for i := len(evs) - 1; i >= 0; i-- {
+		switch evs[i].Type { //nolint:exhaustive // only the events that base a state.
+		case event.ExecutionStarted, event.ExecutionForked, event.ExecutionContinued:
+			return i
+		}
+	}
+
+	return -1
 }
 
 // loadFromHistory folds execID up to upTo from its whole history, when upTo is

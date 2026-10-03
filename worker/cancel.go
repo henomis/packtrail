@@ -184,14 +184,7 @@ func (w *Worker) executionEnded(ctx context.Context, execID string) (ended, gone
 		return false, false, err
 	}
 
-	for _, t := range event.Types(m.Header) {
-		switch t { //nolint:exhaustive // only terminal types end an execution.
-		case event.ExecutionCompleted, event.ExecutionFailed, event.ExecutionCancelled:
-			return true, false, nil
-		}
-	}
-
-	return false, false, nil
+	return slices.ContainsFunc(event.Types(m.Header), event.Type.Terminal), false, nil
 }
 
 func (w *Worker) eventsStream(ctx context.Context) (jetstream.Stream, error) {

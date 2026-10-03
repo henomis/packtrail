@@ -35,14 +35,7 @@ import (
 )
 
 // IsTerminal reports whether ev ends an execution.
-func IsTerminal(ev event.Event) bool {
-	switch ev.Type { //nolint:exhaustive // only terminal types matter.
-	case event.ExecutionCompleted, event.ExecutionFailed, event.ExecutionCancelled:
-		return true
-	default:
-		return false
-	}
-}
+func IsTerminal(ev event.Event) bool { return ev.Type.Terminal() }
 
 // Watch streams the events of an execution from sequence from (0 = the
 // beginning), as they are appended: LangGraph's "updates" stream mode. The
@@ -124,6 +117,129 @@ func sendDecision(ctx context.Context, out chan<- event.Event, evs []event.Event
 }
 
 const watchBuffer = 64
+
+// Ended reports that an execution finished.
+type Ended struct {
+	ExecID string
+	// Status is completed, failed or cancelled; Get has the reason and error.
+	Status Status
+	// Seq is the stream sequence of the terminal decision: pass Seq+1 to
+	// WatchTerminal to resume after it.
+	Seq uint64
+}
+
+// WatchTerminal streams the end of every execution in the namespace (subflow
+// children included) from stream sequence fromSeq, or from now when fromSeq
+// is 0: one consumer for all executions instead of a Wait per execution. It
+// reads only event headers, never bodies. Endings arrive in log order, once
+// each, across reconnects (the ordered consumer resumes after the last
+// message it delivered); a slow reader slows the watch instead of losing
+// endings. The channel closes when ctx ends or the connection is closed.
+func (c *Client) WatchTerminal(ctx context.Context, fromSeq uint64) (<-chan Ended, error) {
+	if err := c.attach(ctx); err != nil {
+		return nil, err
+	}
+
+	next := fromSeq
+	if next == 0 {
+		var err error
+		if next, err = c.eventsEnd(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{c.in.Names.EventsSubjects()},
+		DeliverPolicy:  jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:    next,
+		HeadersOnly:    true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	it, err := cons.Messages()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan Ended, watchBuffer)
+
+	go func() {
+		defer close(out)
+		defer it.Stop()
+
+		stop := context.AfterFunc(ctx, it.Stop)
+		defer stop()
+
+		for {
+			msg, lerr := it.Next()
+			if lerr != nil {
+				return
+			}
+
+			md, lerr := msg.Metadata()
+			if lerr != nil {
+				continue
+			}
+
+			ended, ok := terminalOf(msg, md.Sequence.Stream)
+			if !ok {
+				continue
+			}
+
+			select {
+			case out <- ended:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// eventsEnd returns the sequence the next event will get.
+func (c *Client) eventsEnd(ctx context.Context) (uint64, error) {
+	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamEvents)
+	if err != nil {
+		return 0, err
+	}
+
+	info, err := s.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.State.LastSeq + 1, nil
+}
+
+// terminalOf reads the end of an execution from the headers of a decision.
+func terminalOf(msg jetstream.Msg, seq uint64) (Ended, bool) {
+	for _, t := range event.Types(msg.Headers()) {
+		if !t.Terminal() {
+			continue
+		}
+
+		subject := msg.Subject()
+
+		return Ended{ExecID: subject[strings.LastIndexByte(subject, '.')+1:], Status: endedStatus(t), Seq: seq}, true
+	}
+
+	return Ended{}, false
+}
+
+// endedStatus is the status a terminal event type leaves an execution in.
+func endedStatus(t event.Type) Status {
+	switch t { //nolint:exhaustive // called with terminal types only.
+	case event.ExecutionCompleted:
+		return StatusCompleted
+	case event.ExecutionFailed:
+		return StatusFailed
+	default:
+		return StatusCancelled
+	}
+}
 
 // Progress is an intermediate result a worker published while running a node
 // (worker.Job.Progress). It is never stored: only listeners receive it.
@@ -317,11 +433,8 @@ func (c *Client) waitTerminal(ctx context.Context, execID string, from uint64) e
 			return nil
 		}
 
-		for _, t := range event.Types(msg.Headers()) {
-			switch t { //nolint:exhaustive // only terminal types matter.
-			case event.ExecutionCompleted, event.ExecutionFailed, event.ExecutionCancelled:
-				return nil
-			}
+		if slices.ContainsFunc(event.Types(msg.Headers()), event.Type.Terminal) {
+			return nil
 		}
 	}
 }

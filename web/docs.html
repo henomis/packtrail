@@ -726,6 +726,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Get(exec)</td><td>Current state (archived executions are read from the archive).</td></tr>
           <tr><td>Wait(exec)</td><td>Block until the execution finishes and return the final state. Only <code>ctx</code> ends it early.</td></tr>
           <tr><td>Watch(exec, from)</td><td>Stream events from a sequence.</td></tr>
+          <tr><td>WatchTerminal(from)</td><td>Stream the end of every execution (status and sequence), from now or a sequence.</td></tr>
           <tr><td>Progress(exec)</td><td>Stream workers' progress messages from now on.</td></tr>
           <tr><td>List(filter)</td><td>Indexed executions by status, flow or search attribute, newest first.</td></tr>
           <tr><td>History, StateAt, OutputHistory</td><td>See <a href="#timetravel">time travel</a>.</td></tr>

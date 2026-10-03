@@ -57,6 +57,17 @@ const (
 	TimerFired         Type = "TimerFired"
 )
 
+// Terminal reports whether t ends an execution: completed, failed or
+// cancelled. ExecutionContinued does not; the execution goes on.
+func (t Type) Terminal() bool {
+	switch t { //nolint:exhaustive // only terminal types matter.
+	case ExecutionCompleted, ExecutionFailed, ExecutionCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 // Version is the current version of every event type.
 const Version = 1
 

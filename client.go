@@ -196,8 +196,12 @@ func WithVersion(hash string) StartOption { return func(o *startOpts) { o.versio
 func WithTraceparent(tp string) StartOption { return func(o *startOpts) { o.trace = tp } }
 
 // Start starts an execution of flowName with input (a JSON object, a struct
-// or nil) and returns its id. The execution runs asynchronously; use Wait or
-// Watch to follow it.
+// or nil) and returns its id once the execution exists: Signal, Cancel,
+// Resume, Update and Get can address it right away. It needs a running
+// engine, and fails with ErrInvalidArgument when the engine refuses the
+// input. The execution itself runs asynchronously; use Wait, WaitUntil or
+// Watch to follow it. If ctx ends first the execution may still start: retry
+// with the same WithExecutionID.
 func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...StartOption) (string, error) {
 	if err := c.attach(ctx); err != nil {
 		return "", err
@@ -238,7 +242,7 @@ func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...
 		return "", err
 	}
 
-	if err = wire.PublishCmd(ctx, c.in, start, o.trace); err != nil {
+	if _, err = c.request(ctx, start, o.trace); err != nil {
 		return "", err
 	}
 
@@ -559,7 +563,7 @@ func WithForkWrites(writes map[string]any) ForkOption {
 // Fork creates a new execution from the state of execID right after the
 // event at sequence seq (rounded up to the end of that decision), and
 // continues it from there: what was in flight is dispatched again. The source
-// is untouched.
+// is untouched. Like Start, it returns once the new execution exists.
 func (c *Client) Fork(ctx context.Context, execID string, seq uint64, opts ...ForkOption) (string, error) {
 	evs, err := c.History(ctx, execID)
 	if err != nil {
@@ -609,7 +613,11 @@ func (c *Client) fork(ctx context.Context, execID string, seq uint64, opts []For
 		return "", err
 	}
 
-	return o.id, wire.PublishCmd(ctx, c.in, f, "")
+	if _, err = c.request(ctx, f, ""); err != nil {
+		return "", err
+	}
+
+	return o.id, nil
 }
 
 // checkForkWrites validates fork edits against the source's flow and state at
@@ -697,36 +705,49 @@ func (c *Client) Update(ctx context.Context, execID string, writes map[string]an
 		return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 
+	seq, err := c.request(ctx, command, "")
+	if err != nil {
+		return nil, err
+	}
+
+	return c.StateAt(ctx, execID, seq)
+}
+
+// request publishes command and waits for the engine's answer: the sequence
+// of the decision it produced (or of the last one, for a no-op). The reply
+// subject travels in the command, so an engine that takes over a redelivered
+// command answers too.
+func (c *Client) request(ctx context.Context, command cmd.Command, traceparent string) (uint64, error) {
 	inbox := c.nc.NewRespInbox()
 
 	sub, err := c.nc.SubscribeSync(inbox)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	defer func() { _ = sub.Unsubscribe() }()
 
 	command.Reply = inbox
 
-	if err = wire.PublishCmd(ctx, c.in, command, ""); err != nil {
-		return nil, err
+	if err = wire.PublishCmd(ctx, c.in, command, traceparent); err != nil {
+		return 0, err
 	}
 
 	m, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	var r wire.Reply
 	if err = json.Unmarshal(m.Data, &r); err != nil {
-		return nil, fmt.Errorf("packtrail: update reply: %w", err)
+		return 0, fmt.Errorf("packtrail: %s reply: %w", command.Type, err)
 	}
 
 	if !r.OK {
-		return nil, replyError(execID, r)
+		return 0, replyError(command.ExecID, r)
 	}
 
-	return c.StateAt(ctx, execID, r.Seq)
+	return r.Seq, nil
 }
 
 func replyError(execID string, r wire.Reply) error {

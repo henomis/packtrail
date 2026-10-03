@@ -16,7 +16,6 @@ package e2e_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -175,7 +174,7 @@ func TestChaos(t *testing.T) {
 		}
 
 		var notes []string
-		if json.Unmarshal(st.Channels["scratch"], &notes) != nil || len(notes) != steps {
+		if st.Channel("scratch", &notes) != nil || len(notes) != steps {
 			t.Fatalf("agent %s: scratch %d entries, want %d", id, len(notes), steps)
 		}
 	}

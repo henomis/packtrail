@@ -24,7 +24,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -97,11 +96,16 @@ func main() {
 
 	var perDoc []struct{ Doc, Words int }
 
-	_ = json.Unmarshal(st.Results["count"], &perDoc)
+	if err := st.Result("count", &perDoc); err != nil {
+		log.Fatal(err)
+	}
 
 	var longest []string
 
-	_ = json.Unmarshal(st.Channels["longest"], &longest)
+	if err := st.Channel("longest", &longest); err != nil {
+		log.Fatal(err)
+	}
+
 	sort.Strings(longest)
 
 	fmt.Printf("per document: %+v\n", perDoc)

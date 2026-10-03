@@ -16,12 +16,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/internal/natstest"
 )
 
@@ -69,6 +71,24 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("flows: %s", out)
 	}
 
+	// Start returns once an engine created the execution.
+	eng, eerr := packtrail.New(s.Connect(t), packtrail.WithNamespace("clitest"), packtrail.WithPartitions(2),
+		packtrail.WithoutDispatcher())
+	if eerr != nil {
+		t.Fatal(eerr)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_ = eng.Run(ctx)
+	}()
+
+	t.Cleanup(func() { cancel(); <-done })
+
 	var started struct {
 		ExecID string `json:"exec_id"`
 	}
@@ -77,8 +97,9 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("start: %+v %v", started, err)
 	}
 
-	// No engine is running: the command waits in the stream. Cancel is still
-	// accepted only for an existing execution.
+	// The execution can be driven right away; a missing one cannot.
+	cli("cancel", "e-1", "-reason", "done")
+
 	var out bytes.Buffer
 	if err := run(append(append([]string{}, srv...), "cancel", "nope"), &out); err == nil {
 		t.Fatal("cancel of a missing execution succeeded")

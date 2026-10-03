@@ -13,12 +13,14 @@
 // limitations under the License.
 
 // Package e2e_test runs realistic, multi-feature workflows end to end through
-// the public API only (packtrail, worker, flow), the way an application uses
+// the public API (packtrail, worker, flow), the way an application uses
 // packtrail, and checks every execution against the invariants of the event
 // model (invariants_test.go) on top of each scenario's expected outcome.
 //
 // Every process (engine, worker, client) has its own NATS connection, so a
 // test can crash one — close its connection under it — as well as stop it.
+// Only the harness reaches inside: a test NATS server it can restart, and the
+// diagnosis of a stalled execution (diagnose_test.go).
 // Run with: go test ./e2e/ (add -short to skip the chaos runs).
 package e2e_test
 
@@ -237,22 +239,19 @@ func (cl *cluster) wait(id string) *packtrail.State {
 	return st
 }
 
-// waitStatus polls until id has status want.
-func (cl *cluster) waitStatus(id string, want packtrail.Status) *packtrail.State {
+// waitUntil waits until cond holds on id.
+func (cl *cluster) waitUntil(id, what string, cond func(*packtrail.State) bool) *packtrail.State {
 	cl.t.Helper()
 
-	for {
-		st, err := cl.c.Get(cl.ctx, id)
-		if err == nil && st.Status == want {
-			return st
-		}
+	ctx, cancel := context.WithTimeout(cl.ctx, stallTimeout)
+	defer cancel()
 
-		if cl.ctx.Err() != nil {
-			cl.t.Fatalf("%s never reached %s: %+v %v", id, want, st, err)
-		}
-
-		time.Sleep(20 * time.Millisecond)
+	st, err := cl.c.WaitUntil(ctx, id, cond)
+	if err != nil {
+		cl.t.Fatalf("%s never %s: %v%s", id, what, err, cl.diagnose(id))
 	}
+
+	return st
 }
 
 // eventually polls cond until it holds.

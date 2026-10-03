@@ -88,10 +88,16 @@ w, _ := worker.New(nc, "writer", func(ctx context.Context, j *worker.Job) (*work
 go w.Run(ctx)
 
 c := eng.Client()
-id, _ := c.Start(ctx, "review", map[string]any{"topic": "NATS"})
-_ = c.Signal(ctx, id, "approval", map[string]any{"by": "ana"})
+id, _ := c.Start(ctx, "review", map[string]any{"topic": "NATS"}) // returns once the execution exists
+_ = c.Signal(ctx, id, "approval", map[string]any{"by": "ana"})  // buffered until the await reads it
 st, _ := c.Wait(ctx, id) // final state: channels, results, counters, …
+
+var draft struct{ Text string }
+_ = st.Result("draft", &draft) // also st.Channel, st.Signal, st.DecodeInput, st.DecodeOutput
 ```
+
+`c.WaitUntil(ctx, id, cond)` waits for a point inside an execution — parked
+at an await, a task interrupted for a human — instead of polling `Get`.
 
 A worker can stream intermediate results with `j.Progress(v)`; clients follow
 them with `c.Progress(ctx, id)` (or `packtrail progress <exec>`). Progress is

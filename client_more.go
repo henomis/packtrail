@@ -336,6 +336,37 @@ const drainPoll = 10 * time.Millisecond
 // timeout under load, a leader election) is retried with backoff instead of
 // being returned to a caller that asked to wait.
 func (c *Client) Wait(ctx context.Context, execID string) (*State, error) {
+	return c.wait(ctx, execID, nil)
+}
+
+// WaitUntil blocks until cond holds on the execution's state and returns that
+// state: wait until it parks at an await, opens a task, reaches a status.
+// cond is checked on the current state, then each time the execution's log
+// is caught up after a decision; a state the execution only passes through
+// between two checks may be missed, so test what lasts (an open await, a
+// result) rather than what flashes by. If the execution finishes without cond
+// holding, WaitUntil returns its final state and ErrTerminal. Like Wait, only
+// ctx ends it early.
+func (c *Client) WaitUntil(ctx context.Context, execID string, cond func(*State) bool) (*State, error) {
+	if cond == nil {
+		return nil, fmt.Errorf("%w: nil condition", ErrInvalidArgument)
+	}
+
+	st, err := c.wait(ctx, execID, cond)
+	if err != nil {
+		return nil, err
+	}
+
+	if !cond(st) {
+		return st, fmt.Errorf("%w: %s ended %s", ErrTerminal, execID, st.Status)
+	}
+
+	return st, nil
+}
+
+// wait returns the state of execID once it is final or cond (when not nil)
+// holds on it, retrying failed reads with backoff.
+func (c *Client) wait(ctx context.Context, execID string, cond func(*State) bool) (*State, error) {
 	if err := checkExecID(execID); err != nil {
 		return nil, err
 	}
@@ -343,7 +374,7 @@ func (c *Client) Wait(ctx context.Context, execID string) (*State, error) {
 	delay := waitRetry
 
 	for {
-		st, err := c.waitStep(ctx, execID)
+		st, err := c.waitStep(ctx, execID, cond)
 		if st != nil {
 			return st, nil
 		}
@@ -374,16 +405,18 @@ func (c *Client) Wait(ctx context.Context, execID string) (*State, error) {
 	}
 }
 
-// waitStep reads the execution and, unless it already finished, watches its
-// log until a terminal event shows up. It returns the final state once
-// finished, nothing when the caller should look again, or an error.
-func (c *Client) waitStep(ctx context.Context, execID string) (*State, error) {
+// waitStep reads the execution and, unless it is already done, follows its
+// log. It returns the state once done, nothing when the caller should look
+// again, or an error.
+func (c *Client) waitStep(ctx context.Context, execID string, cond func(*State) bool) (*State, error) {
+	done := func(st *State) bool { return st.Status.Terminal() || (cond != nil && cond(st)) }
+
 	st, err := c.Get(ctx, execID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
 
-	if st != nil && st.Status.Terminal() {
+	if st != nil && done(st) {
 		return st, nil
 	}
 
@@ -392,12 +425,16 @@ func (c *Client) waitStep(ctx context.Context, execID string) (*State, error) {
 		from = st.LastSeq + 1
 	}
 
-	return nil, c.waitTerminal(ctx, execID, from)
+	return c.follow(ctx, execID, from, cond != nil, done)
 }
 
-// waitTerminal returns when a terminal event header is seen after from, or
-// when the watch ends early (the caller re-checks the log).
-func (c *Client) waitTerminal(ctx context.Context, execID string, from uint64) error {
+// follow watches the event headers of execID from sequence from and reads
+// the state again after a terminal event or, when everyStep is set, whenever
+// the watch has caught up with the log. It returns the first state done
+// accepts, nothing when the caller should look again, or an error.
+func (c *Client) follow(ctx context.Context, execID string, from uint64, everyStep bool,
+	done func(*State) bool,
+) (*State, error) {
 	cfg := jetstream.OrderedConsumerConfig{
 		FilterSubjects: []string{c.in.EventSubject(execID)}, HeadersOnly: true,
 	}
@@ -408,12 +445,12 @@ func (c *Client) waitTerminal(ctx context.Context, execID string, from uint64) e
 
 	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	it, err := cons.Messages()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer it.Stop()
@@ -425,18 +462,51 @@ func (c *Client) waitTerminal(ctx context.Context, execID string, from uint64) e
 		msg, lerr := it.Next()
 		if lerr != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return nil, ctx.Err()
 			}
 
 			time.Sleep(waitRetry)
 
-			return nil
+			return nil, nil
 		}
 
-		if slices.ContainsFunc(event.Types(msg.Headers()), event.Type.Terminal) {
-			return nil
+		seq, check := checkpoint(msg, everyStep)
+		if !check {
+			continue
+		}
+
+		st, gerr := c.Get(ctx, execID)
+		if gerr != nil {
+			return nil, gerr
+		}
+
+		if done(st) {
+			return st, nil
+		}
+
+		if st.LastSeq < seq {
+			// The read lags behind the watch: look again from the top.
+			time.Sleep(waitRetry)
+
+			return nil, nil
 		}
 	}
+}
+
+// checkpoint reports whether the state is worth reading after msg: it ends
+// the execution or, with everyStep, the watch has caught up with the log. seq
+// is msg's stream sequence (0 when unknown).
+func checkpoint(msg jetstream.Msg, everyStep bool) (seq uint64, check bool) {
+	md, err := msg.Metadata()
+	if err == nil {
+		seq = md.Sequence.Stream
+	}
+
+	if slices.ContainsFunc(event.Types(msg.Headers()), event.Type.Terminal) {
+		return seq, true
+	}
+
+	return seq, everyStep && (err != nil || md.NumPending == 0)
 }
 
 const (

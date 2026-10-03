@@ -19,7 +19,6 @@ import (
 	"context"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/nats-io/nats.go"
 
@@ -81,25 +80,6 @@ func (g *Group) Serve(nc *nats.Conn, ns, kind string, h worker.Handler, opts ...
 			log.Print(err)
 		}
 	})
-}
-
-// WaitFor polls until the execution has status want (and, when given, is
-// parked at the await node).
-func WaitFor(ctx context.Context, c *packtrail.Client, id string, want packtrail.Status,
-	awaitNode ...string,
-) *packtrail.State {
-	for {
-		st, err := c.Get(ctx, id)
-		if err == nil && st.Status == want && (len(awaitNode) == 0 || st.Awaits[awaitNode[0]] != nil) {
-			return st
-		}
-
-		select {
-		case <-ctx.Done():
-			log.Fatalf("execution %s never reached %s", id, want)
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
 }
 
 // Run starts flow and waits for the final state.

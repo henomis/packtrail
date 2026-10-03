@@ -93,7 +93,7 @@ func main() {
 	}
 
 	child := childOf(ctx, c, parent)
-	exutil.WaitFor(ctx, c, child, packtrail.StatusWaiting, "review")
+	atReview(ctx, c, child)
 	fmt.Printf("child %s is waiting for a reviewer\n", child)
 
 	if err := c.Signal(ctx, child, "reviewed", map[string]any{"ok": true}); err != nil {
@@ -115,30 +115,37 @@ func main() {
 	}
 
 	child2 := childOf(ctx, c, parent2)
-	exutil.WaitFor(ctx, c, child2, packtrail.StatusWaiting, "review")
+	atReview(ctx, c, child2)
 
 	if err := c.Cancel(ctx, parent2, "applicant withdrew"); err != nil {
 		log.Fatal(err)
 	}
 
-	cst := exutil.WaitFor(ctx, c, child2, packtrail.StatusCancelled)
+	cst, err := c.Wait(ctx, child2)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	fmt.Printf("cancelled parent %s → child %s is %s (%s)\n", parent2, child2, cst.Status, cst.Reason)
 }
 
 // childOf waits until the parent started its child and returns the child id.
 func childOf(ctx context.Context, c *packtrail.Client, parent string) string {
-	for {
-		st, err := c.Get(ctx, parent)
-		if err == nil {
-			for _, ch := range st.Children {
-				return ch.ChildID
-			}
-		}
+	st, err := c.WaitUntil(ctx, parent, func(st *packtrail.State) bool { return len(st.Children) > 0 })
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		select {
-		case <-ctx.Done():
-			log.Fatal("no child started")
-		case <-time.After(20 * time.Millisecond):
-		}
+	for _, ch := range st.Children {
+		return ch.ChildID
+	}
+
+	return ""
+}
+
+// atReview waits until the child parks at its review.
+func atReview(ctx context.Context, c *packtrail.Client, child string) {
+	if _, err := c.WaitUntil(ctx, child, func(st *packtrail.State) bool { return st.Awaits["review"] != nil }); err != nil {
+		log.Fatal(err)
 	}
 }

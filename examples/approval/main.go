@@ -109,7 +109,11 @@ func main() {
 	}
 
 	// 1. The policy task interrupts with a question.
-	st := exutil.WaitFor(ctx, c, id, packtrail.StatusWaiting)
+	st, err := c.WaitUntil(ctx, id, func(st *packtrail.State) bool { return st.Status == packtrail.StatusWaiting })
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	fmt.Printf("interrupted at %q: %s\n", "check", st.Tasks["check"].Interrupt)
 
 	if err := c.Resume(ctx, id, "check", "team offsite, 10 people"); err != nil {
@@ -117,7 +121,10 @@ func main() {
 	}
 
 	// 2. Now it waits at the await node for the manager.
-	exutil.WaitFor(ctx, c, id, packtrail.StatusWaiting, "approval")
+	if _, err := c.WaitUntil(ctx, id, func(st *packtrail.State) bool { return st.Awaits["approval"] != nil }); err != nil {
+		log.Fatal(err)
+	}
+
 	fmt.Println("waiting for signal manager-decision …")
 
 	if err := c.Signal(ctx, id, "manager-decision", map[string]any{"approved": true, "by": "ana"}); err != nil {

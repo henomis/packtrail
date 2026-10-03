@@ -57,7 +57,7 @@ func TestRerunAfterFix(t *testing.T) {
 	}
 
 	var out struct{ Status string }
-	if err = json.Unmarshal(st.Results[st.LastNode], &out); err != nil || out.Status != "shipped" {
+	if err = st.Result(st.LastNode, &out); err != nil || out.Status != "shipped" {
 		t.Fatalf("rerun ended on %s: %s", st.LastNode, st.Results[st.LastNode])
 	}
 
@@ -112,8 +112,8 @@ func TestForkWithWrites(t *testing.T) {
 
 	var notes, srcNotes []string
 
-	_ = json.Unmarshal(st.Channels["scratch"], &notes)
-	_ = json.Unmarshal(src.Channels["scratch"], &srcNotes)
+	_ = st.Channel("scratch", &notes)
+	_ = src.Channel("scratch", &srcNotes)
 
 	if st.Status != packtrail.StatusCompleted || !slices.Equal(notes[:3], srcNotes[:3]) || notes[3] != "injected" ||
 		len(notes) != len(srcNotes)+1 {
@@ -143,11 +143,7 @@ func TestUpdateWhileRunning(t *testing.T) {
 	}
 
 	id := cl.start("order", o, packtrail.WithExecutionID(o.ID))
-	cl.eventually("validation running", func() bool {
-		st, err := cl.c.Get(cl.ctx, id)
-
-		return err == nil && st.Tasks["validate"] != nil
-	})
+	cl.waitUntil(id, "running validation", func(st *packtrail.State) bool { return st.Tasks["validate"] != nil })
 
 	st, err := cl.c.Update(cl.ctx, id, map[string]any{"total": 100, "log": "manual"}, packtrail.WithUpdateID("u1"))
 	if err != nil {
@@ -173,7 +169,7 @@ func TestUpdateWhileRunning(t *testing.T) {
 	f := cl.check(id)
 
 	var total float64
-	if err = json.Unmarshal(st.Channels["total"], &total); err != nil || total != 100+o.total() {
+	if err = st.Channel("total", &total); err != nil || total != 100+o.total() {
 		t.Fatalf("total %s, want %g", st.Channels["total"], 100+o.total())
 	}
 

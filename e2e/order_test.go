@@ -349,12 +349,7 @@ func (cl *cluster) runOrder(oc orderCase) string {
 	}
 
 	if oc.early {
-		// Signal needs the execution to exist; it is still far from its review.
-		cl.eventually("order "+id+" exists", func() bool {
-			_, err := cl.c.Get(cl.ctx, id)
-
-			return err == nil
-		})
+		// Start returned: the order exists, still far from its review.
 		send()
 		close(gate(id))
 
@@ -362,13 +357,11 @@ func (cl *cluster) runOrder(oc orderCase) string {
 	}
 
 	go func() {
-		for cl.ctx.Err() == nil {
-			st, err := cl.c.Get(cl.ctx, id)
-			if err == nil && (st.Awaits["review"] != nil || st.Status.Terminal()) {
-				break
-			}
+		_, err := cl.c.WaitUntil(cl.ctx, id, func(st *packtrail.State) bool { return st.Awaits["review"] != nil })
+		if err != nil {
+			cl.t.Errorf("order %s never reached its review: %v", id, err)
 
-			time.Sleep(10 * time.Millisecond)
+			return
 		}
 
 		send()
@@ -396,13 +389,13 @@ func (cl *cluster) verifyOrder(oc orderCase, id string) {
 	}
 
 	var out map[string]any
-	if err := json.Unmarshal(st.Results[st.LastNode], &out); err != nil {
+	if err := st.Result(st.LastNode, &out); err != nil {
 		t.Fatalf("%s: result of %s: %s", oc.name, st.LastNode, st.Results[st.LastNode])
 	}
 
 	var logs []string
 
-	_ = json.Unmarshal(st.Channels["log"], &logs)
+	_ = st.Channel("log", &logs)
 
 	switch oc.want {
 	case shipped:
@@ -464,7 +457,7 @@ func (cl *cluster) verifyShipped(oc orderCase, st *packtrail.State, out map[stri
 	}
 
 	var total float64
-	if err := json.Unmarshal(st.Channels["total"], &total); err != nil || total != oc.o.total() {
+	if err := st.Channel("total", &total); err != nil || total != oc.o.total() {
 		t.Fatalf("%s: total %s, want %g", oc.name, st.Channels["total"], oc.o.total())
 	}
 
@@ -472,7 +465,7 @@ func (cl *cluster) verifyShipped(oc orderCase, st *packtrail.State, out map[stri
 		SKU   string
 		Index int
 	}
-	if err := json.Unmarshal(st.Results["pack"], &packed); err != nil || len(packed) != len(oc.o.Items) {
+	if err := st.Result("pack", &packed); err != nil || len(packed) != len(oc.o.Items) {
 		t.Fatalf("%s: pack result %s", oc.name, st.Results["pack"])
 	}
 
@@ -483,7 +476,7 @@ func (cl *cluster) verifyShipped(oc orderCase, st *packtrail.State, out map[stri
 	}
 
 	var reserved map[string]bool
-	if err := json.Unmarshal(st.Channels["reserved"], &reserved); err != nil || len(reserved) != len(oc.o.Items) {
+	if err := st.Channel("reserved", &reserved); err != nil || len(reserved) != len(oc.o.Items) {
 		t.Fatalf("%s: reserved %s", oc.name, st.Channels["reserved"])
 	}
 
@@ -507,7 +500,7 @@ func (cl *cluster) verifyShipped(oc orderCase, st *packtrail.State, out map[stri
 		Number string
 		Total  float64
 	}
-	if err := json.Unmarshal(st.Results["invoice"], &inv); err != nil || inv.Total != oc.o.total() {
+	if err := st.Result("invoice", &inv); err != nil || inv.Total != oc.o.total() {
 		t.Fatalf("%s: invoice %s", oc.name, st.Results["invoice"])
 	}
 

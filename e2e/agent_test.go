@@ -134,7 +134,7 @@ func TestAgentLoop(t *testing.T) {
 
 	id := cl.start("agent", agentTask{Steps: steps, AskAt: askAt})
 
-	st := cl.waitStatus(id, packtrail.StatusWaiting)
+	st := cl.waitUntil(id, "waiting", func(st *packtrail.State) bool { return st.Status == packtrail.StatusWaiting })
 
 	ask := st.Tasks["ask"]
 	if ask == nil || !jsonEqual(ask.Interrupt, mustJSON(map[string]any{"question": "may I continue?"})) {
@@ -167,7 +167,7 @@ func TestAgentLoop(t *testing.T) {
 	}
 
 	var notes []string
-	if err := json.Unmarshal(st.Channels["scratch"], &notes); err != nil || len(notes) != tools+1 {
+	if err := st.Channel("scratch", &notes); err != nil || len(notes) != tools+1 {
 		t.Fatalf("scratch %s", st.Channels["scratch"])
 	}
 
@@ -176,7 +176,7 @@ func TestAgentLoop(t *testing.T) {
 	}
 
 	var fin struct{ Notes int }
-	if err := json.Unmarshal(st.Results["finish"], &fin); err != nil || fin.Notes != tools+1 {
+	if err := st.Result("finish", &fin); err != nil || fin.Notes != tools+1 {
 		t.Fatalf("finish %s", st.Results["finish"])
 	}
 

@@ -81,7 +81,7 @@ func TestCancelCascades(t *testing.T) {
 		}
 	}
 
-	parent := cl.waitStatus(id, packtrail.StatusRunning)
+	parent := cl.waitUntil(id, "running its child", func(st *packtrail.State) bool { return len(st.Children) > 0 })
 
 	var child string
 	for _, c := range parent.Children {

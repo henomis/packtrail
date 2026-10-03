@@ -14,7 +14,11 @@
 
 package packtrail
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/henomis/packtrail/internal/fold"
+)
 
 // Errors returned by the public API. They are sentinel values: test with
 // errors.Is.
@@ -31,4 +35,7 @@ var (
 	ErrUnknownFlow = errors.New("packtrail: unknown flow")
 	// ErrTerminal means the execution already reached a final status.
 	ErrTerminal = errors.New("packtrail: execution already finished")
+	// ErrNoValue means a value State decodes (a result, a channel, a signal,
+	// the output) is absent.
+	ErrNoValue = fold.ErrNoValue
 )

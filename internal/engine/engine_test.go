@@ -16,6 +16,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -94,5 +95,75 @@ func TestOversizedDecisionFailsExecution(t *testing.T) {
 
 	if st.Status != fold.StatusFailed || st.Reason != event.ReasonDecisionTooLarge {
 		t.Fatalf("status %s reason %s", st.Status, st.Reason)
+	}
+}
+
+// TestCoreTriggerReady: once a core trigger reports ready, a message
+// published from another connection reaches it (core NATS drops messages
+// sent before the server knows the subscription).
+func TestCoreTriggerReady(t *testing.T) {
+	s := natstest.Start(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	in, err := infra.New(s.NC, names.New(""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = in.Provision(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	e := &Engine{In: in}
+	other := s.Connect(t)
+
+	// Each round has its own subject, so a stopping round's subscription
+	// cannot take the next round's message.
+	for i := range 20 {
+		def, perr := flow.Parse(fmt.Appendf(nil, "name: trig\ntriggers: [{subject: trig.core.%d}]\nnodes: [{id: a, type: task, kind: k}]", i))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+
+		rctx, stop := context.WithCancel(ctx)
+		ready := make(chan struct{})
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			_ = e.RunTrigger(rctx, def, 0, def.Triggers[0], func() { close(ready) })
+		}()
+
+		<-ready
+
+		if err = other.Publish(def.Triggers[0].Subject, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+
+		cmds, serr := in.JS.Stream(ctx, in.Names.StreamCmd)
+		if serr != nil {
+			t.Fatal(serr)
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+
+		for {
+			info, ierr := cmds.Info(ctx)
+			if ierr == nil && info.State.Msgs == uint64(i+1) {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: the trigger message was lost", i)
+			}
+
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		stop()
+		<-done
 	}
 }

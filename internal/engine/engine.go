@@ -94,7 +94,7 @@ func (e *Engine) now() time.Time {
 }
 
 // RunPartition processes the commands of partition p until ctx is done.
-func (e *Engine) RunPartition(ctx context.Context, p int) error {
+func (e *Engine) RunPartition(ctx context.Context, p int, ready func()) error {
 	return consume.Run(ctx, e.In.JS, consume.Config{
 		Stream: e.In.Names.StreamCmd,
 		Consumer: jetstream.ConsumerConfig{
@@ -105,6 +105,7 @@ func (e *Engine) RunPartition(ctx context.Context, p int) error {
 		PullExpiry: e.In.PullExpiry,
 		Drain:      e.Drain,
 		Logger:     e.In.Logger,
+		Pulling:    ready,
 		Handler:    e.handle,
 	})
 }

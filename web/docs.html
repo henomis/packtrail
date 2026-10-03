@@ -896,6 +896,13 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
         connection, so CI can reject a bad configuration. <code>ValidateNamespace</code>,
         <code>ValidateName</code> and <code>ValidateCron</code> expose the identifier and cron rules.
       </p>
+      <p>
+        <code>Engine.Ready()</code> and <code>Worker.Ready()</code> return a channel that closes once
+        <code>Run</code> has provisioned and every consumer of the process (commands, dispatch, cron,
+        triggers; a worker's jobs and stop notices) is pulling: wire it to a readiness probe. It stays
+        open when <code>Run</code> fails; once <code>Run</code> returns, <code>Ready()</code> hands out
+        a new, open channel, so call it at each probe. It reports start-up, not later connectivity.
+      </p>
     </section>
 
     <hr class="docs__hr" />

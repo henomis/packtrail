@@ -34,6 +34,7 @@ import (
 	"github.com/henomis/packtrail/internal/consume"
 	"github.com/henomis/packtrail/internal/infra"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/ready"
 	"github.com/henomis/packtrail/internal/wire"
 )
 
@@ -194,6 +195,9 @@ type Worker struct {
 	liveCheck time.Duration
 	streamMu  sync.Mutex
 	events    jetstream.Stream
+
+	// ready tracks whether the running Run pulls jobs.
+	ready *ready.Signal
 }
 
 // New returns a worker for kind. It performs no I/O.
@@ -209,7 +213,7 @@ func New(nc *nats.Conn, kind string, handler Handler, opts ...Option) (*Worker, 
 	w := &Worker{
 		nc: nc, kind: kind, handler: handler, ns: names.Default, concurrency: DefaultConcurrency,
 		ackWait: DefaultAckWait, maxDeliver: DefaultMaxDeliver, logger: slog.Default(),
-		maxAckPending: DefaultMaxAckPending, liveCheck: DefaultLiveCheck,
+		maxAckPending: DefaultMaxAckPending, liveCheck: DefaultLiveCheck, ready: ready.New(),
 	}
 
 	for _, o := range opts {
@@ -245,6 +249,9 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	defer func() { _ = sub.Unsubscribe() }()
 
+	readies, end := w.ready.Begin(1)
+	defer end()
+
 	return consume.Run(ctx, in.JS, consume.Config{
 		Stream: in.Names.StreamWork,
 		Consumer: jetstream.ConsumerConfig{
@@ -265,11 +272,18 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.effMaxDeliver.Store(int64(md))
 			w.effAckWait.Store(int64(info.Config.AckWait))
 		},
+		Pulling: readies[0],
 		Drain:   w.drain,
 		Logger:  w.logger,
 		Handler: w.handle,
 	})
 }
+
+// Ready returns a channel closed once Run is subscribed to stop notices and
+// pulling jobs: the signal for a readiness probe. It stays open if Run fails
+// first, and once Run returns Ready gives a new, open channel: call it at
+// each probe. It reports start-up only, not later connectivity.
+func (w *Worker) Ready() <-chan struct{} { return w.ready.C() }
 
 func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	md, err := msg.Metadata()

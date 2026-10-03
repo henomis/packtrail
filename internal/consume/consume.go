@@ -58,6 +58,8 @@ type Config struct {
 	KeepExisting bool
 	// OnReady receives the consumer's effective configuration.
 	OnReady func(*jetstream.ConsumerInfo)
+	// Pulling is called once, when the consumer starts pulling messages.
+	Pulling func()
 	Logger  *slog.Logger
 	Handler Handler
 }
@@ -225,6 +227,8 @@ func (r *runner) consumeSerial(ctx context.Context, cons jetstream.Consumer) err
 		return fmt.Errorf("consume: %s: %w", r.cfg.Consumer.Durable, err)
 	}
 
+	r.pulling()
+
 	<-ctx.Done()
 	r.fence()
 	sub.Stop()
@@ -234,6 +238,19 @@ func (r *runner) consumeSerial(ctx context.Context, cons jetstream.Consumer) err
 
 // fence stops new deliveries from joining the in-flight group, so Wait never
 // races an Add.
+// pulling reports, the first time, that the consumer has asked for messages.
+func (r *runner) pulling() {
+	if r.pulled {
+		return
+	}
+
+	r.pulled = true
+
+	if r.cfg.Pulling != nil {
+		r.cfg.Pulling()
+	}
+}
+
 func (r *runner) fence() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -311,6 +328,8 @@ func (r *runner) fetchBatch(ctx context.Context, cons jetstream.Consumer, want i
 		return 0
 	}
 
+	r.pulling()
+
 	got := 0
 
 	for msg := range batch.Messages() {
@@ -350,6 +369,10 @@ type runner struct {
 	stopCh     chan struct{}
 	procCtx    context.Context //nolint:containedctx // detached handler context, lives with the runner.
 	procCancel context.CancelFunc
+
+	// pulled is set once Pulling was called (read and written only by the
+	// goroutine that pulls).
+	pulled bool
 }
 
 func (r *runner) deliver(msg jetstream.Msg) {

@@ -46,6 +46,7 @@ import (
 	"github.com/henomis/packtrail/internal/metrics"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/projection"
+	"github.com/henomis/packtrail/internal/ready"
 	"github.com/henomis/packtrail/internal/registry"
 	"github.com/henomis/packtrail/internal/snapshot"
 	"github.com/henomis/packtrail/internal/statecache"
@@ -60,8 +61,11 @@ type Engine struct {
 	nc  *nats.Conn
 	cfg config
 
-	initMu sync.Mutex
-	ready  bool
+	initMu      sync.Mutex
+	initialized bool
+
+	// ready tracks whether the running Run's consumers all pull.
+	ready *ready.Signal
 
 	in      *infra.Infra
 	ld      *loader.Loader
@@ -87,7 +91,7 @@ func New(nc *nats.Conn, opts ...Option) (*Engine, error) {
 		cfg.logger = slog.Default()
 	}
 
-	return &Engine{nc: nc, cfg: cfg, metrics: &metrics.M{}}, nil
+	return &Engine{nc: nc, cfg: cfg, metrics: &metrics.M{}, ready: ready.New()}, nil
 }
 
 // buildConfig applies opts and checks the result. It is every validation New
@@ -122,7 +126,7 @@ func (e *Engine) Init(ctx context.Context) error {
 	e.initMu.Lock()
 	defer e.initMu.Unlock()
 
-	if e.ready {
+	if e.initialized {
 		return nil
 	}
 
@@ -166,10 +170,17 @@ func (e *Engine) Init(ctx context.Context) error {
 		}
 	}
 
-	e.ready = true
+	e.initialized = true
 
 	return nil
 }
+
+// Ready returns a channel closed once Run has provisioned the namespace and
+// every consumer of this process (commands, dispatch, cron, triggers) is
+// pulling: the signal for a readiness probe. It stays open if Run fails
+// first, and once Run returns Ready gives a new, open channel: call it at
+// each probe. It reports start-up only, not later connectivity.
+func (e *Engine) Ready() <-chan struct{} { return e.ready.C() }
 
 // Run processes commands and dispatches effects until ctx is done, then
 // drains in-flight work within the drain budget. It calls Init if needed.
@@ -184,9 +195,16 @@ func (e *Engine) Run(ctx context.Context) error {
 		errs []error
 	)
 
-	run := func(fn func(context.Context) error) {
+	parts := e.components()
+
+	readies, end := e.ready.Begin(len(parts))
+	defer end()
+
+	for i, fn := range parts {
+		ready := readies[i]
+
 		wg.Go(func() {
-			if err := fn(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := fn(ctx, ready); err != nil && !errors.Is(err, context.Canceled) {
 				mu.Lock()
 
 				errs = append(errs, err)
@@ -195,29 +213,43 @@ func (e *Engine) Run(ctx context.Context) error {
 		})
 	}
 
+	wg.Wait()
+
+	return errors.Join(errs...)
+}
+
+// component is one consumer loop of Run; it calls ready once it pulls.
+type component func(ctx context.Context, ready func()) error
+
+// components lists the consumer loops this engine runs.
+func (e *Engine) components() []component {
+	var parts []component
+
 	for _, p := range e.partitions() {
 		if !e.cfg.noCommands {
-			run(func(ctx context.Context) error { return e.eng.RunPartition(ctx, p) })
+			parts = append(parts, func(ctx context.Context, ready func()) error {
+				return e.eng.RunPartition(ctx, p, ready)
+			})
 		}
 
 		if !e.cfg.noDispatch {
-			run(func(ctx context.Context) error { return e.disp.Run(ctx, p) })
+			parts = append(parts, func(ctx context.Context, ready func()) error { return e.disp.Run(ctx, p, ready) })
 		}
 	}
 
 	if !e.cfg.noCommands {
-		run(e.eng.RunCron)
+		parts = append(parts, e.eng.RunCron)
 
 		for _, f := range e.cfg.flows {
 			for i, tr := range f.Triggers {
-				run(func(ctx context.Context) error { return e.eng.RunTrigger(ctx, f, i, tr) })
+				parts = append(parts, func(ctx context.Context, ready func()) error {
+					return e.eng.RunTrigger(ctx, f, i, tr, ready)
+				})
 			}
 		}
 	}
 
-	wg.Wait()
-
-	return errors.Join(errs...)
+	return parts
 }
 
 func (e *Engine) partitions() []int {

@@ -73,6 +73,7 @@ start: draft
 ```go
 eng, _ := packtrail.New(nc, packtrail.WithFlowsDir("flows"))
 go eng.Run(ctx) // provisions the namespace and processes commands
+<-eng.Ready()   // closed once every consumer pulls (readiness probes)
 
 w, _ := worker.New(nc, "writer", func(ctx context.Context, j *worker.Job) (*worker.Result, error) {
 	var in struct{ Topic string }

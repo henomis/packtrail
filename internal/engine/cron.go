@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -42,8 +43,9 @@ type ScheduleSpec struct {
 
 // RunCron turns fired cron messages into start commands. The execution id is
 // "<schedule>-<stream sequence of the firing>": unique per firing and stable
-// across redelivery, so a firing starts exactly one execution.
-func (e *Engine) RunCron(ctx context.Context) error {
+// across redelivery, so a firing starts exactly one execution. ready is
+// called once it pulls.
+func (e *Engine) RunCron(ctx context.Context, ready func()) error {
 	return consume.Run(ctx, e.In.JS, consume.Config{
 		Stream: e.In.Names.StreamCmd,
 		Consumer: jetstream.ConsumerConfig{
@@ -54,6 +56,7 @@ func (e *Engine) RunCron(ctx context.Context) error {
 		PullExpiry: e.In.PullExpiry,
 		Drain:      e.Drain,
 		Logger:     e.In.Logger,
+		Pulling:    ready,
 		Handler:    e.handleCron,
 	})
 }
@@ -96,29 +99,16 @@ func (e *Engine) handleCron(ctx context.Context, msg jetstream.Msg) {
 	_ = msg.Ack()
 }
 
+const flushTimeout = time.Second
+
 // RunTrigger starts def whenever a message arrives on one of its triggers.
 // With a stream the trigger is a durable consumer (at-least-once; the
 // execution id comes from Nats-Msg-Id or the stream sequence, so redelivery
 // starts nothing twice); otherwise a core queue subscription (at-most-once).
-func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.Trigger) error {
+// ready is called once it receives.
+func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.Trigger, ready func()) error {
 	if tr.Stream == "" {
-		sub, err := e.In.NC.QueueSubscribe(tr.Subject, e.In.Names.Prefix+"-trigger-"+def.Name, func(m *nats.Msg) {
-			execID := m.Header.Get(wire.HeaderMsgID)
-			if !names.ValidToken(execID) {
-				execID = def.Name + "-" + nuid.Next()
-			}
-
-			if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
-				e.In.Logger.Warn("packtrail: trigger start failed", "flow", def.Name, "err", err)
-			}
-		})
-		if err != nil {
-			return fmt.Errorf("engine: trigger %s: %w", tr.Subject, err)
-		}
-
-		<-ctx.Done()
-
-		return sub.Unsubscribe()
+		return e.runCoreTrigger(ctx, def, tr, ready)
 	}
 
 	return consume.Run(ctx, e.In.JS, consume.Config{
@@ -131,6 +121,7 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 		Drain:      e.Drain,
 		PullExpiry: e.In.PullExpiry,
 		Logger:     e.In.Logger,
+		Pulling:    ready,
 		Handler: func(ctx context.Context, msg jetstream.Msg) {
 			md, err := msg.Metadata()
 			if err != nil {
@@ -157,6 +148,48 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 
 // triggerDataKey wraps a trigger message that is not a JSON object.
 const triggerDataKey = "data"
+
+// runCoreTrigger serves a trigger without a stream: a core queue
+// subscription.
+func (e *Engine) runCoreTrigger(ctx context.Context, def *flow.Flow, tr flow.Trigger, ready func()) error {
+	sub, err := e.In.NC.QueueSubscribe(tr.Subject, e.In.Names.Prefix+"-trigger-"+def.Name, func(m *nats.Msg) {
+		execID := m.Header.Get(wire.HeaderMsgID)
+		if !names.ValidToken(execID) {
+			execID = def.Name + "-" + nuid.Next()
+		}
+
+		if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
+			e.In.Logger.Warn("packtrail: trigger start failed", "flow", def.Name, "err", err)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("engine: trigger %s: %w", tr.Subject, err)
+	}
+
+	go e.readyWhenFlushed(ctx, ready)
+
+	<-ctx.Done()
+
+	return sub.Unsubscribe()
+}
+
+// readyWhenFlushed calls ready once a round trip to the server completes:
+// the server then has every subscription sent before (while disconnected,
+// they are sent on reconnect).
+func (e *Engine) readyWhenFlushed(ctx context.Context, ready func()) {
+	for ctx.Err() == nil {
+		if e.In.NC.FlushTimeout(flushTimeout) == nil {
+			ready()
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(flushTimeout):
+		}
+	}
+}
 
 func (e *Engine) startFromTrigger(ctx context.Context, def *flow.Flow, execID string, data []byte) error {
 	input := json.RawMessage(data)

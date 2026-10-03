@@ -81,8 +81,8 @@ const (
 	retryCap   = 30 * time.Second
 )
 
-// Run consumes partition p until ctx is done.
-func (d *Dispatcher) Run(ctx context.Context, p int) error {
+// Run consumes partition p until ctx is done. ready is called once it pulls.
+func (d *Dispatcher) Run(ctx context.Context, p int, ready func()) error {
 	d.ctlOnce.Do(func() { d.watchControl(ctx) })
 	d.loadQuarantined(ctx)
 
@@ -102,6 +102,7 @@ func (d *Dispatcher) Run(ctx context.Context, p int) error {
 		Drain:      d.Drain,
 		PullExpiry: d.In.PullExpiry,
 		Logger:     d.In.Logger,
+		Pulling:    ready,
 		Handler:    d.handle,
 	})
 }

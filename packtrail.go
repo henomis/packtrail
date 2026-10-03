@@ -345,9 +345,23 @@ func stalledFor(info *jetstream.ConsumerInfo, pending uint64) time.Duration {
 }
 
 // Archive archives a terminal execution now, regardless of retention.
+// Archiving an archived execution is a no-op; a missing one is ErrNotFound
+// and one still running is ErrInvalidArgument.
 func (e *Engine) Archive(ctx context.Context, execID string) error {
 	if err := checkExecID(execID); err != nil {
 		return err
+	}
+
+	st, err := e.client.Get(ctx, execID)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case st.Archived:
+		return nil
+	case !st.Status.Terminal():
+		return fmt.Errorf("%w: %s is %s, only a finished execution can be archived", ErrInvalidArgument, execID, st.Status)
 	}
 
 	return e.eng.Archive(ctx, execID)

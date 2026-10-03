@@ -31,6 +31,7 @@ import (
 	"github.com/henomis/packtrail/internal/engine"
 	"github.com/henomis/packtrail/internal/names"
 	"github.com/henomis/packtrail/internal/sched"
+	"github.com/henomis/packtrail/internal/store"
 	"github.com/henomis/packtrail/internal/wire"
 )
 
@@ -55,7 +56,7 @@ func (c *Client) Watch(ctx context.Context, execID string, from uint64) (<-chan 
 		cfg.OptStartSeq = from
 	}
 
-	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, cfg)
+	cons, err := c.orderedConsumer(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +97,17 @@ func (c *Client) Watch(ctx context.Context, execID string, from uint64) (<-chan 
 	}()
 
 	return out, nil
+}
+
+// orderedConsumer creates an ordered consumer of the events stream. The
+// request gets the read timeout: one sent as the server goes away is never
+// answered, and without a deadline it would wait forever. The consumer
+// itself survives reconnects.
+func (c *Client) orderedConsumer(ctx context.Context, cfg jetstream.OrderedConsumerConfig) (jetstream.Consumer, error) {
+	rctx, cancel := context.WithTimeout(ctx, c.in.ReadTimeout)
+	defer cancel()
+
+	return c.in.JS.OrderedConsumer(rctx, c.in.Names.StreamEvents, cfg)
 }
 
 // sendDecision sends the events of one decision to out. It returns false
@@ -148,7 +160,7 @@ func (c *Client) WatchTerminal(ctx context.Context, fromSeq uint64) (<-chan Ende
 		}
 	}
 
-	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, jetstream.OrderedConsumerConfig{
+	cons, err := c.orderedConsumer(ctx, jetstream.OrderedConsumerConfig{
 		FilterSubjects: []string{c.in.Names.EventsSubjects()},
 		DeliverPolicy:  jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:    next,
@@ -443,7 +455,7 @@ func (c *Client) follow(ctx context.Context, execID string, from uint64, everySt
 		cfg.OptStartSeq = from
 	}
 
-	cons, err := c.in.JS.OrderedConsumer(ctx, c.in.Names.StreamEvents, cfg)
+	cons, err := c.orderedConsumer(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -730,100 +742,45 @@ func (c *Client) Redrive(ctx context.Context, seq uint64) error {
 // Long-term store
 
 // Store is a namespaced key-value store for application data that outlives
-// executions (LangGraph Store). Namespaces and keys are tokens.
+// executions (LangGraph Store). Namespaces and keys are tokens. Worker jobs
+// reach the same store through worker.Job.Store.
 type Store struct{ c *Client }
 
 // Store returns the long-term store.
 func (c *Client) Store() *Store { return &Store{c: c} }
 
-func (s *Store) kv(ctx context.Context, ns, key string) (jetstream.KeyValue, string, error) {
-	if err := s.c.attach(ctx); err != nil {
-		return nil, "", err
-	}
-
-	if err := names.CheckToken("store namespace", ns); err != nil {
-		return nil, "", fmt.Errorf("%w: %w", ErrInvalidArgument, err)
-	}
-
-	if key != "" {
-		if err := names.CheckToken("store key", key); err != nil {
-			return nil, "", fmt.Errorf("%w: %w", ErrInvalidArgument, err)
-		}
-	}
-
-	kv, err := s.c.in.KV(ctx, s.c.in.Names.BucketStore)
-
-	return kv, ns + "." + key, err
-}
-
 // Put stores value (any JSON-encodable value) under ns/key.
 func (s *Store) Put(ctx context.Context, ns, key string, value any) error {
-	kv, k, err := s.kv(ctx, ns, key)
-	if err != nil {
+	if err := s.c.attach(ctx); err != nil {
 		return err
 	}
 
-	b, err := marshalAny(value)
-	if err != nil {
-		return err
-	}
-
-	_, err = kv.Put(ctx, k, b)
-
-	return err
+	return store.Put(ctx, s.c.in, ns, key, value)
 }
 
-// Get returns the value under ns/key.
+// Get returns the value under ns/key, ErrNotFound when there is none.
 func (s *Store) Get(ctx context.Context, ns, key string) (json.RawMessage, error) {
-	kv, k, err := s.kv(ctx, ns, key)
-	if err != nil {
+	if err := s.c.attach(ctx); err != nil {
 		return nil, err
 	}
 
-	e, err := kv.Get(ctx, k)
-	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return nil, fmt.Errorf("%w: %s/%s", ErrNotFound, ns, key)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	return e.Value(), nil
+	return store.Get(ctx, s.c.in, ns, key)
 }
 
 // Delete removes ns/key.
 func (s *Store) Delete(ctx context.Context, ns, key string) error {
-	kv, k, err := s.kv(ctx, ns, key)
-	if err != nil {
+	if err := s.c.attach(ctx); err != nil {
 		return err
 	}
 
-	return kv.Delete(ctx, k)
+	return store.Delete(ctx, s.c.in, ns, key)
 }
 
-// Keys lists the keys of a namespace.
+// Keys lists the keys of a namespace, sorted.
 func (s *Store) Keys(ctx context.Context, ns string) ([]string, error) {
-	kv, _, err := s.kv(ctx, ns, "")
-	if err != nil {
+	if err := s.c.attach(ctx); err != nil {
 		return nil, err
 	}
 
-	l, err := kv.ListKeysFiltered(ctx, ns+".*")
-	if err != nil {
-		if errors.Is(err, jetstream.ErrNoKeysFound) {
-			return nil, nil
-		}
-
-		return nil, err
-	}
-
-	var out []string
-	for k := range l.Keys() {
-		out = append(out, strings.TrimPrefix(k, ns+"."))
-	}
-
-	slices.Sort(out)
-
-	return out, nil
+	return store.Keys(ctx, s.c.in, ns)
 }

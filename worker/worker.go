@@ -417,7 +417,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 	job := &Job{
 		ExecID: wj.ExecID, Flow: wj.Flow, FlowHash: wj.FlowHash, Node: wj.Node, Kind: wj.Kind, Key: wj.Key,
 		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: deliveries,
-		Traceparent: wj.Traceparent, Meta: wj.Meta, progress: w.progressSink(wj),
+		Traceparent: wj.Traceparent, Meta: wj.Meta, progress: w.progressSink(wj), store: &Store{in: w.in},
 	}
 
 	ref := cmd.TaskRef{Key: wj.Key, Generation: wj.Generation, Attempt: wj.Attempt}

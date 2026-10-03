@@ -281,9 +281,9 @@ func orderHandlers() map[string]worker.Handler {
 }
 
 // orderWorkers starts one worker process per kind of the order flows.
-func orderWorkers(cl *cluster, opts ...worker.Option) {
+func orderWorkers(cl *cluster) {
 	for kind, h := range orderHandlers() {
-		cl.worker(kind, h, opts...)
+		cl.worker(kind, h)
 	}
 }
 

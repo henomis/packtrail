@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/henomis/packtrail"
@@ -218,5 +219,44 @@ func TestAgentBudget(t *testing.T) {
 
 	if st.Counters["tokens"] <= 200 || st.Counters["tokens"] > 200+planTokens {
 		t.Fatalf("tokens %g: the budget must stop the first step past it", st.Counters["tokens"])
+	}
+}
+
+// TestAgentRecursionLimit: a planner that never decides to finish is stopped
+// by max_steps — across continue-as-new and an engine crash — and the
+// failure is not routed anywhere.
+func TestAgentRecursionLimit(t *testing.T) {
+	const maxSteps = 61
+
+	runaway := strings.Replace(strings.Replace(fmt.Sprintf(agentFlow, 1_000_000), "name: agent", "name: runaway", 1),
+		"max_steps: 1000", fmt.Sprintf("max_steps: %d", maxSteps), 1)
+
+	cl := newCluster(t, []string{runaway}, packtrail.WithHistoryLimit(20))
+	spare := cl.startEngine()
+	agentWorkers(cl)
+
+	ids := []string{
+		cl.start("runaway", agentTask{Steps: 1_000_000, AskAt: -1}),
+		cl.start("runaway", agentTask{Steps: 1_000_000, AskAt: -1}),
+	}
+
+	cl.waitUntil(ids[0], "half way", func(st *packtrail.State) bool { return st.Steps >= maxSteps/2 })
+	spare.crash()
+
+	for _, id := range ids {
+		st := cl.wait(id)
+		f := cl.check(id)
+
+		if st.Status != packtrail.StatusFailed || st.Reason != event.ReasonMaxSteps {
+			t.Fatalf("%s: %s (%s: %s)", id, st.Status, st.Reason, st.Error)
+		}
+
+		if st.Steps != maxSteps || st.Visits["finish"] != 0 {
+			t.Fatalf("%s stopped after %d steps (limit %d), visits %v", id, st.Steps, maxSteps, st.Visits)
+		}
+
+		if f.count[event.ExecutionContinued] < 2 {
+			t.Fatalf("%s: %d continuations", id, f.count[event.ExecutionContinued])
+		}
 	}
 }

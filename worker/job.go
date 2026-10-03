@@ -59,6 +59,7 @@ type Job struct {
 	Meta json.RawMessage
 
 	progress *progressSink
+	store    *Store
 }
 
 // NodeError is how a node last failed permanently.

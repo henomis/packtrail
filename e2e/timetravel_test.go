@@ -181,3 +181,212 @@ func TestUpdateWhileRunning(t *testing.T) {
 		t.Fatalf("update of a finished execution: %v", err)
 	}
 }
+
+// TestTimeTravelAcrossContinuation reads and forks a long agent run at points
+// before and after its continue-as-new boundaries: the past is intact on both
+// sides, and each fork resumes exactly where the source was.
+func TestTimeTravelAcrossContinuation(t *testing.T) {
+	cl := newCluster(t, []string{fmt.Sprintf(agentFlow, 1_000_000)}, packtrail.WithHistoryLimit(30))
+	agentWorkers(cl)
+
+	const steps = 30
+
+	id := cl.start("agent", agentTask{Steps: steps, AskAt: -1})
+	src := cl.wait(id)
+	f := cl.check(id)
+
+	if f.count[event.ExecutionContinued] < 2 {
+		t.Fatalf("%d continuations, want several", f.count[event.ExecutionContinued])
+	}
+
+	// Decision ends after the 2nd tool call (before the first continuation)
+	// and after the last but one (after the last continuation).
+	var toolDone []uint64
+
+	firstContinued := -1
+
+	for i, ev := range f.events {
+		if ev.Type == event.ExecutionContinued && firstContinued < 0 {
+			firstContinued = i
+		}
+
+		if d, ok := ev.Data.(*event.NodeDone); ok && d.Node == "tool" {
+			toolDone = append(toolDone, ev.Seq)
+		}
+	}
+
+	if len(toolDone) != steps || firstContinued < 0 {
+		t.Fatalf("%d tool completions, first continuation at %d", len(toolDone), firstContinued)
+	}
+
+	if f.events[firstContinued].Seq <= toolDone[1] {
+		t.Fatalf("the first continuation (seq %d) is not after the 2nd tool call (seq %d)",
+			f.events[firstContinued].Seq, toolDone[1])
+	}
+
+	for _, n := range []int{2, steps - 1} {
+		at := toolDone[n-1]
+
+		past, err := cl.c.StateAt(cl.ctx, id, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var notes []string
+
+		_ = past.Channel("scratch", &notes)
+
+		if past.Visits["tool"] != n || len(notes) != n || notes[n-1] != fmt.Sprintf("tool-%d", n) {
+			t.Fatalf("state after tool call %d: visits %v scratch %v", n, past.Visits, notes)
+		}
+
+		fork, err := cl.c.Fork(cl.ctx, id, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		st := cl.wait(fork)
+		cl.check(fork)
+
+		if st.Status != packtrail.StatusCompleted || !jsonEqual(mustJSON(st.Visits), mustJSON(src.Visits)) ||
+			!jsonEqual(st.Channels["scratch"], src.Channels["scratch"]) {
+			t.Fatalf("fork after tool call %d: %s visits %v, source %v", n, st.Status, st.Visits, src.Visits)
+		}
+	}
+}
+
+// TestRerunAcrossSubflow reruns nodes of a shipped order around its invoice
+// child: rerunning a node after the child inherits the child's result
+// without starting another; rerunning the subflow node starts a fresh child
+// linked to the rerun, and the original child is untouched.
+func TestRerunAcrossSubflow(t *testing.T) {
+	cl := newCluster(t, []string{orderFlow, invoiceFlow})
+	orderWorkers(cl)
+
+	o := order{
+		ID: fmt.Sprintf("rerunsub%d", time.Now().UnixNano()), Customer: "hal", Amount: 20,
+		Items: []item{{SKU: "A", Price: 4}, {SKU: "B", Price: 6}},
+	}
+
+	id := cl.runOrder(orderCase{name: "small", o: o, want: shipped})
+	cl.verifyOrder(orderCase{name: "small", o: o, want: shipped}, id)
+
+	children := func(f *facts) []string {
+		var out []string
+
+		for _, ev := range f.events {
+			if d, ok := ev.Data.(*event.Child); ok {
+				out = append(out, d.ChildID)
+			}
+		}
+
+		return out
+	}
+
+	orig := children(cl.check(id))
+	if len(orig) != 1 {
+		t.Fatalf("source children %v", orig)
+	}
+
+	src := cl.wait(id)
+
+	// After the child: no new child, the same invoice.
+	notify, err := cl.c.Rerun(cl.ctx, id, "notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := cl.wait(notify)
+	if f := cl.check(notify); st.Status != packtrail.StatusCompleted || len(children(f)) != 0 ||
+		!jsonEqual(st.Results["invoice"], src.Results["invoice"]) {
+		t.Fatalf("rerun of notify: %s, children %v, invoice %s", st.Status, children(f), st.Results["invoice"])
+	}
+
+	// The subflow node itself: a new child, linked to the rerun.
+	invoice, err := cl.c.Rerun(cl.ctx, id, "invoice")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st = cl.wait(invoice)
+	kids := children(cl.check(invoice))
+
+	if st.Status != packtrail.StatusCompleted || len(kids) != 1 || kids[0] == orig[0] {
+		t.Fatalf("rerun of invoice: %s, children %v (source child %s)", st.Status, kids, orig[0])
+	}
+
+	child := cl.wait(kids[0])
+	cl.check(kids[0])
+
+	if child.Status != packtrail.StatusCompleted || child.Parent == nil || child.Parent.ExecID != invoice {
+		t.Fatalf("new child %s: %s parent %+v", kids[0], child.Status, child.Parent)
+	}
+
+	if !jsonEqual(st.Results["invoice"], src.Results["invoice"]) {
+		t.Fatalf("new invoice %s, source %s", st.Results["invoice"], src.Results["invoice"])
+	}
+
+	if again := cl.wait(orig[0]); again.Parent == nil || again.Parent.ExecID != id {
+		t.Fatalf("source child relinked: %+v", again.Parent)
+	}
+}
+
+// TestForkWhileRunning forks an agent run that is parked on a human question:
+// the fork reaches the same question on its own, and the two are answered
+// differently and end independently.
+func TestForkWhileRunning(t *testing.T) {
+	cl := newCluster(t, []string{fmt.Sprintf(agentFlow, 1_000_000)})
+	agentWorkers(cl)
+
+	const steps, askAt = 5, 3
+
+	waiting := func(id string) {
+		cl.waitUntil(id, "asking", func(st *packtrail.State) bool { return st.Tasks["ask"] != nil && st.Status == packtrail.StatusWaiting })
+	}
+
+	id := cl.start("agent", agentTask{Steps: steps, AskAt: askAt})
+	waiting(id)
+
+	// Fork right after the first planner decision: the source is still waiting.
+	evs, err := cl.c.History(cl.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var at uint64
+
+	for _, ev := range evs {
+		if d, ok := ev.Data.(*event.NodeDone); ok && d.Node == "plan" {
+			at = ev.Seq
+
+			break
+		}
+	}
+
+	fork, err := cl.c.Fork(cl.ctx, id, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waiting(fork)
+
+	for x, answer := range map[string]string{id: "yes", fork: "no"} {
+		if err = cl.c.Resume(cl.ctx, x, "ask", answer); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for x, answer := range map[string]string{id: "yes", fork: "no"} {
+		st := cl.wait(x)
+		cl.check(x)
+
+		var notes []string
+
+		_ = st.Channel("scratch", &notes)
+
+		if st.Status != packtrail.StatusCompleted || !slices.Contains(notes, "human:"+answer) ||
+			slices.Contains(notes, "human:"+map[string]string{"yes": "no", "no": "yes"}[answer]) {
+			t.Fatalf("%s answered %q: %s scratch %v", x, answer, st.Status, notes)
+		}
+	}
+}

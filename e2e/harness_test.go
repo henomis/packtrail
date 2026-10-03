@@ -26,6 +26,7 @@ package e2e_test
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -51,8 +52,12 @@ type cluster struct {
 	ctx context.Context //nolint:containedctx // test-scoped context.
 	// c is a standalone client (its own connection, like an API process).
 	c *packtrail.Client
-
-	opts []packtrail.Option
+	// ns is the namespace ("" = the default one).
+	ns string
+	// tuning holds the engine options other than the flows.
+	tuning []packtrail.Option
+	// flows are the definitions the next engine registers (deploy changes them).
+	flows []string
 
 	// root is the cluster a view (with) was taken from: it owns the processes.
 	root *cluster
@@ -75,29 +80,39 @@ type proc struct {
 func newCluster(t *testing.T, flows []string, opts ...packtrail.Option) *cluster {
 	t.Helper()
 
-	s := packtrailtest.Start(t)
+	return newClusterOn(t, packtrailtest.Start(t), "", flows, opts...)
+}
+
+// newClusterOn serves namespace ns ("" = default) on an existing server, so
+// several clusters can share one NATS.
+func newClusterOn(t *testing.T, s *packtrailtest.Server, ns string, flows []string,
+	opts ...packtrail.Option,
+) *cluster {
+	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	t.Cleanup(cancel)
 
-	base := make([]packtrail.Option, 0, 4+len(flows)+len(opts)) //nolint:mnd // the four below.
-	base = append(base,
+	tuning := []packtrail.Option{
 		packtrail.WithPartitions(partitions),
-		packtrail.WithDrainTimeout(2*time.Second),
+		packtrail.WithDrainTimeout(2 * time.Second),
 		packtrail.WithAckWait(time.Second),
 		packtrail.WithPullExpiry(time.Second),
-	)
-
-	for _, f := range flows {
-		base = append(base, packtrail.WithFlowYAML([]byte(f)))
 	}
 
-	cl := &cluster{t: t, s: s, ctx: ctx, opts: append(base, opts...)}
+	var copts []packtrail.ClientOption
+
+	if ns != "" {
+		tuning = append(tuning, packtrail.WithNamespace(ns))
+		copts = append(copts, packtrail.WithClientNamespace(ns))
+	}
+
+	cl := &cluster{t: t, s: s, ctx: ctx, ns: ns, tuning: append(tuning, opts...), flows: flows}
 	t.Cleanup(cl.stopAll)
 
 	cl.startEngine()
 
-	c, err := packtrail.NewClient(s.Connect(t))
+	c, err := packtrail.NewClient(s.Connect(t), copts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +125,7 @@ func newCluster(t *testing.T, flows []string, opts ...packtrail.Option) *cluster
 // with returns a view of the cluster reporting to t (a subtest). It shares
 // the processes but must not start or stop any.
 func (cl *cluster) with(t *testing.T) *cluster {
-	return &cluster{t: t, s: cl.s, ctx: cl.ctx, c: cl.c, opts: cl.opts, root: cl}
+	return &cluster{t: t, s: cl.s, ctx: cl.ctx, c: cl.c, ns: cl.ns, tuning: cl.tuning, root: cl}
 }
 
 // liveEngines returns the engines of the processes still running.
@@ -135,13 +150,30 @@ func (cl *cluster) liveEngines() []*packtrail.Engine {
 	return out
 }
 
+// deploy sets the flow definitions the engines started from now on register:
+// a new version of a flow becomes the latest once one of them is ready.
+func (cl *cluster) deploy(flows []string) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	cl.flows = flows
+}
+
 // startEngine starts an engine process and waits until it pulls.
 func (cl *cluster) startEngine() *proc {
 	cl.t.Helper()
 
 	nc := cl.s.Connect(cl.t)
 
-	eng, err := packtrail.New(nc, cl.opts...)
+	cl.mu.Lock()
+	opts := slices.Clone(cl.tuning)
+
+	for _, f := range cl.flows {
+		opts = append(opts, packtrail.WithFlowYAML([]byte(f)))
+	}
+	cl.mu.Unlock()
+
+	eng, err := packtrail.New(nc, opts...)
 	if err != nil {
 		cl.t.Fatal(err)
 	}
@@ -170,10 +202,15 @@ func (cl *cluster) worker(kind string, h worker.Handler, opts ...worker.Option) 
 
 	nc := cl.s.Connect(cl.t)
 
-	opts = append([]worker.Option{
+	base := []worker.Option{
 		worker.WithDrainTimeout(time.Second), worker.WithAckWait(2 * time.Second),
 		worker.WithLiveCheck(500 * time.Millisecond),
-	}, opts...)
+	}
+	if cl.ns != "" {
+		base = append(base, worker.WithNamespace(cl.ns))
+	}
+
+	opts = append(base, opts...)
 
 	w, err := worker.New(nc, kind, h, opts...)
 	if err != nil {
@@ -223,6 +260,18 @@ func (p *proc) crash() {
 	p.nc.Close()
 	p.cancel()
 	<-p.done
+}
+
+// stopEngines stops every running engine gracefully: nothing processes
+// commands or dispatches events until startEngine.
+func (cl *cluster) stopEngines() {
+	cl.mu.Lock()
+	ps := slices.Clone(cl.engines)
+	cl.mu.Unlock()
+
+	for _, p := range ps {
+		p.stop()
+	}
 }
 
 func (cl *cluster) stopAll() {
@@ -280,6 +329,13 @@ func (cl *cluster) waitUntil(id, what string, cond func(*packtrail.State) bool) 
 	}
 
 	return st
+}
+
+// parkedAt waits until id waits at the await node and returns its state.
+func (cl *cluster) parkedAt(id, node string) *packtrail.State {
+	cl.t.Helper()
+
+	return cl.waitUntil(id, "parked at "+node, func(st *packtrail.State) bool { return st.Awaits[node] != nil })
 }
 
 // eventually polls cond until it holds.

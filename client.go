@@ -764,7 +764,9 @@ func replyError(execID string, r wire.Reply) error {
 }
 
 // Rerun forks execID at the point where node was last entered, so the node
-// (and everything after it) runs again in a new execution.
+// (and everything after it) runs again in a new execution. Any node can be
+// rerun: a task or a map runs its work again, a subflow starts a new child,
+// an await waits again.
 func (c *Client) Rerun(ctx context.Context, execID, node string, opts ...ForkOption) (string, error) {
 	evs, err := c.History(ctx, execID)
 	if err != nil {
@@ -774,7 +776,7 @@ func (c *Client) Rerun(ctx context.Context, execID, node string, opts ...ForkOpt
 	var at, cut uint64
 
 	for _, ev := range evs {
-		if d, ok := ev.Data.(*event.Scheduled); ok && d.Node == node && d.Attempt == 1 {
+		if d, ok := ev.Data.(*event.Entered); ok && d.Node == node {
 			at = ev.Seq
 		}
 	}

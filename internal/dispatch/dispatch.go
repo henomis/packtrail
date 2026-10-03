@@ -70,7 +70,6 @@ type Dispatcher struct {
 	quarantined map[string]bool
 	hmu         sync.Mutex
 	heads       map[string]head
-	ctlOnce     sync.Once
 }
 
 const (
@@ -82,8 +81,8 @@ const (
 )
 
 // Run consumes partition p until ctx is done. ready is called once it pulls.
+// The process must be following control notices (WatchControl) first.
 func (d *Dispatcher) Run(ctx context.Context, p int, ready func()) error {
-	d.ctlOnce.Do(func() { d.watchControl(ctx) })
 	d.loadQuarantined(ctx)
 
 	return consume.Run(ctx, d.In.JS, consume.Config{

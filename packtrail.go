@@ -195,6 +195,15 @@ func (e *Engine) Run(ctx context.Context) error {
 		errs []error
 	)
 
+	if !e.cfg.noDispatch {
+		stopControl, err := e.disp.WatchControl()
+		if err != nil {
+			return err
+		}
+
+		defer stopControl()
+	}
+
 	parts := e.components()
 
 	readies, end := e.ready.Begin(len(parts))

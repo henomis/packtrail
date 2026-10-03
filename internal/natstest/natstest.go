@@ -279,3 +279,12 @@ func freePort(t testing.TB) int {
 
 	return l.Addr().(*net.TCPAddr).Port //nolint:errcheck,forcetypeassert // a TCP listener.
 }
+
+// HasSubscription reports whether some client is subscribed to subject (in
+// the global account).
+func (s *Server) HasSubscription(subject string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.ns.GlobalAccount().SubscriptionInterest(subject)
+}

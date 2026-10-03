@@ -68,10 +68,11 @@ type Client struct {
 	ns       string
 	timeouts timeouts
 
-	once    sync.Once
-	initErr error
-	in      *infra.Infra
-	ld      *loader.Loader
+	// attachMu guards attaching: in and ld are set by the first attach that
+	// succeeds, and never change after.
+	attachMu sync.Mutex
+	in       *infra.Infra
+	ld       *loader.Loader
 }
 
 // ClientOption configures a Client.
@@ -135,33 +136,34 @@ func NewClient(nc *nats.Conn, opts ...ClientOption) (*Client, error) {
 }
 
 func newClientFromInfra(in *infra.Infra, ld *loader.Loader) *Client {
-	c := &Client{nc: in.NC, ns: in.Names.Prefix, in: in, ld: ld}
-	c.once.Do(func() {})
-
-	return c
+	return &Client{nc: in.NC, ns: in.Names.Prefix, in: in, ld: ld}
 }
 
+// attach binds the client to its namespace on first use. A failed attempt
+// (namespace not provisioned yet, ctx ended, NATS unreachable) is not
+// remembered: the next call tries again.
 func (c *Client) attach(ctx context.Context) error {
-	c.once.Do(func() {
-		in, err := infra.New(c.nc, names.New(c.ns), slog.Default())
-		if err != nil {
-			c.initErr = err
+	c.attachMu.Lock()
+	defer c.attachMu.Unlock()
 
-			return
-		}
+	if c.in != nil {
+		return nil
+	}
 
-		if err = in.Attach(ctx); err != nil {
-			c.initErr = err
+	in, err := infra.New(c.nc, names.New(c.ns), slog.Default())
+	if err != nil {
+		return err
+	}
 
-			return
-		}
+	if err = in.Attach(ctx); err != nil {
+		return err
+	}
 
-		c.timeouts.apply(in)
-		c.in = in
-		c.ld = loader.New(in, eventlog.New(in), snapshot.New(in, -1), registry.New(in))
-	})
+	c.timeouts.apply(in)
+	c.ld = loader.New(in, eventlog.New(in), snapshot.New(in, -1), registry.New(in))
+	c.in = in
 
-	return c.initErr
+	return nil
 }
 
 func checkExecID(id string) error {

@@ -354,31 +354,35 @@ func (d *Dispatcher) replayFrom(ctx context.Context, cache *statecache.Cache, ex
 	return last, errors.Join(err, aerr)
 }
 
-// watchControl follows quarantine/release broadcasts so every dispatcher
-// process skips (or resumes) an execution at once.
-func (d *Dispatcher) watchControl(ctx context.Context) {
+// WatchControl follows quarantine/release broadcasts, so every dispatcher
+// process skips (or resumes) an execution at once, until stop is called. Call
+// it before Run: the subscriptions then precede each partition's read of the
+// quarantine list, so no broadcast falls between the two.
+func (d *Dispatcher) WatchControl() (stop func(), err error) {
 	subs := make([]*nats.Subscription, 0, 2) //nolint:mnd // quarantine and release.
 
+	stop = func() {
+		for _, s := range subs {
+			_ = s.Unsubscribe()
+		}
+	}
+
 	for kind, fn := range map[string]func(string){ctlQuarantine: d.markQuarantined, ctlRelease: d.unmarkQuarantined} {
-		sub, err := d.In.NC.Subscribe(d.In.Names.CtlSubject(kind), func(m *nats.Msg) {
+		sub, serr := d.In.NC.Subscribe(d.In.Names.CtlSubject(kind), func(m *nats.Msg) {
 			execID := string(m.Data)
 			fn(execID)
 			d.Cache.Drop(execID)
 		})
-		if err != nil {
-			d.In.Logger.Warn("packtrail: control subscription", "err", err)
+		if serr != nil {
+			stop()
 
-			continue
+			return nil, fmt.Errorf("dispatch: control subscription %s: %w", kind, serr)
 		}
 
 		subs = append(subs, sub)
 	}
 
-	context.AfterFunc(ctx, func() {
-		for _, s := range subs {
-			_ = s.Unsubscribe()
-		}
-	})
+	return stop, nil
 }
 
 func (d *Dispatcher) loadQuarantined(ctx context.Context) {

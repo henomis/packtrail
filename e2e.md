@@ -5,8 +5,7 @@ on `main` (last pushed commit: `c2d8805`).
 
 ## Goal
 
-Extend `e2e/` with realistic, multi-feature workflows covering what LangGraph,
-CrewAI (workflow side only, no AI) and Temporal offer, and fix the public API
+Extend `e2e/` with realistic, multi-feature workflows covering common durable orchestration patterns, and fix the public API
 wherever a scenario exposed a gap.
 
 Rules for `e2e/` and `examples/` (from CLAUDE.md): public API only — no
@@ -123,8 +122,7 @@ Every scenario also runs `cl.check(id)` (event-model invariants, incl.
 
 ## Open items (not done, need a decision)
 
-- **Fan-out branches must be task nodes**: no parallel subflows (LangGraph and
-  CrewAI support parallel sub-graphs). #5 was restructured to two parents.
+- **Fan-out branches must be task nodes**: no parallel subflows (some engines support parallel sub-graphs). #5 was restructured to two parents.
   Implementing it is an engine change (`flow` validation + fold/dispatch).
 - **Result cache has no single-flight**: concurrent runs with the same key all
   miss (by design). #4 asserts hits only for runs fetching ≥1 s after an

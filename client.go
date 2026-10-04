@@ -674,8 +674,7 @@ func WithUpdateID(id string) UpdateOption { return func(s *string) { *s = id } }
 
 // Update writes channels of a running execution (through their reducers) and
 // returns its state right after the write: a synchronous, validated change
-// from outside the graph (Temporal's Update, LangGraph's update_state). Tasks
-// scheduled from then on see the new values. It fails with ErrInvalidArgument
+// from outside the graph. Tasks scheduled from then on see the new values. It fails with ErrInvalidArgument
 // when a channel is undeclared or a value does not fit its reducer, and with
 // ErrTerminal when the execution already finished. If ctx ends first the
 // update may still be applied: retry with the same WithUpdateID.

@@ -26,9 +26,9 @@ A durable workflow engine built only on [NATS JetStream](https://docs.nats.io/na
 
 **What it is, and is not.** packtrail is a *workflow-as-data* engine: you
 declare the graph (YAML or Go structs) and packtrail interprets it. In that it
-is closer to AWS Step Functions, Netflix Conductor or Argo — and to LangGraph's
-graphs — than to Temporal, whose workflows are code replayed
-deterministically. What it shares with Temporal is the durability model:
+is closer to other graph-based engines — than to the
+workflow-as-code model where workflows are replayed
+deterministically. What it shares with other durable engines is the durability model:
 event history, durable timers, workers in any language.
 
 ## Install

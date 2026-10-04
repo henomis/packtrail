@@ -124,7 +124,7 @@ func TestTriggerDeadLetterPerFlow(t *testing.T) {
 
 	t.Logf("dead letters metric %d, dead letters stored %d", e.Metrics.DeadLetters.Load(), info.State.Msgs)
 
-	for _, key := range []string{"trig1-o1", "trig2-o1"} {
+	for _, key := range []string{names.TriggerMsgExecID("trig1", "o1"), names.TriggerMsgExecID("trig2", "o1")} {
 		if _, gerr := dlq.GetLastMsgForSubject(ctx, in.Names.DLQSubject(wire.DLQTrigger, key)); gerr != nil {
 			t.Errorf("no trigger dead letter for %s: %v (message terminated, never started)", key, gerr)
 		}

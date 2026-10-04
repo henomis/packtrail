@@ -345,6 +345,26 @@ func (l *Log) LastSeq(ctx context.Context, execID string) (uint64, error) {
 	return m.Sequence, nil
 }
 
+// FirstSeq returns the sequence of the first event of execID still in the
+// live log (a continuation purges what precedes it), 0 if none.
+func (l *Log) FirstSeq(ctx context.Context, execID string) (uint64, error) {
+	s, err := l.events(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	m, err := s.GetMsg(ctx, 1, jetstream.WithGetMsgSubject(l.in.EventSubject(execID)))
+	if err != nil {
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			return 0, nil
+		}
+
+		return 0, err
+	}
+
+	return m.Sequence, nil
+}
+
 // PurgeBefore removes the events of execID stored before sequence seq (they
 // were archived by a continuation).
 func (l *Log) PurgeBefore(ctx context.Context, execID string, seq uint64) error {

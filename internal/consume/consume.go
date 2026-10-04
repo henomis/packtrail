@@ -170,8 +170,9 @@ func ensureConsumerRetry(ctx context.Context, js jetstream.JetStream, cfg Config
 			return cons, nil
 		}
 
+		// Ending while the setup still fails is a shutdown, not a failure.
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("consume: consumer %s on %s: %w", cc.Durable, cfg.Stream, err)
+			return nil, shutdownErr(ctx, cfg, cc, err)
 		}
 
 		cfg.Logger.Warn("packtrail: cannot set up consumer, will retry", "consumer", cc.Durable,
@@ -179,12 +180,19 @@ func ensureConsumerRetry(ctx context.Context, js jetstream.JetStream, cfg Config
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("consume: consumer %s on %s: %w", cc.Durable, cfg.Stream, err)
+			return nil, shutdownErr(ctx, cfg, cc, err)
 		case <-time.After(delay):
 		}
 
 		delay = min(delay*2, setupRetryCap) //nolint:mnd // exponential backoff.
 	}
+}
+
+// shutdownErr is the error of a setup ended by ctx: ctx's, with the last
+// setup error kept as text.
+func shutdownErr(ctx context.Context, cfg Config, cc jetstream.ConsumerConfig, last error) error {
+	return fmt.Errorf("consume: consumer %s on %s: %w (last: %v)", //nolint:errorlint // only ctx's error is wrapped.
+		cc.Durable, cfg.Stream, ctx.Err(), last)
 }
 
 // ensureConsumer creates the consumer, or updates it — unless keepExisting,

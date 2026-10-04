@@ -63,6 +63,16 @@ func (l *Loader) Load(ctx context.Context, execID string, upTo uint64) (*fold.St
 		return nil, nil, err
 	}
 
+	if st != nil && !l.continues(ctx, execID, st, evs) {
+		// The log moved past the snapshot (a continuation purged events
+		// after it, and saving the next snapshot failed): fold without it.
+		st = nil
+
+		if evs, err = l.Log.Read(ctx, execID, 1, upTo); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if st == nil && len(evs) == 0 {
 		if upTo > 0 {
 			// Before the live log (continue-as-new): fold the segments.
@@ -107,6 +117,20 @@ func (l *Loader) Load(ctx context.Context, execID string, upTo uint64) (*fold.St
 	}
 
 	return st, def, nil
+}
+
+// continues reports whether evs, read right after snapshot st, continue it:
+// no event of the execution between the two was purged. The first event's
+// index says so; without one (none read, or an index-less event), the live
+// log must still hold an event the snapshot covers.
+func (l *Loader) continues(ctx context.Context, execID string, st *fold.State, evs []event.Event) bool {
+	if len(evs) > 0 && evs[0].Index != 0 {
+		return evs[0].Index == st.Events+1
+	}
+
+	first, err := l.Log.FirstSeq(ctx, execID)
+
+	return err == nil && first != 0 && first <= st.LastSeq
 }
 
 // lastBase returns the index in evs of the last event a state can be folded

@@ -211,8 +211,12 @@ func (c *Client) WatchTerminal(ctx context.Context, fromSeq uint64) (<-chan Ende
 	return out, nil
 }
 
-// eventsEnd returns the sequence the next event will get.
+// eventsEnd returns the sequence the next event will get. Like creating a
+// watch, it is bounded by the read timeout (I-88).
 func (c *Client) eventsEnd(ctx context.Context) (uint64, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.in.ReadTimeout)
+	defer cancel()
+
 	s, err := c.in.JS.Stream(ctx, c.in.Names.StreamEvents)
 	if err != nil {
 		return 0, err
@@ -700,7 +704,11 @@ func (c *Client) DeadLetters(ctx context.Context, limit int) ([]DeadLetter, erro
 }
 
 // Redrive re-publishes the dead letter at seq to its original subject (with
-// a fresh deduplication id) and removes it from the dead-letter stream.
+// a fresh deduplication id) and removes it from the dead-letter stream. A
+// trigger dead letter is redriven as the start of its own flow, with the
+// execution id it was meant to get: other flows and consumers of the
+// message's subject do not see it again, and a start that landed after all
+// starts nothing twice.
 func (c *Client) Redrive(ctx context.Context, seq uint64) error {
 	if err := c.attach(ctx); err != nil {
 		return err
@@ -719,6 +727,19 @@ func (c *Client) Redrive(ctx context.Context, seq uint64) error {
 	var d DeadLetter
 	if err = json.Unmarshal(m.Data, &d); err != nil {
 		return err
+	}
+
+	if d.Kind == wire.DLQTrigger && d.Flow != "" {
+		start, serr := wire.TriggerStart(d.Flow, d.Key, d.Body)
+		if serr != nil {
+			return serr
+		}
+
+		if err = wire.PublishCmd(ctx, c.in, start, nats.Header(d.Header).Get(wire.HeaderTraceparent)); err != nil {
+			return err
+		}
+
+		return s.DeleteMsg(ctx, seq)
 	}
 
 	msg := nats.NewMsg(d.Subject)

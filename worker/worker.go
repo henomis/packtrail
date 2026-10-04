@@ -431,7 +431,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 	id := wire.CmdID(wj.ExecID, wj.Key, wj.Generation, wj.Attempt)
 
 	if err := json.Unmarshal(wj.Context, &job.Context); err != nil {
-		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error())
+		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error(), nil)
 	}
 
 	res, err := w.call(ctx, job)
@@ -451,7 +451,7 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 	case errors.As(herr, &intr):
 		p, merr := marshalOutput(intr.Payload)
 		if merr != nil {
-			return failCmd(id, wj.ExecID, ref, merr.Error())
+			return failCmd(id, wj.ExecID, ref, merr.Error(), usageOf(herr))
 		}
 
 		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p, Usage: usageOf(herr)})
@@ -466,7 +466,12 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 	// A result that cannot be encoded (NaN usage, invalid raw JSON) would
 	// otherwise leave an empty command and a task that never settles.
 	if err != nil {
-		return failCmd(id, wj.ExecID, ref, err.Error())
+		usage := usageOf(herr)
+		if res != nil && herr == nil {
+			usage = res.Usage
+		}
+
+		return failCmd(id, wj.ExecID, ref, err.Error(), usage)
 	}
 
 	return c, nil
@@ -486,8 +491,14 @@ func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {
 }
 
 // failCmd fails an attempt without retry: its answer cannot be encoded.
-func failCmd(id, execID string, ref cmd.TaskRef, msg string) (cmd.Command, error) {
-	return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg})
+func failCmd(id, execID string, ref cmd.TaskRef, msg string, usage map[string]float64) (cmd.Command, error) {
+	c, err := cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg, Usage: usage})
+	if err != nil && usage != nil {
+		// The usage itself cannot be encoded (NaN): fail without it.
+		return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg})
+	}
+
+	return c, err
 }
 
 func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Command, error) {
@@ -497,7 +508,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 
 	out, err := marshalOutput(res.Output)
 	if err != nil {
-		return failCmd(id, wj.ExecID, ref, err.Error())
+		return failCmd(id, wj.ExecID, ref, err.Error(), res.Usage)
 	}
 
 	var writes map[string]json.RawMessage
@@ -508,7 +519,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 		for k, v := range res.Writes {
 			b, lerr := marshalOutput(v)
 			if lerr != nil {
-				return failCmd(id, wj.ExecID, ref, lerr.Error())
+				return failCmd(id, wj.ExecID, ref, lerr.Error(), res.Usage)
 			}
 
 			if b == nil {

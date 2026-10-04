@@ -322,7 +322,7 @@ nodes:
 		return err == nil && len(l) == 2
 	}, func() string { return "triggers did not start two executions" })
 
-	if st := e.Completed("on-order-order-2"); string(st.Input) != `{"order":2}` {
+	if st := e.Completed(packtrail.TriggerExecID("on-order", "order-2")); string(st.Input) != `{"order":2}` {
 		t.Fatalf("trigger input %s", st.Input)
 	}
 }

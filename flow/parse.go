@@ -73,6 +73,9 @@ func Parse(data []byte) (*Flow, error) {
 func ParseJSON(data []byte) (*Flow, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
+	// Keep numbers as written: meta is handed to workers and hashed, and a
+	// float64 would round integers above 2^53.
+	dec.UseNumber()
 
 	var f Flow
 	if err := dec.Decode(&f); err != nil {

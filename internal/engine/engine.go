@@ -55,6 +55,10 @@ const (
 	// transient errors: with the backoff it is about 30 minutes, after which
 	// the command is dead-lettered (I-11) and can be redriven.
 	maxDeliver = 64
+	// deadLetterSpare is how many more deliveries a consumer allows past
+	// maxDeliver, for recording the dead letter itself: a failed record
+	// naks, and the server must not drop the message before one succeeds.
+	deadLetterSpare = 8
 )
 
 // Engine processes commands.
@@ -103,7 +107,7 @@ func (e *Engine) RunPartition(ctx context.Context, p int, ready func()) error {
 		Stream: e.In.Names.StreamCmd,
 		Consumer: jetstream.ConsumerConfig{
 			Durable: e.In.Names.DurEngine(p), FilterSubject: e.In.Names.CmdPartitionFilter(p),
-			AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + 1, AckWait: e.In.AckWait,
+			AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + deadLetterSpare, AckWait: e.In.AckWait,
 		},
 		Group:      "engine",
 		PullExpiry: e.In.PullExpiry,
@@ -292,21 +296,18 @@ func (e *Engine) deadLetter(ctx context.Context, msg jetstream.Msg, execID, reas
 		seq = md.Sequence.Stream
 	}
 
-	e.deadLetterAs(ctx, msg, wire.DLQCommand, execID, reason, "cmd."+strconv.FormatUint(seq, 10))
+	e.deadLetterAs(ctx, msg, wire.DeadLetter{Kind: wire.DLQCommand, Key: execID, Reason: reason},
+		"cmd."+strconv.FormatUint(seq, 10))
 }
 
-// deadLetterAs records msg as a dead letter of kind (deduplicated by dedup)
+// deadLetterAs records msg as the dead letter d (deduplicated by dedup)
 // and terminates it; if the record fails, msg is redelivered instead.
-func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, kind, key, reason, dedup string) {
-	var deliveries uint64
+func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.DeadLetter, dedup string) {
 	if md, err := msg.Metadata(); err == nil {
-		deliveries = md.NumDelivered
+		d.Deliveries = md.NumDelivered
 	}
 
-	d := wire.DeadLetter{
-		Kind: kind, Key: key, Reason: reason, Deliveries: deliveries, Subject: msg.Subject(),
-		Header: msg.Headers(), Body: msg.Data(),
-	}
+	d.Subject, d.Header, d.Body = msg.Subject(), msg.Headers(), msg.Data()
 
 	if err := wire.PublishDLQ(ctx, e.In, d, dedup); err != nil {
 		e.In.Logger.Error("packtrail: dead letter failed", "err", err)
@@ -317,7 +318,7 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, kind, key,
 	}
 
 	e.Metrics.DeadLetters.Add(1)
-	e.In.Logger.Warn("packtrail: dead-lettered", "kind", kind, "key", key, "reason", reason)
+	e.In.Logger.Warn("packtrail: dead-lettered", "kind", d.Kind, "key", d.Key, "reason", d.Reason)
 
 	if err := msg.Term(); err != nil {
 		e.In.Logger.Warn("packtrail: term failed", "err", err)

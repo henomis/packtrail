@@ -50,7 +50,7 @@ func (e *Engine) RunCron(ctx context.Context, ready func()) error {
 		Stream: e.In.Names.StreamCmd,
 		Consumer: jetstream.ConsumerConfig{
 			Durable: e.In.Names.DurCron(), FilterSubject: e.In.Names.CronFilter(),
-			AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + 1,
+			AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + deadLetterSpare,
 		},
 		Group:      "cron",
 		PullExpiry: e.In.PullExpiry,
@@ -119,7 +119,7 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 		Stream: tr.Stream,
 		Consumer: jetstream.ConsumerConfig{
 			Durable:       e.In.Names.Prefix + "-trigger-" + def.Name + "-" + strconv.Itoa(i),
-			FilterSubject: tr.Subject, AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + 1,
+			FilterSubject: tr.Subject, AckPolicy: jetstream.AckExplicitPolicy, MaxDeliver: maxDeliver + deadLetterSpare,
 			AckWait: e.In.AckWait,
 		},
 		Drain:      e.Drain,
@@ -134,16 +134,20 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 				return
 			}
 
-			execID, ok := triggerExecID(def, msg.Headers().Get(wire.HeaderMsgID))
-			if !ok {
-				execID = def.Name + "-" + tr.Stream + "-" + strconv.FormatUint(md.Sequence.Stream, 10)
+			execID := names.TriggerSeqExecID(def.Name, tr.Stream, md.Sequence.Stream)
+			if id := msg.Headers().Get(wire.HeaderMsgID); id != "" {
+				execID = names.TriggerMsgExecID(def.Name, id)
 			}
 
 			if err = e.startFromTrigger(ctx, def, execID, msg.Data()); err != nil {
 				if md.NumDelivered >= e.triggerDeliveries() {
 					// One record per flow: flows triggered by the same
 					// message must not dedupe each other's dead letter.
-					e.deadLetterAs(ctx, msg, wire.DLQTrigger, execID, "delivery attempts exhausted: "+err.Error(),
+					d := wire.DeadLetter{
+						Kind: wire.DLQTrigger, Key: execID, Flow: def.Name,
+						Reason: "delivery attempts exhausted: " + err.Error(),
+					}
+					e.deadLetterAs(ctx, msg, d,
 						"trigger."+def.Name+"."+tr.Stream+"."+strconv.FormatUint(md.Sequence.Stream, 10))
 
 					return
@@ -162,20 +166,6 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 	})
 }
 
-// triggerExecID is the execution a trigger message with Nats-Msg-Id msgID
-// starts: "<flow>-<msgID>", so flows triggered by the same message do not
-// share an id (nor a start command id). ok is false without a Msg-Id or when
-// the result is not a valid token.
-func triggerExecID(def *flow.Flow, msgID string) (string, bool) {
-	if msgID == "" {
-		return "", false
-	}
-
-	id := def.Name + "-" + msgID
-
-	return id, names.ValidToken(id)
-}
-
 // triggerDeliveries is how many deliveries a stream trigger message gets
 // before it is dead-lettered.
 func (e *Engine) triggerDeliveries() uint64 {
@@ -186,16 +176,13 @@ func (e *Engine) triggerDeliveries() uint64 {
 	return maxDeliver
 }
 
-// triggerDataKey wraps a trigger message that is not a JSON object.
-const triggerDataKey = "data"
-
 // runCoreTrigger serves a trigger without a stream: a core queue
 // subscription.
 func (e *Engine) runCoreTrigger(ctx context.Context, def *flow.Flow, tr flow.Trigger, ready func()) error {
 	sub, err := e.In.NC.QueueSubscribe(tr.Subject, e.In.Names.Prefix+"-trigger-"+def.Name, func(m *nats.Msg) {
-		execID, ok := triggerExecID(def, m.Header.Get(wire.HeaderMsgID))
-		if !ok {
-			execID = def.Name + "-" + nuid.Next()
+		execID := names.TriggerMsgExecID(def.Name, "core\x00"+nuid.Next()) // no Msg-Id: a fresh id
+		if id := m.Header.Get(wire.HeaderMsgID); id != "" {
+			execID = names.TriggerMsgExecID(def.Name, id)
 		}
 
 		if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
@@ -232,16 +219,7 @@ func (e *Engine) readyWhenFlushed(ctx context.Context, ready func()) {
 }
 
 func (e *Engine) startFromTrigger(ctx context.Context, def *flow.Flow, execID string, data []byte) error {
-	input := json.RawMessage(data)
-	if len(data) == 0 || !json.Valid(data) {
-		b, _ := json.Marshal(map[string]string{triggerDataKey: string(data)}) //nolint:errchkjson // strings always encode
-		input = b
-	} else if data[0] != '{' {
-		b, _ := json.Marshal(map[string]json.RawMessage{triggerDataKey: data}) //nolint:errchkjson // data is valid JSON
-		input = b
-	}
-
-	c, err := cmd.New("trigger."+execID, cmd.Start, execID, cmd.StartData{Flow: def.Name, Input: input})
+	c, err := wire.TriggerStart(def.Name, execID, data)
 	if err != nil {
 		return err
 	}

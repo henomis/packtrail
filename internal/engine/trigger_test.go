@@ -91,7 +91,7 @@ func TestTriggerDeadLettersAfterMaxDeliver(t *testing.T) {
 	var raw *jetstream.RawStreamMsg
 
 	for raw == nil {
-		raw, _ = dlq.GetLastMsgForSubject(ctx, in.Names.DLQSubject(wire.DLQTrigger, "trig-o1"))
+		raw, _ = dlq.GetLastMsgForSubject(ctx, in.Names.DLQSubject(wire.DLQTrigger, names.TriggerMsgExecID("trig", "o1")))
 
 		select {
 		case <-ctx.Done():
@@ -105,7 +105,7 @@ func TestTriggerDeadLettersAfterMaxDeliver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if d.Kind != wire.DLQTrigger || d.Key != "trig-o1" || d.Subject != "orders.created" ||
+	if d.Kind != wire.DLQTrigger || d.Key != names.TriggerMsgExecID("trig", "o1") || d.Subject != "orders.created" ||
 		string(d.Body) != `{"order":1}` || d.Deliveries != 2 {
 		t.Fatalf("dead letter %+v", d)
 	}

@@ -26,6 +26,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/henomis/packtrail"
+	"github.com/henomis/packtrail/internal/names"
 )
 
 // Durable (stream) triggers: the application owns stream ORDERS; two flows
@@ -152,13 +153,13 @@ func TestTriggerStreamSurvivesEngineOutage(t *testing.T) {
 
 		if i%2 == 0 {
 			publishOrder(t, e, e.S.JS, "o"+strconv.Itoa(i), []byte(body))
-			want["on-order-o"+strconv.Itoa(i)] = body
+			want[packtrail.TriggerExecID("on-order", "o"+strconv.Itoa(i))] = body
 
 			continue
 		}
 
 		seq := publishOrder(t, e, e.S.JS, "", []byte(body))
-		want["on-order-ORDERS-"+strconv.FormatUint(seq, 10)] = body
+		want[names.TriggerSeqExecID("on-order", "ORDERS", seq)] = body
 	}
 
 	e.StartEngine()
@@ -217,7 +218,7 @@ func TestTriggerStreamAcrossCrashAndNATSRestart(t *testing.T) {
 	}
 
 	for i := range n {
-		e.Completed("on-order-o" + strconv.Itoa(i))
+		e.Completed(packtrail.TriggerExecID("on-order", "o"+strconv.Itoa(i)))
 	}
 
 	e.Eventually(func() bool { return countFlow(e, "on-order") == n },
@@ -234,7 +235,7 @@ func TestTriggerRepublishedMessageStartsOnce(t *testing.T) {
 	e.restartReady()
 
 	first := publishOrder(t, e, e.S.JS, "x", []byte(`{"v":1}`))
-	e.Completed("on-order-x")
+	e.Completed(packtrail.TriggerExecID("on-order", "x"))
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -258,7 +259,7 @@ func TestTriggerRepublishedMessageStartsOnce(t *testing.T) {
 		t.Fatalf("%d executions, want 1", c)
 	}
 
-	if st := e.Completed("on-order-x"); string(st.Input) != `{"v":1}` {
+	if st := e.Completed(packtrail.TriggerExecID("on-order", "x")); string(st.Input) != `{"v":1}` {
 		t.Fatalf("input %s: the republished message replaced the first", st.Input)
 	}
 }
@@ -283,7 +284,10 @@ func TestTriggerOneMessageStartsEveryFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, id := range []string{"on-order-m1", "audit-m1", "on-core-m2", "audit-m2"} {
+	for _, id := range []string{
+		packtrail.TriggerExecID("on-order", "m1"), packtrail.TriggerExecID("audit", "m1"),
+		packtrail.TriggerExecID("on-core", "m2"), packtrail.TriggerExecID("audit", "m2"),
+	} {
 		e.Completed(id)
 	}
 
@@ -324,7 +328,7 @@ func TestTriggerStreamCreatedAfterEngine(t *testing.T) {
 
 	createOrders(t, e, jetstream.StreamConfig{})
 	publishOrder(t, e, e.S.JS, "late", []byte(`{}`))
-	e.Completed("on-order-late")
+	e.Completed(packtrail.TriggerExecID("on-order", "late"))
 
 	select {
 	case <-e.Engine.Ready():
@@ -356,7 +360,7 @@ func TestTriggerInputWrapping(t *testing.T) {
 
 		publishOrder(t, e, e.S.JS, id, []byte(body))
 
-		st := e.Completed("on-order-" + id)
+		st := e.Completed(packtrail.TriggerExecID("on-order", id))
 
 		var got, exp any
 		if json.Unmarshal(st.Input, &got) != nil || json.Unmarshal([]byte(want), &exp) != nil ||

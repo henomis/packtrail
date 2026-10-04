@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -167,7 +168,7 @@ func TestEventDrivenPipeline(t *testing.T) {
 		for _, tenant := range tenants {
 			for _, topic := range topics {
 				id := fmt.Sprintf("req-%s-%s-%s", round, tenant, topic)
-				ids = append(ids, "digest-"+id)                                      // the trigger's execution id is <flow>-<Nats-Msg-Id>
+				ids = append(ids, packtrail.TriggerExecID("digest", id))
 				body, _ := json.Marshal(digestRequest{Tenant: tenant, Topic: topic}) //nolint:errchkjson // plain struct.
 
 				for range 2 {
@@ -250,9 +251,16 @@ func TestEventDrivenPipeline(t *testing.T) {
 		t.Fatalf("%d cron runs after Unschedule", later-settled)
 	}
 
-	// Exactly the requests published, each once.
-	if n := ends.count("digest-req-"); n != len(first)+len(again)+len(fresh) {
+	// Exactly the requests published, each once (triggered ids are
+	// "digest-t<digest>").
+	if n := ends.count("digest-t"); n != len(first)+len(again)+len(fresh) {
 		t.Fatalf("%d request executions, want %d", n, len(first)+len(again)+len(fresh))
+	}
+
+	for _, id := range slices.Concat(first, again, fresh) {
+		if ends.seen[id] != 1 {
+			t.Fatalf("request %s ended %d times", id, ends.seen[id])
+		}
 	}
 
 	cached := map[string]bool{}

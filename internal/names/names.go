@@ -19,10 +19,13 @@
 package names
 
 import (
+	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"hash/fnv"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // Default is the namespace prefix used when none is supplied.
@@ -41,6 +44,9 @@ var (
 	// later.
 	tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )
+
+// maxToken is the longest valid token.
+const maxToken = 128
 
 // ValidPrefix reports whether p is a valid namespace prefix.
 func ValidPrefix(p string) bool { return prefixPattern.MatchString(p) }
@@ -233,3 +239,33 @@ func (n Names) DurIndexer() string { return n.Prefix + "-indexer" }
 
 // DurWorker is the durable consumer shared by every worker of one kind.
 func (n Names) DurWorker(kind string) string { return n.Prefix + "-work-" + kind }
+
+// triggerHashLen is the length of the digest that ends a trigger's execution
+// id: 26 base32 characters, 130 bits.
+const triggerHashLen = 26
+
+// TriggerMsgExecID is the execution a trigger of flow starts for a message
+// with Nats-Msg-Id msgID. Flows triggered by the same message get different
+// ids, and a redelivered or republished message the same one.
+func TriggerMsgExecID(flow, msgID string) string { return triggerExecID(flow, "msg\x00"+msgID) }
+
+// TriggerSeqExecID is the execution a stream trigger of flow starts for a
+// message without Nats-Msg-Id: the message's stream and sequence identify it.
+func TriggerSeqExecID(flow, stream string, seq uint64) string {
+	return triggerExecID(flow, "seq\x00"+stream+"\x00"+strconv.FormatUint(seq, 10))
+}
+
+// triggerExecID is "<flow>-t<digest of flow and key>", the flow cut so the
+// id stays a valid token. The digest has a fixed length, so two ids are equal
+// only when flow and key are: a '-' in a flow name or a Msg-Id cannot make
+// two triggers collide.
+func triggerExecID(flow, key string) string {
+	sum := sha256.Sum256([]byte(flow + "\x00" + key))
+	digest := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]))
+
+	if keep := maxToken - len("-t") - triggerHashLen; len(flow) > keep {
+		flow = flow[:keep]
+	}
+
+	return flow + "-t" + digest[:triggerHashLen]
+}

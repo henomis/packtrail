@@ -197,6 +197,13 @@ type startOpts struct {
 // second Start with the same id returns it without starting anything, I-03).
 func WithExecutionID(id string) StartOption { return func(o *startOpts) { o.id = id } }
 
+// TriggerExecID returns the id of the execution a message trigger of flow
+// starts for a message with Nats-Msg-Id msgID: "<flow>-t<digest>", unique per
+// flow and message. Use it to follow (Wait, Get) what a published message
+// started. A message without a Msg-Id gets an id derived from its stream and
+// sequence (stream trigger) or a fresh one (core trigger).
+func TriggerExecID(flow, msgID string) string { return names.TriggerMsgExecID(flow, msgID) }
+
 // WithVersion pins a flow version hash instead of the latest.
 func WithVersion(hash string) StartOption { return func(o *startOpts) { o.version = hash } }
 

@@ -145,8 +145,10 @@ func CmdID(execID, key string, gen, attempt int) string {
 
 // DeadLetter is a message the system gave up on.
 type DeadLetter struct {
-	Kind       string              `json:"kind"`
-	Key        string              `json:"key"`
+	Kind string `json:"kind"`
+	Key  string `json:"key"`
+	// Flow is the flow a trigger dead letter was meant to start.
+	Flow       string              `json:"flow,omitempty"`
 	Reason     string              `json:"reason"`
 	Deliveries uint64              `json:"deliveries,omitempty"`
 	Time       time.Time           `json:"time"`
@@ -249,6 +251,25 @@ func PublishCmd(ctx context.Context, in *infra.Infra, c cmd.Command, traceparent
 	}
 
 	return nil
+}
+
+// triggerDataKey wraps a trigger message that is not a JSON object.
+const triggerDataKey = "data"
+
+// TriggerStart is the start command a trigger of flow publishes for a message
+// with body data, starting execID. A body that is not a JSON object is wrapped
+// as {"data": …}.
+func TriggerStart(flow, execID string, data []byte) (cmd.Command, error) {
+	input := json.RawMessage(data)
+	if len(data) == 0 || !json.Valid(data) {
+		b, _ := json.Marshal(map[string]string{triggerDataKey: string(data)}) //nolint:errchkjson // strings always encode
+		input = b
+	} else if data[0] != '{' {
+		b, _ := json.Marshal(map[string]json.RawMessage{triggerDataKey: data}) //nolint:errchkjson // data is valid JSON
+		input = b
+	}
+
+	return cmd.New("trigger."+execID, cmd.Start, execID, cmd.StartData{Flow: flow, Input: input})
 }
 
 // CacheEntry is a cached task result.

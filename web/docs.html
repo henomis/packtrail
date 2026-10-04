@@ -675,9 +675,11 @@ c.<span class="fn">Unschedule</span>(ctx, <span class="s">"nightly"</span>)</cod
         A flow's <code>triggers</code> start it for every message on a subject; the message body is the
         input. With <code>stream</code> set, the trigger is a durable JetStream consumer of that stream
         (at-least-once); without it, a core NATS queue subscription (at-most-once). The execution id
-        is <code>&lt;flow&gt;-&lt;Nats-Msg-Id&gt;</code>, so a duplicate message starts nothing twice and
-        several flows triggered by the same message each run once; without a <code>Nats-Msg-Id</code>
-        it is <code>&lt;flow&gt;-&lt;stream&gt;-&lt;sequence&gt;</code> (stream) or a fresh id (core).
+        is derived from the flow and the message's <code>Nats-Msg-Id</code>
+        (<code>packtrail.TriggerExecID(flow, msgID)</code>, <code>&lt;flow&gt;-t&lt;digest&gt;</code>), so a
+        duplicate message starts nothing twice and several flows triggered by the same message each run
+        once; without a <code>Nats-Msg-Id</code> it is derived from the stream and sequence (stream) or
+        fresh (core).
         A stream message that still cannot be started after its redeliveries is dead-lettered
         (<code>trigger</code>). Create the stream yourself: until it exists the trigger keeps retrying
         and <code>Engine.Ready()</code> stays open.
@@ -806,7 +808,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Fork, Rerun</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
           <tr><td>Register, Flows, Flow</td><td>Store a definition (new version when changed), list versions, read one.</td></tr>
           <tr><td>Schedule, Unschedule, Schedules</td><td>Manage cron schedules.</td></tr>
-          <tr><td>DeadLetters, Redrive</td><td>Inspect and re-publish dead letters.</td></tr>
+          <tr><td>DeadLetters, Redrive</td><td>Inspect and re-publish dead letters (a <code>trigger</code> one restarts only its own flow).</td></tr>
           <tr><td>Quarantined, Unquarantine</td><td>See <a href="#operations">quarantine</a>.</td></tr>
           <tr><td>Store()</td><td>A namespaced key-value store for application data that outlives executions: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>.</td></tr>
         </tbody>
@@ -1255,8 +1257,10 @@ unquarantine &lt;exec&gt;</code></pre>
           <strong>Cron</strong> lives on <code>&lt;ns&gt;.sched.&lt;name&gt;</code> targeting
           <code>&lt;ns&gt;.cron.&lt;name&gt;</code>; each firing starts <code>&lt;name&gt;-&lt;stream sequence&gt;</code>.</li>
         <li><strong>Dead letters</strong> (<code>cmd</code>, <code>job</code>, <code>trigger</code>,
-          <code>dispatch</code>) have body <code>{kind, key, reason, deliveries, time, subject, header, body}</code>;
-          redrive re-publishes <code>body</code> to <code>subject</code> without the <code>Nats-*</code> headers.</li>
+          <code>dispatch</code>) have body <code>{kind, key, flow?, reason, deliveries, time, subject, header, body}</code>;
+          redrive re-publishes <code>body</code> to <code>subject</code> without the <code>Nats-*</code> headers, except a
+          <code>trigger</code> dead letter: it becomes the start of its <code>flow</code> with execution id <code>key</code>,
+          so other consumers of the subject do not see the message again.</li>
       </ul>
     </section>
 

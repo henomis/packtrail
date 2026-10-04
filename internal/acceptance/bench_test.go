@@ -33,8 +33,8 @@ import (
 	"github.com/henomis/packtrail/worker"
 )
 
-// BenchmarkLinearThroughput measures completed 3-step executions per second
-// (docs/bench.md). Completions are counted from the events streams by one
+// BenchmarkLinearThroughput measures completed 3-step executions per second.
+// Completions are counted from the events streams by one
 // consumer per namespace, so the measure is not bounded by the client.
 // Environment: PT_BENCH_PARTITIONS (default 64), PT_BENCH_ENGINES (1 per
 // namespace, each owning a share of the partitions), PT_BENCH_WORKERS (1

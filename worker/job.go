@@ -15,7 +15,7 @@
 // Package worker is the Go SDK for packtrail workers. A worker serves one
 // kind: it pulls jobs from <ns>.work.<kind>, runs a handler, and reports the
 // outcome as a command (complete, fail, interrupt) to the job's reply
-// subject. The protocol is plain NATS + JSON (docs/protocol.md); SDKs in other
+// subject. The protocol is plain NATS + JSON; SDKs in other
 // languages implement the same steps.
 //
 //	w, _ := worker.New(nc, "summarize", func(ctx context.Context, j *worker.Job) (*worker.Result, error) {

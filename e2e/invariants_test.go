@@ -44,7 +44,7 @@ type attempt struct {
 	gen, attemptNum int
 }
 
-// check verifies the invariants of the event model (docs/events.md) on a
+// check verifies the invariants of the event model on a
 // finished execution and returns what it read. Every scenario calls it on
 // every execution it creates.
 func (cl *cluster) check(id string) *facts {

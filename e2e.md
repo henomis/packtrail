@@ -49,8 +49,6 @@ Modified:
 | `client_more.go` | bounded ordered-consumer creation (`Wait`/`Watch`/`WatchTerminal`) |
 | `packtrail.go` | `Engine.Archive` errors |
 
-`docs/invariants.md` got rows I-88..I-90, but `docs/` is in `.gitignore`.
-
 ## Harness additions (`e2e/harness_test.go`)
 
 - `newClusterOn(t, server, ns, flows, opts...)`: several clusters (namespaces)
@@ -135,7 +133,7 @@ Every scenario also runs `cl.check(id)` (event-model invariants, incl.
   bucket/keys as `Client.Store()`, shared code in `internal/store`, shared
   sentinels in `internal/apierr` so `errors.Is(err, packtrail.ErrNotFound)`
   works on both). #10 uses it; acceptance `TestJobStore`; documented in
-  `docs/protocol.md` and `web/docs.html`.
+  `web/docs.html`.
 - **Core triggers are at-most-once**: #4 publishes only while engines are
   known ready (replaced after the NATS restart). The durable stream trigger
   would need the test to create an application JetStream stream directly,

@@ -18,7 +18,7 @@
 // events it produces. Every command carries an id: the stream deduplicates on
 // it (Nats-Msg-Id) and the decision is idempotent, so redelivery is harmless.
 //
-// The JSON encoding is the wire protocol shared by every SDK (docs/protocol.md).
+// The JSON encoding is the wire protocol shared by every SDK.
 package cmd
 
 import (

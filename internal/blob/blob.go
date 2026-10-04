@@ -15,7 +15,7 @@
 // Package blob implements the claim-check: a message body larger than the
 // threshold is stored in the blobs object store and the message carries only
 // its name in the Pt-Blob header. It applies uniformly to events, commands and
-// jobs, so every reader resolves bodies the same way (docs/protocol.md).
+// jobs, so every reader resolves bodies the same way.
 package blob
 
 import (

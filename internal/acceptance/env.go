@@ -16,7 +16,7 @@
 // drives a real engine, real workers and a real embedded nats-server through
 // the public API only, with fault injection (engine kill and restart, NATS
 // restart, duplicate and reordered completions). Each scenario pins a
-// guaranteed behaviour; docs/invariants.md points at them.
+// guaranteed behaviour.
 package acceptance
 
 import (

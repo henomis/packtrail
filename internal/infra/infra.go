@@ -42,7 +42,7 @@ const MetaPartitions = "packtrail.partitions"
 // version.
 const MetaProtocol = "packtrail.protocol"
 
-// ProtocolVersion is the version of the wire protocol (docs/protocol.md).
+// ProtocolVersion is the version of the wire protocol.
 const ProtocolVersion = "1"
 
 // Default timeouts (all configurable on the engine, client and worker).

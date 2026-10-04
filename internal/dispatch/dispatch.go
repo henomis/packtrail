@@ -97,7 +97,7 @@ func (d *Dispatcher) Run(ctx context.Context, p int, ready func()) error {
 		// No pinned group: MaxAckPending 1 already serialises the partition
 		// across any number of dispatchers, and pinning combined with a single
 		// in-flight message can stall a consumer after a hand-over (observed
-		// with nats-server 2.14; see docs/bench.md).
+		// with nats-server 2.14).
 		Drain:      d.Drain,
 		PullExpiry: d.In.PullExpiry,
 		Logger:     d.In.Logger,

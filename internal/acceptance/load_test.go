@@ -28,7 +28,7 @@ import (
 
 // TestM4Load runs many executions across 3 engines × 16 partitions while
 // engines are killed and replaced in rotation. PT_LOAD sets the number of
-// executions (default 300; docs/bench.md records larger runs).
+// executions (default 300).
 func TestM4Load(t *testing.T) {
 	if testing.Short() {
 		t.Skip("load test")

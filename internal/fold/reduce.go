@@ -49,9 +49,12 @@ func Reduce(reducer string, cur, delta json.RawMessage) (json.RawMessage, error)
 	}
 }
 
+// jsonNull is the JSON null literal.
+const jsonNull = "null"
+
 func isNull(b json.RawMessage) bool {
 	t := bytes.TrimSpace(b)
-	return len(t) == 0 || string(t) == "null"
+	return len(t) == 0 || string(t) == jsonNull
 }
 
 func reduceAppend(cur, delta json.RawMessage) (json.RawMessage, error) {

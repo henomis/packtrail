@@ -166,6 +166,15 @@ func (c *Client) attach(ctx context.Context) error {
 	return nil
 }
 
+// attached reports whether attach has succeeded. It takes attachMu, since a
+// concurrent call may be attaching.
+func (c *Client) attached() bool {
+	c.attachMu.Lock()
+	defer c.attachMu.Unlock()
+
+	return c.in != nil
+}
+
 func checkExecID(id string) error {
 	if err := names.CheckToken("execution id", id); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
@@ -200,8 +209,13 @@ func WithTraceparent(tp string) StartOption { return func(o *startOpts) { o.trac
 // Resume, Update and Get can address it right away. It needs a running
 // engine, and fails with ErrInvalidArgument when the engine refuses the
 // input. The execution itself runs asynchronously; use Wait, WaitUntil or
-// Watch to follow it. If ctx ends first the execution may still start: retry
-// with the same WithExecutionID.
+// Watch to follow it.
+//
+// An error with an empty id means nothing was requested. An error with an id
+// (ctx ended before the engine answered) means the outcome is unknown: the
+// execution may still start, and retrying with WithExecutionID(id) is safe. A
+// reply lost to a reconnect does not hang Start: it returns as soon as the
+// execution exists.
 func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...StartOption) (string, error) {
 	if err := c.attach(ctx); err != nil {
 		return "", err
@@ -242,8 +256,12 @@ func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...
 		return "", err
 	}
 
-	if _, err = c.request(ctx, start, o.trace); err != nil {
-		return "", err
+	if _, published, rerr := c.request(ctx, start, o.trace, true); rerr != nil {
+		if published {
+			return o.id, rerr
+		}
+
+		return "", rerr
 	}
 
 	return o.id, nil
@@ -563,7 +581,9 @@ func WithForkWrites(writes map[string]any) ForkOption {
 // Fork creates a new execution from the state of execID right after the
 // event at sequence seq (rounded up to the end of that decision), and
 // continues it from there: what was in flight is dispatched again. The source
-// is untouched. Like Start, it returns once the new execution exists.
+// is untouched. Like Start, it returns once the new execution exists, and
+// returns the new id with an error whose outcome is unknown (retry with
+// WithForkID(id)).
 func (c *Client) Fork(ctx context.Context, execID string, seq uint64, opts ...ForkOption) (string, error) {
 	evs, err := c.History(ctx, execID)
 	if err != nil {
@@ -613,8 +633,12 @@ func (c *Client) fork(ctx context.Context, execID string, seq uint64, opts []For
 		return "", err
 	}
 
-	if _, err = c.request(ctx, f, ""); err != nil {
-		return "", err
+	if _, published, rerr := c.request(ctx, f, "", true); rerr != nil {
+		if published {
+			return o.id, rerr
+		}
+
+		return "", rerr
 	}
 
 	return o.id, nil
@@ -704,7 +728,7 @@ func (c *Client) Update(ctx context.Context, execID string, writes map[string]an
 		return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 
-	seq, err := c.request(ctx, command, "")
+	seq, _, err := c.request(ctx, command, "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -712,33 +736,90 @@ func (c *Client) Update(ctx context.Context, execID string, writes map[string]an
 	return c.StateAt(ctx, execID, seq)
 }
 
+// Waiting for a reply: how often the wait wakes up, and how often it checks
+// the log without a reconnect (a reply dropped on a live connection).
+const (
+	replyPoll  = 250 * time.Millisecond
+	replyCheck = 5 * time.Second
+)
+
 // request publishes command and waits for the engine's answer: the sequence
 // of the decision it produced (or of the last one, for a no-op). The reply
 // subject travels in the command, so an engine that takes over a redelivered
-// command answers too.
-func (c *Client) request(ctx context.Context, command cmd.Command, traceparent string) (uint64, error) {
+// command answers too. published reports whether the command was stored, so
+// an error may leave it to be decided later.
+//
+// A reply is core NATS: one sent while the client reconnects is lost, and the
+// command, already acked, is never answered again. For a command that creates
+// its execution (creates), the log answers too: once the execution has an
+// event after a reconnect (or every replyCheck), the command was decided.
+func (c *Client) request(ctx context.Context, command cmd.Command, traceparent string, creates bool) (
+	seq uint64, published bool, err error,
+) {
 	inbox := c.nc.NewRespInbox()
 
 	sub, err := c.nc.SubscribeSync(inbox)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	defer func() { _ = sub.Unsubscribe() }()
 
 	command.Reply = inbox
+	reconnects := c.nc.Stats().Reconnects
+	checked := time.Now()
 
 	if err = wire.PublishCmd(ctx, c.in, command, traceparent); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
-	m, err := sub.NextMsgWithContext(ctx)
+	for {
+		wctx, cancel := context.WithTimeout(ctx, replyPoll)
+		m, nerr := sub.NextMsgWithContext(wctx)
+
+		cancel()
+
+		if nerr == nil {
+			seq, err = decodeReply(command, m.Data)
+
+			return seq, true, err
+		}
+
+		if ctx.Err() != nil {
+			return 0, true, ctx.Err()
+		}
+
+		if !errors.Is(nerr, context.DeadlineExceeded) {
+			return 0, true, nerr
+		}
+
+		if n := c.nc.Stats().Reconnects; creates && (n != reconnects || time.Since(checked) >= replyCheck) {
+			reconnects, checked = n, time.Now()
+
+			if seq = c.lastSeq(ctx, command.ExecID); seq > 0 {
+				return seq, true, nil
+			}
+		}
+	}
+}
+
+// lastSeq is the sequence of execID's last event, 0 if it has none or the
+// log cannot be read now.
+func (c *Client) lastSeq(ctx context.Context, execID string) uint64 {
+	rctx, cancel := context.WithTimeout(ctx, c.in.ReadTimeout)
+	defer cancel()
+
+	seq, err := c.ld.Log.LastSeq(rctx, execID)
 	if err != nil {
-		return 0, err
+		return 0
 	}
 
+	return seq
+}
+
+func decodeReply(command cmd.Command, data []byte) (uint64, error) {
 	var r wire.Reply
-	if err = json.Unmarshal(m.Data, &r); err != nil {
+	if err := json.Unmarshal(data, &r); err != nil {
 		return 0, fmt.Errorf("packtrail: %s reply: %w", command.Type, err)
 	}
 
@@ -763,9 +844,14 @@ func replyError(execID string, r wire.Reply) error {
 }
 
 // Rerun forks execID at the point where node was last entered, so the node
-// (and everything after it) runs again in a new execution. Any node can be
-// rerun: a task or a map runs its work again, a subflow starts a new child,
-// an await waits again.
+// (and everything after it) runs again in a new execution: a task or a map
+// runs its work again, a subflow starts a new child, an await waits again.
+//
+// A fork starts at the end of a decision, so only a node still in flight at
+// the end of the decision that entered it can be rerun. A node that settled
+// in that same decision (a choice, a join, an await whose signal was already
+// buffered, a node that failed on entry) fails with ErrInvalidArgument: rerun
+// the node before it, or Fork at an earlier sequence.
 func (c *Client) Rerun(ctx context.Context, execID, node string, opts ...ForkOption) (string, error) {
 	evs, err := c.History(ctx, execID)
 	if err != nil {
@@ -790,6 +876,16 @@ func (c *Client) Rerun(ctx context.Context, execID, node string, opts ...ForkOpt
 
 			break
 		}
+	}
+
+	st, err := c.StateAt(ctx, execID, cut)
+	if err != nil {
+		return "", err
+	}
+
+	if !st.Open(node) {
+		return "", fmt.Errorf("%w: node %q of %s settled in the decision that entered it; "+
+			"rerun the node before it", ErrInvalidArgument, node, execID)
 	}
 
 	return c.fork(ctx, execID, cut, opts)

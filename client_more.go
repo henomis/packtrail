@@ -401,7 +401,7 @@ func (c *Client) wait(ctx context.Context, execID string, cond func(*State) bool
 			return nil, ctx.Err()
 		}
 
-		if c.in == nil {
+		if !c.attached() {
 			return nil, err // the client never attached: retrying cannot help
 		}
 

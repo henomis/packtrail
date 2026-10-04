@@ -125,6 +125,29 @@ func (c *ChildState) NodeOf(key string) string {
 	return c.Node
 }
 
+// Open reports whether node is in flight: a task or map item instance, an
+// open fan-out, map or await, or a running child. A fork dispatches open
+// nodes again; a node that settled is past.
+func (s *State) Open(node string) bool {
+	if s.Fans[node] != nil || s.Maps[node] != nil || s.Awaits[node] != nil {
+		return true
+	}
+
+	for _, t := range s.Tasks {
+		if t.Node == node {
+			return true
+		}
+	}
+
+	for key, c := range s.Children {
+		if c.NodeOf(key) == node {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Buffered is a received signal not consumed yet.
 type Buffered struct {
 	Name    string          `json:"name"`

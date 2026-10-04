@@ -22,7 +22,7 @@ import (
 	"github.com/henomis/packtrail/internal/cmd"
 )
 
-func (x *h) interrupt(key, payload string) {
+func (x *h) interrupt(key, payload string) { //nolint:unparam // the key reads better at call sites.
 	x.t.Helper()
 
 	t := x.task(key)
@@ -127,5 +127,27 @@ func TestInterruptPayloadAcrossFork(t *testing.T) {
 
 	if got := y.seen(); got != `{"q":1}` {
 		t.Fatalf("fork resumed: interrupt = %q", got)
+	}
+}
+
+// A resume without a value (Client.Resume with nil, the dashboard's empty
+// resume) is still a resume: the job sees the interrupt payload and a null
+// resume value.
+func TestResumeWithoutValueKeepsInterruptPayload(t *testing.T) {
+	x := newH(t, linear)
+	x.start(`{}`)
+	x.interrupt("a", `{"q":1}`)
+	x.do(cmd.Resume, cmd.ResumeData{Node: "a"})
+
+	if a := x.task("a"); a.Status != TaskScheduled {
+		t.Fatalf("not resumed: %s", a.Status)
+	}
+
+	if got := x.seen(); got != `{"q":1}` {
+		t.Fatalf("resumed job interrupt = %q, want {\"q\":1}", got)
+	}
+
+	if got := string(x.st.ContextView(x.task("a")).Resume); got != "null" {
+		t.Fatalf("resumed job resume = %q, want null", got)
 	}
 }

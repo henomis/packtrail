@@ -53,6 +53,9 @@ type decider struct {
 	now   time.Time
 	cmdID string
 	out   []event.Event
+	// inherited holds the child ids a fork copied from its source and has not
+	// re-started yet: they belong to the source, never to be cancelled here.
+	inherited map[string]bool
 }
 
 // Decide returns the events produced by command c on state st, applying them to
@@ -423,7 +426,7 @@ func (d *decider) cancelChildren() []string {
 	var out []string
 
 	for _, node := range slices.Sorted(maps.Keys(d.st.Children)) {
-		if c := d.st.Children[node]; c.Policy != flow.ParentCloseAbandon {
+		if c := d.st.Children[node]; c.Policy != flow.ParentCloseAbandon && !d.inherited[c.ChildID] {
 			out = append(out, c.ChildID)
 		}
 	}
@@ -722,7 +725,14 @@ func (d *decider) resume(p *cmd.ResumeData) error {
 
 	n := d.def.Node(t.Node)
 
-	return d.schedule(n, t.Key, t.Owner, t.Index, t.Item, p.Value, 0, 1)
+	// A resume without a value resumes with null: an empty value would mark
+	// the run as fresh (no Job.Resumed, no interrupt payload).
+	value := p.Value
+	if len(value) == 0 {
+		value = json.RawMessage(jsonNull)
+	}
+
+	return d.schedule(n, t.Key, t.Owner, t.Index, t.Item, value, 0, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,7 +1248,18 @@ func (d *decider) rekick() error {
 		}
 	}
 
+	d.inherited = map[string]bool{}
+	for _, c := range d.st.Children {
+		d.inherited[c.ChildID] = true
+	}
+
 	for _, key := range slices.Sorted(maps.Keys(d.st.Children)) {
+		// A child that cannot start (its input fails) fails the fork, which
+		// closes every child: stop there.
+		if d.st.Status.Terminal() {
+			return nil
+		}
+
 		c := d.st.Children[key]
 
 		var item json.RawMessage

@@ -871,7 +871,7 @@ st, err := c.<span class="fn">Update</span>(ctx, id, <span class="kw">map</span>
           <tr><td>StateAt(exec, seq)</td><td>The state right after the decision at <code>seq</code>.</td></tr>
           <tr><td>OutputHistory(exec, node)</td><td>Every output the node produced, oldest first — one per visit.</td></tr>
           <tr><td>Fork(exec, seq, …)</td><td>A new execution from the state at <code>seq</code>, continuing from there: what was in flight is dispatched again. <code>WithForkWrites</code> edits its channels first; <code>WithForkID</code> names it.</td></tr>
-          <tr><td>Rerun(exec, node, …)</td><td>Fork at the point the node was last entered, so it (and what follows) runs again — the usual move after fixing a worker bug.</td></tr>
+          <tr><td>Rerun(exec, node, …)</td><td>Fork at the point the node was last entered, so it (and what follows) runs again — the usual move after fixing a worker bug. The node must still be in flight when the decision that entered it ends (a task, map, subflow, fan-out or waiting await): a node that settled right away (a choice, a join, an await whose signal was already buffered) is refused with <code>ErrInvalidArgument</code>; rerun the node before it.</td></tr>
         </tbody>
       </table>
       <div class="codecard">

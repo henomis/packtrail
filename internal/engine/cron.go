@@ -141,8 +141,10 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 
 			if err = e.startFromTrigger(ctx, def, execID, msg.Data()); err != nil {
 				if md.NumDelivered >= e.triggerDeliveries() {
+					// One record per flow: flows triggered by the same
+					// message must not dedupe each other's dead letter.
 					e.deadLetterAs(ctx, msg, wire.DLQTrigger, execID, "delivery attempts exhausted: "+err.Error(),
-						"trigger."+tr.Stream+"."+strconv.FormatUint(md.Sequence.Stream, 10))
+						"trigger."+def.Name+"."+tr.Stream+"."+strconv.FormatUint(md.Sequence.Stream, 10))
 
 					return
 				}

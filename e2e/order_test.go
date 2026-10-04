@@ -320,8 +320,10 @@ func orderCases(prefix string) []orderCase {
 			want: compensated, failedAt: "settle",
 		},
 		{
-			name: "broken-item", o: order{ID: prefix + "broken", Customer: "eve", Amount: 50,
-				Items: []item{{SKU: "X", Price: 1}, {SKU: "Y", Price: 2, Broken: true}, {SKU: "Z", Price: 3}}},
+			name: "broken-item", o: order{
+				ID: prefix + "broken", Customer: "eve", Amount: 50,
+				Items: []item{{SKU: "X", Price: 1}, {SKU: "Y", Price: 2, Broken: true}, {SKU: "Z", Price: 3}},
+			},
 			want: compensated, failedAt: "pack",
 		},
 	}

@@ -327,3 +327,82 @@ func TestForkRestartsBranchAndItemChildren(t *testing.T) {
 		})
 	}
 }
+
+// a fork whose writes make a re-started branch child's input
+// invalid must fail the fork with expression_error, not panic in the fold.
+const forkFan = `
+name: ff
+channels:
+  cfg: {default: {a: 1}}
+nodes:
+  - {id: f, type: fanout, branches: [b1, b2], next: j}
+  - {id: b1, type: subflow, flow: child, input: "%s"}
+  - {id: b2, type: subflow, flow: child, input: "%s"}
+  - {id: j, type: join}
+`
+
+func forkWith(t *testing.T, yaml string, writes map[string]json.RawMessage) (*h, *State, []event.Event, error) {
+	t.Helper()
+
+	x := newH(t, yaml)
+	x.start(`{}`)
+
+	src, _ := x.st.Clone()
+	fork := New("e2")
+
+	var (
+		evs []event.Event
+		err error
+	)
+
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				t.Fatalf("DecideFork panicked: %v", p)
+			}
+		}()
+
+		evs, err = DecideFork(x.def, fork, src, "e1", 9, "fork-1", writes, t0)
+	}()
+
+	return x, fork, evs, err
+}
+
+func TestForkFailingBranchChildFailsTheFork(t *testing.T) {
+	y := fmt.Sprintf(forkFan, "channels.cfg", "channels.cfg")
+	_, fork, _, err := forkWith(t, y, map[string]json.RawMessage{"cfg": json.RawMessage(`5`)})
+
+	if err != nil || fork.Status != StatusFailed || fork.Reason != event.ReasonExpression {
+		t.Fatalf("fork: err %v status %s reason %s", err, fork.Status, fork.Reason)
+	}
+}
+
+// the failure of a fork must not cancel the SOURCE's children.
+func TestFailedForkKeepsSourceChildren(t *testing.T) {
+	y := `
+name: ff
+channels:
+  cfg: {default: {a: 1}}
+nodes:
+  - {id: f, type: fanout, branches: [b1, b2], next: j}
+  - {id: b1, type: subflow, flow: child, input: "{'x': 1}"}
+  - {id: b2, type: subflow, flow: child, input: "channels.cfg"}
+  - {id: j, type: join}
+`
+
+	x, fork, evs, err := forkWith(t, y, map[string]json.RawMessage{"cfg": json.RawMessage(`5`)})
+	if err != nil || fork.Status != StatusFailed {
+		t.Fatalf("fork: err %v status %s", err, fork.Status)
+	}
+
+	failed := evs[len(evs)-1].Data.(*event.Failed) //nolint:forcetypeassert // last event of a failed fork.
+
+	for _, c := range x.st.Children { // the source's (e1) running children
+		for _, id := range failed.CancelChildren {
+			if id == c.ChildID {
+				t.Fatalf("fork e2's ExecutionFailed cancels the source's child %s (cancel list %v)",
+					id, failed.CancelChildren)
+			}
+		}
+	}
+}

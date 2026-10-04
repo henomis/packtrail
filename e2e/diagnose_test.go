@@ -37,8 +37,10 @@ func (cl *cluster) diagnose(id string) string {
 		fmt.Fprintf(&b, "status %s steps %d last %s updated %s lastSeq %d\n", st.Status, st.Steps, st.LastNode,
 			st.Updated.Format(time.RFC3339Nano), st.LastSeq)
 
-		for name, open := range map[string]any{"tasks": st.Tasks, "timers": st.Timers, "awaits": st.Awaits,
-			"fans": st.Fans, "maps": st.Maps, "children": st.Children} {
+		for name, open := range map[string]any{
+			"tasks": st.Tasks, "timers": st.Timers, "awaits": st.Awaits,
+			"fans": st.Fans, "maps": st.Maps, "children": st.Children,
+		} {
 			if j, _ := json.Marshal(open); string(j) != "null" && string(j) != "{}" { //nolint:errchkjson // diagnostics.
 				fmt.Fprintf(&b, "open %s: %s\n", name, j)
 			}

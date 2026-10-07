@@ -84,7 +84,7 @@ func TestOversizedDecisionFailsExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err = e.apply(ctx, c, ""); err != nil {
+	if _, _, err = e.apply(ctx, c, ""); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 

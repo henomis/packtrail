@@ -44,10 +44,12 @@ const (
 // "invalid" (malformed or does not fit the flow), "rejected" (refused in the
 // execution's current state), "not_found", "failed" (dead-lettered).
 type Reply struct {
-	OK    bool   `json:"ok"`
-	Seq   uint64 `json:"seq,omitempty"`
-	Code  string `json:"code,omitempty"`
-	Error string `json:"error,omitempty"`
+	OK  bool   `json:"ok"`
+	Seq uint64 `json:"seq,omitempty"`
+	// Joined marks a start that found its execution already there.
+	Joined bool   `json:"joined,omitempty"`
+	Code   string `json:"code,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // Reply codes.
@@ -56,6 +58,7 @@ const (
 	ReplyRejected = "rejected"
 	ReplyNotFound = "not_found"
 	ReplyFailed   = "failed"
+	ReplyConflict = "conflict"
 )
 
 // Progress is an intermediate result a worker publishes while it runs a job:

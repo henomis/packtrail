@@ -162,8 +162,8 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	seq, err := e.apply(ctx, c, msg.Headers().Get(wire.HeaderTraceparent))
-	if e.answer(c, seq, err) {
+	seq, appended, err := e.apply(ctx, c, msg.Headers().Get(wire.HeaderTraceparent))
+	if e.answer(c, seq, c.Type == cmd.Start && !appended, err) {
 		_ = msg.Ack() // a rejection answered to the caller is not poison
 
 		return
@@ -174,17 +174,22 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 
 // answer replies to a command that asked for it (c.Reply): on success, and on
 // a rejection, which then ends the command (it reports true). Other errors are
-// retried as usual and answered when they end.
-func (e *Engine) answer(c cmd.Command, seq uint64, err error) bool {
+// retried as usual and answered when they end. joined reports a start that
+// found its execution already there.
+func (e *Engine) answer(c cmd.Command, seq uint64, joined bool, err error) bool {
 	if c.Reply == "" {
 		return false
 	}
 
 	switch {
 	case err == nil:
-		e.reply(c, wire.Reply{OK: true, Seq: seq})
+		e.reply(c, wire.Reply{OK: true, Seq: seq, Joined: joined})
 
 		return false
+	case errors.Is(err, fold.ErrConflict):
+		e.reply(c, wire.Reply{Code: wire.ReplyConflict, Error: err.Error()})
+
+		return true
 	case errors.Is(err, fold.ErrInvalid):
 		e.reply(c, wire.Reply{Code: wire.ReplyInvalid, Error: err.Error()})
 
@@ -325,24 +330,24 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	}
 }
 
-// apply decides and appends, retrying on concurrent appends.
 // apply decides and appends, retrying on concurrent appends. It returns the
-// sequence of the stored decision (for a no-op, of the last one).
-func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, error) {
+// sequence of the stored decision (for a no-op, of the last one) and whether
+// the decision appended events.
+func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, bool, error) {
 	for range maxConflicts {
 		ent, expected, evs, err := e.decide(ctx, c)
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
 
-			return 0, err
+			return 0, false, err
 		}
 
 		if len(evs) == 0 {
-			return expected, nil
+			return expected, false, nil
 		}
 
 		if ent, evs, err = e.fitDecision(ctx, c, ent, evs, trace); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 
 		before := ent.State.Events - len(evs)
@@ -358,7 +363,7 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
 
-			return 0, err
+			return 0, false, err
 		}
 
 		e.Metrics.EventsAppended.Add(int64(len(evs)))
@@ -368,10 +373,10 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 
 		e.afterAppend(ctx, c.ExecID, ent, before)
 
-		return last, nil
+		return last, true, nil
 	}
 
-	return 0, fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
+	return 0, false, fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
 }
 
 // fitDecision stamps the trace on the decided events and replaces a decision
@@ -478,18 +483,30 @@ func (e *Engine) load(ctx context.Context, execID string) (statecache.Entry, err
 func (e *Engine) decideStart(ctx context.Context, st *fold.State, c cmd.Command,
 	now time.Time,
 ) ([]event.Event, *flow.Flow, error) {
-	if st.Exists() {
-		return nil, nil, nil
-	}
-
-	// A start for an archived id is a duplicate, not a new execution.
-	if archived, err := e.Loader.IsArchived(ctx, c.ExecID); err != nil || archived {
-		return nil, nil, err
-	}
-
 	var p cmd.StartData
 	if err := c.Payload(&p); err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", fold.ErrInvalid, err)
+	}
+
+	// A start for an existing id joins it (I-03), unless it is of another
+	// flow.
+	if st.Exists() {
+		return nil, nil, fold.CheckJoin(st, p.Flow)
+	}
+
+	// A start for an archived id is a duplicate too, not a new execution.
+	archived, err := e.Loader.IsArchived(ctx, c.ExecID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if archived {
+		old, _, lerr := e.Loader.LoadArchived(ctx, c.ExecID, 0)
+		if lerr != nil {
+			return nil, nil, lerr
+		}
+
+		return nil, nil, fold.CheckJoin(old, p.Flow)
 	}
 
 	def, err := e.Loader.Flows.Get(ctx, p.Flow, p.Version)

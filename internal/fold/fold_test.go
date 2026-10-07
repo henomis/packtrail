@@ -240,6 +240,12 @@ func TestStartIdempotentAndValidates(t *testing.T) {
 		t.Fatal("second start must be a no-op (I-03)")
 	}
 
+	other, _ := cmd.New("s2", cmd.Start, "e1", cmd.StartData{Flow: "other"})
+	if evs, err := Decide(x.def, x.st, other, t0); len(evs) != 0 || !errors.Is(err, ErrConflict) ||
+		!errors.Is(err, ErrRejected) {
+		t.Fatalf("start of another flow on an existing id = %d events, %v", len(evs), err)
+	}
+
 	y := newH(t, linear)
 	c, _ := cmd.New("s", cmd.Start, "e1", cmd.StartData{Flow: "lin", Input: json.RawMessage(`[1]`)})
 

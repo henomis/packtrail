@@ -793,7 +793,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
       <table class="doctable">
         <thead><tr><th>Method</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>Start(flow, input, …)</td><td>Start an execution; returns its id. <code>WithExecutionID</code> makes it idempotent on that id, <code>WithVersion</code> pins a flow version, <code>WithTraceparent</code> propagates a trace.</td></tr>
+          <tr><td>Start(flow, input, …)</td><td>Start an execution; returns its id. <code>WithExecutionID</code> makes it idempotent on that id (an id of another flow's execution fails with <code>ErrExecutionConflict</code>; <code>WithJoinExisting(false)</code> fails with <code>ErrExecutionExists</code> instead of joining), <code>WithVersion</code> pins a flow version, <code>WithTraceparent</code> propagates a trace.</td></tr>
           <tr><td>Signal(exec, name, payload)</td><td>Deliver a signal (buffered if no await is waiting yet); <code>WithSignalID</code> deduplicates.</td></tr>
           <tr><td>Update(exec, writes)</td><td>Write channels synchronously and return the state right after.</td></tr>
           <tr><td>Resume(exec, node, value)</td><td>Re-run an interrupted node with a value.</td></tr>
@@ -1178,7 +1178,7 @@ unquarantine &lt;exec&gt;</code></pre>
       <table class="doctable">
         <thead><tr><th>Type</th><th>data</th></tr></thead>
         <tbody>
-          <tr><td>start</td><td><code>flow, version?, input?, parent?</code> — idempotent per execution id (command id <code>start.&lt;exec&gt;</code>)</td></tr>
+          <tr><td>start</td><td><code>flow, version?, input?, parent?</code> — idempotent per execution id (command id <code>start.&lt;exec&gt;</code>); <code>conflict</code> when the id is an execution of another flow</td></tr>
           <tr><td>fork</td><td><code>from, seq, writes?</code></td></tr>
           <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?</code></td></tr>
           <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?</code></td></tr>
@@ -1191,7 +1191,8 @@ unquarantine &lt;exec&gt;</code></pre>
       </table>
       <p>
         With <code>reply</code> set, the engine answers once the command is decided:
-        <code>{"ok": true, "seq": N}</code> or <code>{"ok": false, "code": "invalid" | "rejected" |
+        <code>{"ok": true, "seq": N}</code> (plus <code>"joined": true</code> for a start that found its
+        execution already there) or <code>{"ok": false, "code": "invalid" | "rejected" | "conflict" |
         "not_found" | "failed", "error": "…"}</code>; the <code>Nats-Msg-Id</code> is then
         <code>&lt;id&gt;@&lt;reply&gt;</code> so a retry with a new inbox still gets an answer. Commands are
         idempotent; one that can never apply is dead-lettered.
@@ -1342,6 +1343,8 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>ErrNotFound</td><td>The execution does not exist and was never archived.</td></tr>
           <tr><td>ErrArchived</td><td>The execution is archived: readable, but it cannot be driven any more.</td></tr>
           <tr><td>ErrUnknownFlow</td><td>The flow or version is not registered.</td></tr>
+          <tr><td>ErrExecutionConflict</td><td><code>Start</code> named the id of another flow's execution; nothing started.</td></tr>
+          <tr><td>ErrExecutionExists</td><td><code>Start</code> with <code>WithJoinExisting(false)</code> found its execution already there.</td></tr>
           <tr><td>ErrTerminal</td><td>The execution already finished (e.g. <code>Update</code> on a completed execution).</td></tr>
           <tr><td>worker.ErrCancelled</td><td>Cause of a job context cancelled because its work is no longer wanted.</td></tr>
         </tbody>

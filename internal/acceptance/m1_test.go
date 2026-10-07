@@ -374,6 +374,51 @@ func TestM1StartIdempotent(t *testing.T) {
 	}
 }
 
+// TestM1StartConflict: a Start that names another flow's execution id is
+// refused and leaves that execution alone; WithJoinExisting(false) reports a
+// join instead of hiding it.
+func TestM1StartConflict(t *testing.T) {
+	e := NewEnv(t, []string{m1Linear, `
+name: other
+nodes:
+  - {id: a, type: task, kind: echo}
+`})
+	e.Worker("echo", Echo)
+
+	id := e.Start("linear", map[string]any{"k": "v"}, packtrail.WithExecutionID("order-7"))
+
+	got, err := e.Client.Start(e.Ctx, "other", nil, packtrail.WithExecutionID(id))
+	if !errors.Is(err, packtrail.ErrExecutionConflict) || got != "" {
+		t.Fatalf("start of another flow's id = %q, %v", got, err)
+	}
+
+	got, err = e.Client.Start(e.Ctx, "linear", nil, packtrail.WithExecutionID(id),
+		packtrail.WithJoinExisting(false))
+	if !errors.Is(err, packtrail.ErrExecutionExists) || got != id {
+		t.Fatalf("exclusive start of an existing id = %q, %v", got, err)
+	}
+
+	if _, err = e.Client.Start(e.Ctx, "linear", nil, packtrail.WithExecutionID("order-8"),
+		packtrail.WithJoinExisting(false)); err != nil {
+		t.Fatalf("exclusive start of a new id: %v", err)
+	}
+
+	st := e.Completed(id)
+	if st.Flow != "linear" || string(st.Input) != `{"k":"v"}` {
+		t.Fatalf("execution changed: flow %s input %s", st.Flow, st.Input)
+	}
+
+	if c := countEvents(t, e, id, event.ExecutionStarted, ""); c != 1 {
+		t.Fatalf("started %d times", c)
+	}
+
+	// Still refused once the execution finished.
+	if _, err = e.Client.Start(e.Ctx, "other", nil, packtrail.WithExecutionID(id)); !errors.Is(err,
+		packtrail.ErrExecutionConflict) {
+		t.Fatalf("start of a finished execution's id from another flow = %v", err)
+	}
+}
+
 func TestM1ValidationAndMissingExecutions(t *testing.T) {
 	e := NewEnv(t, []string{m1Linear})
 	c := e.Client

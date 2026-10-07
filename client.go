@@ -191,11 +191,23 @@ type StartOption func(*startOpts)
 
 type startOpts struct {
 	id, version, trace string
+	exclusive          bool
 }
 
 // WithExecutionID sets the execution id: Start becomes idempotent on it (a
-// second Start with the same id returns it without starting anything, I-03).
+// second Start of the same flow with the same id returns it without starting
+// anything, I-03). An id of another flow's execution fails with
+// ErrExecutionConflict.
 func WithExecutionID(id string) StartOption { return func(o *startOpts) { o.id = id } }
+
+// WithJoinExisting sets whether a Start whose execution already exists joins
+// it (true, the default) or fails with ErrExecutionExists, returning the id.
+// Joining means returning the id, never starting anything: the existing
+// execution keeps its input and version. A retry after an ambiguous Start
+// (an error with an id) may find the execution its own first attempt
+// started. A reply lost to a reconnect can't tell either case: Start then
+// joins.
+func WithJoinExisting(join bool) StartOption { return func(o *startOpts) { o.exclusive = !join } }
 
 // TriggerExecID returns the id of the execution a message trigger of flow
 // starts for a message with Nats-Msg-Id msgID: "<flow>-t<digest>", unique per
@@ -223,6 +235,9 @@ func WithTraceparent(tp string) StartOption { return func(o *startOpts) { o.trac
 // execution may still start, and retrying with WithExecutionID(id) is safe. A
 // reply lost to a reconnect does not hang Start: it returns as soon as the
 // execution exists.
+//
+// With WithExecutionID, an existing execution of flowName is joined (see
+// WithJoinExisting), and one of another flow fails with ErrExecutionConflict.
 func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...StartOption) (string, error) {
 	if err := c.attach(ctx); err != nil {
 		return "", err
@@ -263,15 +278,38 @@ func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...
 		return "", err
 	}
 
-	if _, published, rerr := c.request(ctx, start, o.trace, true); rerr != nil {
-		if published {
-			return o.id, rerr
-		}
+	r, published, rerr := c.request(ctx, start, o.trace, true)
+	if rerr == nil && r.lost {
+		rerr = c.checkStartedFlow(ctx, o.id, flowName)
+	}
 
+	switch {
+	case errors.Is(rerr, ErrExecutionConflict):
 		return "", rerr
+	case rerr != nil && published:
+		return o.id, rerr
+	case rerr != nil:
+		return "", rerr
+	case r.joined && o.exclusive:
+		return o.id, fmt.Errorf("%w: %s", ErrExecutionExists, o.id)
 	}
 
 	return o.id, nil
+}
+
+// checkStartedFlow checks that execID, found in the log after a lost reply,
+// is an execution of flowName: the engine's refusal may have been lost.
+func (c *Client) checkStartedFlow(ctx context.Context, execID, flowName string) error {
+	st, err := c.Get(ctx, execID)
+	if err != nil {
+		return err
+	}
+
+	if st.Flow != flowName {
+		return fmt.Errorf("%w: %s", ErrExecutionConflict, execID)
+	}
+
+	return nil
 }
 
 // exists checks that execID can still receive commands.
@@ -735,12 +773,12 @@ func (c *Client) Update(ctx context.Context, execID string, writes map[string]an
 		return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 
-	seq, _, err := c.request(ctx, command, "", false)
+	r, _, err := c.request(ctx, command, "", false)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.StateAt(ctx, execID, seq)
+	return c.StateAt(ctx, execID, r.seq)
 }
 
 // Waiting for a reply: how often the wait wakes up, and how often it checks
@@ -761,13 +799,13 @@ const (
 // its execution (creates), the log answers too: once the execution has an
 // event after a reconnect (or every replyCheck), the command was decided.
 func (c *Client) request(ctx context.Context, command cmd.Command, traceparent string, creates bool) (
-	seq uint64, published bool, err error,
+	r answer, published bool, err error,
 ) {
 	inbox := c.nc.NewRespInbox()
 
 	sub, err := c.nc.SubscribeSync(inbox)
 	if err != nil {
-		return 0, false, err
+		return r, false, err
 	}
 
 	defer func() { _ = sub.Unsubscribe() }()
@@ -777,7 +815,7 @@ func (c *Client) request(ctx context.Context, command cmd.Command, traceparent s
 	checked := time.Now()
 
 	if err = wire.PublishCmd(ctx, c.in, command, traceparent); err != nil {
-		return 0, false, err
+		return r, false, err
 	}
 
 	for {
@@ -787,27 +825,36 @@ func (c *Client) request(ctx context.Context, command cmd.Command, traceparent s
 		cancel()
 
 		if nerr == nil {
-			seq, err = decodeReply(command, m.Data)
+			r, err = decodeReply(command, m.Data)
 
-			return seq, true, err
+			return r, true, err
 		}
 
 		if ctx.Err() != nil {
-			return 0, true, ctx.Err()
+			return r, true, ctx.Err()
 		}
 
 		if !errors.Is(nerr, context.DeadlineExceeded) {
-			return 0, true, nerr
+			return r, true, nerr
 		}
 
 		if n := c.nc.Stats().Reconnects; creates && (n != reconnects || time.Since(checked) >= replyCheck) {
 			reconnects, checked = n, time.Now()
 
-			if seq = c.lastSeq(ctx, command.ExecID); seq > 0 {
-				return seq, true, nil
+			if seq := c.lastSeq(ctx, command.ExecID); seq > 0 {
+				return answer{seq: seq, lost: true}, true, nil
 			}
 		}
 	}
+}
+
+// answer is the engine's answer to a request: the sequence of the decision,
+// whether a start joined an existing execution, and whether the reply was
+// lost (the answer was then read from the log, without joined).
+type answer struct {
+	seq    uint64
+	joined bool
+	lost   bool
 }
 
 // lastSeq is the sequence of execID's last event, 0 if it has none or the
@@ -824,17 +871,17 @@ func (c *Client) lastSeq(ctx context.Context, execID string) uint64 {
 	return seq
 }
 
-func decodeReply(command cmd.Command, data []byte) (uint64, error) {
+func decodeReply(command cmd.Command, data []byte) (answer, error) {
 	var r wire.Reply
 	if err := json.Unmarshal(data, &r); err != nil {
-		return 0, fmt.Errorf("packtrail: %s reply: %w", command.Type, err)
+		return answer{}, fmt.Errorf("packtrail: %s reply: %w", command.Type, err)
 	}
 
 	if !r.OK {
-		return 0, replyError(command.ExecID, r)
+		return answer{}, replyError(command.ExecID, r)
 	}
 
-	return r.Seq, nil
+	return answer{seq: r.Seq, joined: r.Joined}, nil
 }
 
 func replyError(execID string, r wire.Reply) error {
@@ -845,6 +892,8 @@ func replyError(execID string, r wire.Reply) error {
 		return fmt.Errorf("%w: %s", ErrTerminal, execID)
 	case wire.ReplyNotFound:
 		return fmt.Errorf("%w: %s", ErrNotFound, execID)
+	case wire.ReplyConflict:
+		return fmt.Errorf("%w: %s", ErrExecutionConflict, execID)
 	default:
 		return fmt.Errorf("packtrail: %s: %s", execID, r.Error)
 	}

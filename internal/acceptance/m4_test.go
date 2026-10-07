@@ -152,7 +152,7 @@ name: shortlived
 retention: 1s
 nodes:
   - {id: a, type: task, kind: echo}
-`})
+`, m1Linear})
 	e.Worker("echo", Echo)
 
 	id := e.Start("shortlived", map[string]any{"k": "v"}, packtrail.WithExecutionID("short-1"))
@@ -183,6 +183,12 @@ nodes:
 
 	if again, _ := e.Client.Get(e.Ctx, id); !again.Archived {
 		t.Fatal("archived id was restarted")
+	}
+
+	// ... and another flow can't take it over.
+	if _, err := e.Client.Start(e.Ctx, "linear", nil, packtrail.WithExecutionID(id)); !errors.Is(err,
+		packtrail.ErrExecutionConflict) {
+		t.Fatalf("start of an archived id from another flow = %v", err)
 	}
 
 	if _, err := e.Client.Fork(e.Ctx, id, 1); err != nil {

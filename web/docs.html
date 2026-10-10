@@ -285,7 +285,9 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
           <tr><td>budget</td><td>Caps on generic counters reported by workers (<code>Result.Usage</code>, <code>worker.WithUsage</code> for runs that fail or interrupt) and the built-in <code>steps</code>. Exceeding one fails the execution with <code>budget_exceeded</code>.</td></tr>
           <tr><td>max_steps</td><td>Recursion limit: total node entries (default 1000). Exceeding it fails with <code>max_steps</code>.</td></tr>
           <tr><td>search_attributes</td><td>Expressions evaluated on the start input and indexed, for <code>List</code> / <code>packtrail list -attr</code>.</td></tr>
-          <tr><td>retention</td><td>Archive a finished execution after this long (default: never). Archived executions stay readable.</td></tr>
+          <tr><td>retention</td><td>How long a finished execution is kept before it expires (default: forever). What expiry does is <code>on_expire</code>.</td></tr>
+          <tr><td>on_expire</td><td><code>archive</code> (default): the execution moves to the archive, where it stays readable. <code>delete</code>: it is removed for good, with no archive. Needs a <code>retention</code>. See <a href="#retention">retention</a>.</td></tr>
+          <tr><td>archive_retention</td><td>Delete an archived execution this long after it was archived (default: keep archives forever). Not with <code>on_expire: delete</code>.</td></tr>
           <tr><td>triggers</td><td>Start the flow when a message arrives on a subject — see <a href="#starting">triggers</a>.</td></tr>
         </tbody>
       </table>
@@ -1027,7 +1029,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
       <h3>Metrics &amp; alerting</h3>
       <p>
         <code>Engine.Metrics(ctx)</code> returns counters (commands, conflicts, events appended, jobs
-        dispatched, cache hits, timers, dead letters, archived), <code>ProjectionLag</code> and
+        dispatched, cache hits, timers, dead letters, archived, deleted), <code>ProjectionLag</code> and
         <code>DispatchStall</code>: the longest time a partition with pending events has gone without
         progress. Alert when it exceeds a minute or so.
       </p>
@@ -1038,10 +1040,40 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
         carrying the state. Nothing else changes; <code>History</code>, <code>StateAt</code>,
         <code>Fork</code> and <code>Rerun</code> still see every event.
       </p>
-      <h3>Retention &amp; the index</h3>
+      <h3 id="retention">Retention &amp; the index</h3>
       <p>
-        A flow's <code>retention</code> archives finished executions to the archive object store;
-        <code>Engine.Archive</code> does it immediately. The visibility index is a projection:
+        A flow's <code>retention</code> is how long a finished execution stays live. When it expires
+        the execution is archived to the archive object store (<code>on_expire: archive</code>, the
+        default) or deleted (<code>on_expire: delete</code>); <code>Engine.Archive</code> and
+        <code>Engine.Delete</code> do it immediately. An archived execution stays readable — state,
+        history, time travel, fork — but cannot be driven any more, and its id is never started
+        again. Archives are kept forever unless the flow sets <code>archive_retention</code>, which
+        deletes an execution that long after it was archived.
+      </p>
+      <div class="codecard">
+        <div class="codecard__bar">
+          <span class="codecard__dots"><i></i><i></i><i></i></span>
+          <span class="codecard__name">expiry</span>
+        </div>
+<pre class="codecard__body"><code><span class="cm"># live for 30 days, then archived for a year, then deleted</span>
+<span class="k">retention</span>: 720h
+<span class="k">archive_retention</span>: 8760h
+
+<span class="cm"># or: live for 5 hours, then deleted, never archived</span>
+<span class="k">retention</span>: 5h
+<span class="k">on_expire</span>: delete</code></pre>
+      </div>
+      <p>
+        A deleted execution leaves nothing behind: its events, snapshot, blobs, timers, archive and
+        index entries are removed, without delete markers, so storage does not grow with the
+        executions that ever ran. It reads as <code>ErrNotFound</code> and its id is free: a
+        <code>Start</code> with it runs a new execution. Because message ids are derived from the
+        execution id and deduplicated for ten minutes, an execution is never deleted sooner than
+        that after it finished: a shorter <code>retention</code> with <code>on_expire: delete</code>
+        deletes at ten minutes, and <code>Engine.Delete</code> refuses until then.
+      </p>
+      <p>
+        The visibility index is a projection:
         <code>Engine.RebuildIndex</code> (<code>packtrail rebuild-index</code>) rebuilds it from the log.
       </p>
       <h3>Benchmarks</h3>
@@ -1073,6 +1105,7 @@ run [-flows DIR] [-partitions N]       <span class="cm"># run an engine until in
 init [-flows DIR] [-partitions N]      <span class="cm"># provision the namespace and register flows</span>
 rebuild-index                          <span class="cm"># rebuild the visibility index from the log</span>
 archive &lt;exec&gt;                         <span class="cm"># archive a finished execution now</span>
+delete &lt;exec&gt;                          <span class="cm"># delete a finished execution now, archive included</span>
 
 <span class="cm"># flows</span>
 validate &lt;file.yaml&gt;...                <span class="cm"># validate flow files offline</span>
@@ -1340,7 +1373,7 @@ unquarantine &lt;exec&gt;</code></pre>
         <thead><tr><th>Error</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td>ErrInvalidArgument</td><td>Wraps every validation error of caller input: ids, names, payloads, flows, options.</td></tr>
-          <tr><td>ErrNotFound</td><td>The execution does not exist and was never archived.</td></tr>
+          <tr><td>ErrNotFound</td><td>The execution does not exist and was never archived, or it was deleted.</td></tr>
           <tr><td>ErrArchived</td><td>The execution is archived: readable, but it cannot be driven any more.</td></tr>
           <tr><td>ErrUnknownFlow</td><td>The flow or version is not registered.</td></tr>
           <tr><td>ErrExecutionConflict</td><td><code>Start</code> named the id of another flow's execution; nothing started.</td></tr>

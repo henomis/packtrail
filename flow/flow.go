@@ -82,6 +82,16 @@ const (
 	ReducerSum     = "sum"
 )
 
+// What expiry (Flow.Retention) does to a terminal execution.
+const (
+	// ExpireArchive moves the execution to the archive: it stays readable but
+	// can no longer be driven.
+	ExpireArchive = "archive"
+	// ExpireDelete removes the execution and everything derived from it; its
+	// id is free again.
+	ExpireDelete = "delete"
+)
+
 // Choice on_error modes.
 const (
 	OnErrorDefault = ""
@@ -207,8 +217,17 @@ type Flow struct {
 	// SearchAttributes are expressions evaluated on the start input and
 	// indexed for List/Query.
 	SearchAttributes map[string]string `yaml:"search_attributes,omitempty" json:"search_attributes,omitempty"`
-	// Retention archives a terminal execution after this long (0 = never).
+	// Retention is how long a terminal execution is kept before it expires
+	// (0 = forever). What happens then is OnExpire.
 	Retention Duration `yaml:"retention,omitempty" json:"retention,omitempty"`
+	// OnExpire is what expiry does to the execution: ExpireArchive (the
+	// default) moves it to the archive, where it stays readable; ExpireDelete
+	// removes it for good, archive included. It needs a Retention.
+	OnExpire string `yaml:"on_expire,omitempty" json:"on_expire,omitempty"`
+	// ArchiveRetention deletes an archived execution this long after it was
+	// archived, by Retention or by hand (0 = keep the archive forever). It
+	// does not apply with ExpireDelete, which leaves no archive.
+	ArchiveRetention Duration `yaml:"archive_retention,omitempty" json:"archive_retention,omitempty"`
 	// Triggers start this flow when a message arrives on a subject.
 	Triggers []Trigger `yaml:"triggers,omitempty" json:"triggers,omitempty"`
 
@@ -352,6 +371,10 @@ func (f *Flow) FanoutOf(branch string) string { return f.branchOf[branch] }
 
 // JoinOf returns the join node of fanout id.
 func (f *Flow) JoinOf(fanout string) string { return f.joinOf[fanout] }
+
+// DeletesOnExpire reports whether an expired execution is deleted instead of
+// archived.
+func (f *Flow) DeletesOnExpire() bool { return f.OnExpire == ExpireDelete }
 
 // MaxStepsOrDefault returns the recursion limit.
 func (f *Flow) MaxStepsOrDefault() int {

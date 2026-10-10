@@ -367,6 +367,43 @@ func (e *Engine) Archive(ctx context.Context, execID string) error {
 	return e.eng.Archive(ctx, execID)
 }
 
+// Delete removes a finished execution now, regardless of retention: its
+// events, its archive when it has one, and everything derived from them
+// (index entries, snapshot, blobs, timers). Nothing is kept: afterwards the
+// execution is ErrNotFound and its id may start a new one. A missing
+// execution is ErrNotFound and one still running is ErrInvalidArgument.
+//
+// An execution that finished less than ten minutes ago is ErrInvalidArgument
+// too: message ids are derived from the execution id and deduplicated for
+// that long, so its id could not be safely used again yet.
+//
+// A flow deletes its executions by itself with on_expire: delete (after
+// retention) or archive_retention (after archiving).
+func (e *Engine) Delete(ctx context.Context, execID string) error {
+	if err := checkExecID(execID); err != nil {
+		return err
+	}
+
+	st, err := e.client.Get(ctx, execID)
+	if err != nil {
+		return err
+	}
+
+	if !st.Status.Terminal() {
+		return fmt.Errorf("%w: %s is %s, only a finished execution can be deleted", ErrInvalidArgument, execID, st.Status)
+	}
+
+	err = e.eng.Delete(ctx, execID)
+
+	var recent *engine.TooRecentError
+	if errors.As(err, &recent) {
+		return fmt.Errorf("%w: %s finished less than %s ago, it can be deleted from %s", ErrInvalidArgument,
+			execID, infra.DedupWindow, recent.Until.UTC().Format(time.RFC3339))
+	}
+
+	return err
+}
+
 // RebuildIndex rebuilds the visibility index from the event log: every
 // execution in the events stream is folded and its summary rewritten. The
 // index is a projection, so it can always be recovered this way.

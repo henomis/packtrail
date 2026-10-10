@@ -46,6 +46,7 @@ engine:
   init [-flows DIR] [-partitions N]     provision the namespace and register flows
   rebuild-index                          rebuild the visibility index from the log
   archive <exec>                         archive a finished execution now
+  delete <exec>                          delete a finished execution now, archive included
 
 flows:
   validate <file.yaml>...                validate flow files offline
@@ -136,6 +137,7 @@ func run(args []string, out io.Writer) error {
 func (a *app) dispatch(ctx context.Context, name string, args []string) error {
 	handlers := map[string]func(context.Context, []string) error{
 		"run": a.runEngine, "init": a.initEngine, "rebuild-index": a.rebuildIndex, "archive": a.archive,
+		"delete":   a.delete,
 		"register": a.register, "flows": a.flows, "start": a.start, "signal": a.signal, "update": a.update,
 		"resume": a.resume,
 		"cancel": a.cancel, "get": a.get, "history": a.history, "watch": a.watch, "progress": a.progress,
@@ -281,6 +283,24 @@ func (a *app) archive(ctx context.Context, args []string) error {
 	}
 
 	return eng.Archive(ctx, pos[0])
+}
+
+func (a *app) delete(ctx context.Context, args []string) error {
+	pos, err := parse(flag.NewFlagSet("delete", flag.ContinueOnError), args, 1)
+	if err != nil {
+		return err
+	}
+
+	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns))
+	if err != nil {
+		return err
+	}
+
+	if err = eng.Init(ctx); err != nil {
+		return err
+	}
+
+	return eng.Delete(ctx, pos[0])
 }
 
 // ---------------------------------------------------------------------------

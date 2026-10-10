@@ -24,8 +24,8 @@ import (
 // Errors returned by the public API. They are sentinel values: test with
 // errors.Is.
 var (
-	// ErrNotFound means the execution does not exist (and was never archived),
-	// or a Store key has no value.
+	// ErrNotFound means the execution does not exist (it was never archived,
+	// or it was deleted), or a Store key has no value.
 	ErrNotFound = apierr.ErrNotFound
 	// ErrArchived means the execution finished and was archived: it can be
 	// read, but not driven any more (I-17).

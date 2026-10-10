@@ -315,6 +315,52 @@ func SetTerminal(ctx context.Context, in *infra.Infra, execID string, status fol
 	return moveStatus(ctx, kv, execID, status)
 }
 
+// Delete removes an execution from the index: its summary and its flow,
+// attribute, status and quarantine memberships. The memberships are read
+// from the summary, so it goes last: a delete that failed half-way finds
+// them again when it is retried. Deleting an unknown execution is a no-op.
+func Delete(ctx context.Context, in *infra.Infra, execID string) error {
+	kv, err := in.KV(ctx, in.Names.BucketIndex)
+	if err != nil {
+		return err
+	}
+
+	keys := []string{"q." + execID}
+	for _, s := range statuses {
+		keys = append(keys, statusKey(s, execID))
+	}
+
+	e, err := kv.Get(ctx, "x."+execID)
+
+	switch {
+	case errors.Is(err, jetstream.ErrKeyNotFound):
+	case err != nil:
+		return err
+	default:
+		var s Summary
+		if err = json.Unmarshal(e.Value(), &s); err != nil {
+			return err
+		}
+
+		keys = append(keys, "f."+s.Flow+"."+execID)
+
+		for k, v := range s.Attrs {
+			if names.ValidToken(k) {
+				keys = append(keys, "a."+k+"."+AttrHash(v)+"."+execID)
+			}
+		}
+	}
+
+	// Erased, not deleted: a deleted execution leaves no markers behind.
+	for _, k := range append(keys, "x."+execID) {
+		if err = in.EraseKey(ctx, in.Names.BucketIndex, k); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // MarkArchived flags the summary of an execution as archived.
 func MarkArchived(ctx context.Context, in *infra.Infra, execID string) error {
 	kv, err := in.KV(ctx, in.Names.BucketIndex)

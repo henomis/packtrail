@@ -31,6 +31,7 @@ type M struct {
 	CacheHits      atomic.Int64
 	Timers         atomic.Int64
 	Archived       atomic.Int64
+	Deleted        atomic.Int64
 	// LatencyNanos accumulates command handling time (decide + append).
 	LatencyNanos atomic.Int64
 }
@@ -45,6 +46,7 @@ type Snapshot struct {
 	CacheHits      int64 `json:"cache_hits"`
 	Timers         int64 `json:"timers"`
 	Archived       int64 `json:"archived"`
+	Deleted        int64 `json:"deleted"`
 	LatencyNanos   int64 `json:"latency_nanos"`
 	// ProjectionLag is the number of events not yet processed by the
 	// dispatcher (filled by the engine on request).
@@ -62,6 +64,7 @@ func (m *M) Snapshot() Snapshot {
 	return Snapshot{
 		Commands: m.Commands.Load(), Conflicts: m.Conflicts.Load(), EventsAppended: m.EventsAppended.Load(),
 		DeadLetters: m.DeadLetters.Load(), JobsDispatched: m.JobsDispatched.Load(), CacheHits: m.CacheHits.Load(),
-		Timers: m.Timers.Load(), Archived: m.Archived.Load(), LatencyNanos: m.LatencyNanos.Load(),
+		Timers: m.Timers.Load(), Archived: m.Archived.Load(), Deleted: m.Deleted.Load(),
+		LatencyNanos: m.LatencyNanos.Load(),
 	}
 }

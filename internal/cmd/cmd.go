@@ -50,6 +50,9 @@ const (
 	Timer     Type = "timer"
 	ChildDone Type = "child_done"
 	Archive   Type = "archive"
+	// Delete removes a terminal or archived execution and everything derived
+	// from it (expiry with on_expire: delete, archive_retention, or by hand).
+	Delete Type = "delete"
 	// Redispatch lifts the quarantine of an execution (dispatcher replay).
 	Redispatch Type = "redispatch"
 )
@@ -201,7 +204,7 @@ func (c Command) Validate() error {
 
 	switch c.Type {
 	case Start, Fork, Complete, Fail, Interrupt, Resume, Signal, Cancel, Timer, ChildDone, Archive, Redispatch,
-		Update:
+		Update, Delete:
 		return nil
 	default:
 		return fmt.Errorf("cmd: unknown type %q", c.Type)

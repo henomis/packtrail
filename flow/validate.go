@@ -94,6 +94,27 @@ func (f *Flow) indexNodes(p *problems) {
 	}
 }
 
+// validateExpiry checks on_expire and archive_retention against retention.
+func (f *Flow) validateExpiry(p *problems) {
+	switch f.OnExpire {
+	case "", ExpireArchive, ExpireDelete:
+	default:
+		p.add("", "on_expire", nil, "unknown value %q (%s or %s)", f.OnExpire, ExpireArchive, ExpireDelete)
+	}
+
+	if f.OnExpire != "" && f.Retention == 0 {
+		p.add("", "on_expire", nil, "needs a retention: without one the execution never expires")
+	}
+
+	if f.ArchiveRetention < 0 {
+		p.add("", "archive_retention", nil, "must not be negative")
+	}
+
+	if f.ArchiveRetention > 0 && f.OnExpire == ExpireDelete {
+		p.add("", "archive_retention", nil, "has no effect with on_expire: %s, which leaves no archive", ExpireDelete)
+	}
+}
+
 func (f *Flow) validateFlowLevel(p *problems) {
 	if f.MaxSteps < 0 {
 		p.add("", "max_steps", nil, "must not be negative")
@@ -102,6 +123,8 @@ func (f *Flow) validateFlowLevel(p *problems) {
 	if f.Retention < 0 {
 		p.add("", "retention", nil, "must not be negative")
 	}
+
+	f.validateExpiry(p)
 
 	f.validateChannels(p)
 	f.validateOutput(p)

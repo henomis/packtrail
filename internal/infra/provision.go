@@ -34,6 +34,12 @@ const (
 	minMinor = 12
 )
 
+// DedupWindow is how long the command and work streams remember a message
+// id. Ids are derived from the execution id, so an execution id must not be
+// used again before its last messages have left the window: a deleted
+// execution is kept at least this long after it finished.
+const DedupWindow = dedupWindow
+
 const (
 	dedupWindow    = 10 * time.Minute
 	dlqMaxAge      = 30 * 24 * time.Hour

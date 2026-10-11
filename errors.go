@@ -24,8 +24,8 @@ import (
 // Errors returned by the public API. They are sentinel values: test with
 // errors.Is.
 var (
-	// ErrNotFound means the execution does not exist (and was never archived),
-	// or a Store key has no value.
+	// ErrNotFound means the execution does not exist (it was never archived,
+	// or it was deleted), or a Store key has no value.
 	ErrNotFound = apierr.ErrNotFound
 	// ErrArchived means the execution finished and was archived: it can be
 	// read, but not driven any more (I-17).
@@ -35,6 +35,12 @@ var (
 	ErrInvalidArgument = apierr.ErrInvalidArgument
 	// ErrUnknownFlow means the flow (or version) is not registered.
 	ErrUnknownFlow = errors.New("packtrail: unknown flow")
+	// ErrExecutionConflict means a Start named the id of an execution of
+	// another flow: nothing was started and that execution is unchanged.
+	ErrExecutionConflict = errors.New("packtrail: execution id belongs to another flow")
+	// ErrExecutionExists means a Start with WithJoinExisting(false) found
+	// its execution already there (of the same flow).
+	ErrExecutionExists = errors.New("packtrail: execution already exists")
 	// ErrTerminal means the execution already reached a final status.
 	ErrTerminal = errors.New("packtrail: execution already finished")
 	// ErrNoValue means a value State decodes (a result, a channel, a signal,

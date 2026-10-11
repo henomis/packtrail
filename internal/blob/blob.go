@@ -115,6 +115,34 @@ func DeleteExec(ctx context.Context, in *infra.Infra, execID string) error {
 	return errors.Join(errs...)
 }
 
+// EraseExec removes every blob of an execution that is being deleted,
+// leaving no delete markers behind.
+func EraseExec(ctx context.Context, in *infra.Infra, execID string) error {
+	obs, err := in.Object(ctx, in.Names.ObjectBlobs)
+	if err != nil {
+		return err
+	}
+
+	list, err := obs.List(ctx, jetstream.ListObjectsShowDeleted())
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			return nil
+		}
+
+		return fmt.Errorf("blob: list: %w", err)
+	}
+
+	var errs []error
+
+	for _, o := range list {
+		if strings.HasPrefix(o.Name, execID+"/") {
+			errs = append(errs, in.EraseObject(ctx, in.Names.ObjectBlobs, o.Name))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
 // transferContext bounds one blob transfer by timeout unless the caller
 // already set a deadline. Blobs can be large, so the default is generous.
 func transferContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

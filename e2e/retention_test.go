@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,4 +196,150 @@ func TestRetentionAndArchive(t *testing.T) {
 	if st, _ := cl.c.Get(cl.ctx, open); st.Archived || st.Status != packtrail.StatusWaiting {
 		t.Fatalf("running receipt: %+v", st)
 	}
+}
+
+const ticketFlow = `
+name: ticket
+retention: 5s
+on_expire: delete
+search_attributes: {customer: input.customer}
+nodes:
+  - {id: gate, type: await, signal: go, timeout: 1h, next: issue}
+  - {id: issue, type: task, kind: issue}
+`
+
+// skewedClock is an engine clock a test can move forward: an execution is
+// only deleted once the deduplication window (ten minutes) has passed since
+// it finished, and the test jumps past it instead of waiting.
+type skewedClock struct{ offset atomic.Int64 }
+
+func (c *skewedClock) now() time.Time { return time.Now().Add(time.Duration(c.offset.Load())) }
+
+func (c *skewedClock) pastDedupWindow() { c.offset.Add(int64(11 * time.Minute)) }
+
+// TestRetentionAndDelete lets finished executions of a flow with
+// on_expire: delete age out, and deletes others by hand. A deleted execution
+// is gone for every reader — state, history, the index — and for every
+// writer; one still running is never deleted, and neither is one that has
+// just finished.
+func TestRetentionAndDelete(t *testing.T) {
+	clock := &skewedClock{}
+	cl := newCluster(t, []string{ticketFlow, ledgerFlow}, packtrail.WithClock(clock.now))
+
+	cl.worker("issue", func(_ context.Context, j *worker.Job) (*worker.Result, error) {
+		return &worker.Result{Output: map[string]any{"number": "T-" + j.ExecID}}, nil
+	})
+
+	prefix := fmt.Sprintf("tkt%d-", time.Now().UnixNano())
+	done := make([]string, 3)
+
+	for i := range done {
+		done[i] = cl.start("ticket", map[string]any{"customer": "kim"},
+			packtrail.WithExecutionID(fmt.Sprintf("%s%d", prefix, i)))
+
+		if err := cl.c.Signal(cl.ctx, done[i], "go", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	open := cl.start("ticket", map[string]any{"customer": "kim"})
+	cl.parkedAt(open, "gate")
+
+	for _, id := range done {
+		if st := cl.wait(id); st.Status != packtrail.StatusCompleted {
+			t.Fatalf("%s: %s", id, st.Status)
+		}
+	}
+
+	kept := cl.start("ledger", nil)
+	cl.wait(kept)
+
+	archived := cl.start("ledger", nil)
+	cl.wait(archived)
+
+	eng := cl.liveEngines()[0]
+
+	if err := eng.Archive(cl.ctx, archived); err != nil {
+		t.Fatal(err)
+	}
+
+	// By hand: not a running one, not one that has just finished, not one
+	// that never existed.
+	for id, what := range map[string]string{open: "running", kept: "just finished", archived: "just archived"} {
+		if err := eng.Delete(cl.ctx, id); !errors.Is(err, packtrail.ErrInvalidArgument) {
+			t.Fatalf("delete of a %s execution: %v, want ErrInvalidArgument", what, err)
+		}
+	}
+
+	if err := eng.Delete(cl.ctx, "no-such-execution"); !errors.Is(err, packtrail.ErrNotFound) {
+		t.Fatalf("delete of a missing execution: %v, want ErrNotFound", err)
+	}
+
+	clock.pastDedupWindow()
+
+	for _, id := range []string{kept, archived} {
+		if err := eng.Delete(cl.ctx, id); err != nil {
+			t.Fatalf("delete %s: %v", id, err)
+		}
+	}
+
+	// The tickets age out by themselves; the ledgers were deleted by hand.
+	for _, id := range append(slices.Clone(done), kept, archived) {
+		cl.eventually(id+" deleted", func() bool {
+			_, err := cl.c.Get(cl.ctx, id)
+
+			return errors.Is(err, packtrail.ErrNotFound)
+		})
+
+		for what, err := range map[string]error{
+			"cancel": cl.c.Cancel(cl.ctx, id, "late"),
+			"signal": cl.c.Signal(cl.ctx, id, "go", nil),
+			"resume": cl.c.Resume(cl.ctx, id, "issue", "x"),
+		} {
+			if !errors.Is(err, packtrail.ErrNotFound) {
+				t.Fatalf("%s of deleted %s: %v, want ErrNotFound", what, id, err)
+			}
+		}
+
+		if _, err := cl.c.History(cl.ctx, id); !errors.Is(err, packtrail.ErrNotFound) {
+			t.Fatalf("history of deleted %s: %v, want ErrNotFound", id, err)
+		}
+
+		if _, err := cl.c.Fork(cl.ctx, id, 1); err == nil {
+			t.Fatalf("fork of deleted %s accepted", id)
+		}
+	}
+
+	// Out of the index too: only the open ticket is left.
+	cl.eventually("deleted tickets unlisted", func() bool {
+		l, err := cl.c.List(cl.ctx, packtrail.ListFilter{Flow: "ticket", Attr: "customer", Value: "kim"})
+
+		return err == nil && len(l) == 1 && l[0].ExecID == open
+	})
+
+	cl.eventually("deleted ledgers unlisted", func() bool {
+		l, err := cl.c.List(cl.ctx, packtrail.ListFilter{Flow: "ledger"})
+
+		return err == nil && len(l) == 0
+	})
+
+	// Nothing was archived on the way.
+	if n := eng.Metrics(cl.ctx).Archived; n > 1 {
+		t.Fatalf("archived metric = %d: only the ledger archived by hand should count", n)
+	}
+
+	// The one still waiting outlived its retention untouched, and finishes.
+	if st, err := cl.c.Get(cl.ctx, open); err != nil || st.Status != packtrail.StatusWaiting {
+		t.Fatalf("running ticket: %+v %v", st, err)
+	}
+
+	if err := cl.c.Signal(cl.ctx, open, "go", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if st := cl.wait(open); st.Status != packtrail.StatusCompleted {
+		t.Fatalf("open ticket: %s", st.Status)
+	}
+
+	cl.check(open)
 }

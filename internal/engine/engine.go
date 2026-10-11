@@ -151,6 +151,10 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		e.ackOrRetry(ctx, msg, c, e.Archive(ctx, c.ExecID))
 
 		return
+	case cmd.Delete:
+		e.ackOrRetry(ctx, msg, c, e.deleteOrPostpone(ctx, c.ExecID))
+
+		return
 	case cmd.Redispatch:
 		var rerr error
 		if e.Redispatch != nil {
@@ -162,8 +166,8 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	seq, err := e.apply(ctx, c, msg.Headers().Get(wire.HeaderTraceparent))
-	if e.answer(c, seq, err) {
+	seq, appended, err := e.apply(ctx, c, msg.Headers().Get(wire.HeaderTraceparent))
+	if e.answer(c, seq, c.Type == cmd.Start && !appended, err) {
 		_ = msg.Ack() // a rejection answered to the caller is not poison
 
 		return
@@ -174,17 +178,22 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 
 // answer replies to a command that asked for it (c.Reply): on success, and on
 // a rejection, which then ends the command (it reports true). Other errors are
-// retried as usual and answered when they end.
-func (e *Engine) answer(c cmd.Command, seq uint64, err error) bool {
+// retried as usual and answered when they end. joined reports a start that
+// found its execution already there.
+func (e *Engine) answer(c cmd.Command, seq uint64, joined bool, err error) bool {
 	if c.Reply == "" {
 		return false
 	}
 
 	switch {
 	case err == nil:
-		e.reply(c, wire.Reply{OK: true, Seq: seq})
+		e.reply(c, wire.Reply{OK: true, Seq: seq, Joined: joined})
 
 		return false
+	case errors.Is(err, fold.ErrConflict):
+		e.reply(c, wire.Reply{Code: wire.ReplyConflict, Error: err.Error()})
+
+		return true
 	case errors.Is(err, fold.ErrInvalid):
 		e.reply(c, wire.Reply{Code: wire.ReplyInvalid, Error: err.Error()})
 
@@ -325,24 +334,24 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	}
 }
 
-// apply decides and appends, retrying on concurrent appends.
 // apply decides and appends, retrying on concurrent appends. It returns the
-// sequence of the stored decision (for a no-op, of the last one).
-func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, error) {
+// sequence of the stored decision (for a no-op, of the last one) and whether
+// the decision appended events.
+func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, bool, error) {
 	for range maxConflicts {
 		ent, expected, evs, err := e.decide(ctx, c)
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
 
-			return 0, err
+			return 0, false, err
 		}
 
 		if len(evs) == 0 {
-			return expected, nil
+			return expected, false, nil
 		}
 
 		if ent, evs, err = e.fitDecision(ctx, c, ent, evs, trace); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 
 		before := ent.State.Events - len(evs)
@@ -358,7 +367,7 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
 
-			return 0, err
+			return 0, false, err
 		}
 
 		e.Metrics.EventsAppended.Add(int64(len(evs)))
@@ -368,10 +377,10 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 
 		e.afterAppend(ctx, c.ExecID, ent, before)
 
-		return last, nil
+		return last, true, nil
 	}
 
-	return 0, fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
+	return 0, false, fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
 }
 
 // fitDecision stamps the trace on the decided events and replaces a decision
@@ -478,18 +487,30 @@ func (e *Engine) load(ctx context.Context, execID string) (statecache.Entry, err
 func (e *Engine) decideStart(ctx context.Context, st *fold.State, c cmd.Command,
 	now time.Time,
 ) ([]event.Event, *flow.Flow, error) {
-	if st.Exists() {
-		return nil, nil, nil
-	}
-
-	// A start for an archived id is a duplicate, not a new execution.
-	if archived, err := e.Loader.IsArchived(ctx, c.ExecID); err != nil || archived {
-		return nil, nil, err
-	}
-
 	var p cmd.StartData
 	if err := c.Payload(&p); err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", fold.ErrInvalid, err)
+	}
+
+	// A start for an existing id joins it (I-03), unless it is of another
+	// flow.
+	if st.Exists() {
+		return nil, nil, fold.CheckJoin(st, p.Flow)
+	}
+
+	// A start for an archived id is a duplicate too, not a new execution.
+	archived, err := e.Loader.IsArchived(ctx, c.ExecID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if archived {
+		old, _, lerr := e.Loader.LoadArchived(ctx, c.ExecID, 0)
+		if lerr != nil {
+			return nil, nil, lerr
+		}
+
+		return nil, nil, fold.CheckJoin(old, p.Flow)
 	}
 
 	def, err := e.Loader.Flows.Get(ctx, p.Flow, p.Version)
@@ -691,9 +712,10 @@ func (e *Engine) putArchive(ctx context.Context, name string, evs []event.Event)
 
 // Archive moves a terminal execution's events to the archive object store and
 // purges it from the hot resources: event subject, snapshot, blobs, timers.
-// Reads of an archived execution come from the archive (I-17).
+// Reads of an archived execution come from the archive (I-17). A flow with
+// an archive retention has the archive deleted that long after.
 func (e *Engine) Archive(ctx context.Context, execID string) error {
-	st, _, err := e.Loader.Load(ctx, execID, 0)
+	st, def, err := e.Loader.Load(ctx, execID, 0)
 	if err != nil {
 		return err
 	}
@@ -711,6 +733,12 @@ func (e *Engine) Archive(ctx context.Context, execID string) error {
 		return err
 	}
 
+	// Before the purge: an archive retried after it finds no live log and
+	// stops, so the expiry must already be scheduled by then.
+	if err = e.scheduleArchiveExpiry(ctx, execID, def); err != nil {
+		return err
+	}
+
 	if err = e.Loader.Log.Purge(ctx, execID); err != nil {
 		return err
 	}
@@ -725,4 +753,150 @@ func (e *Engine) Archive(ctx context.Context, execID string) error {
 	e.Metrics.Archived.Add(1)
 
 	return errors.Join(errs...)
+}
+
+// scheduleArchiveExpiry schedules the deletion of an execution being
+// archived, when its flow bounds how long archives are kept.
+func (e *Engine) scheduleArchiveExpiry(ctx context.Context, execID string, def *flow.Flow) error {
+	if def == nil || def.ArchiveRetention.D() <= 0 {
+		return nil
+	}
+
+	c, err := cmd.New("delete."+execID, cmd.Delete, execID, nil)
+	if err != nil {
+		return err
+	}
+
+	return wire.ScheduleCmd(ctx, e.In, execID, wire.TimerDelete, e.now().Add(def.ArchiveRetention.D()), c)
+}
+
+// TooRecentError is returned by Delete for an execution that finished less
+// than the deduplication window ago: it can be deleted from Until.
+type TooRecentError struct {
+	ExecID string
+	Until  time.Time
+}
+
+func (e *TooRecentError) Error() string {
+	return fmt.Sprintf("engine: %s finished less than %s ago, it can be deleted from %s",
+		e.ExecID, infra.DedupWindow, e.Until.UTC().Format(time.RFC3339))
+}
+
+// deleteOrPostpone deletes an execution whose time has come (a delete
+// command). One that finished too recently is deleted as soon as it may be.
+func (e *Engine) deleteOrPostpone(ctx context.Context, execID string) error {
+	err := e.Delete(ctx, execID)
+
+	var recent *TooRecentError
+	if !errors.As(err, &recent) {
+		return err
+	}
+
+	c, err := cmd.New("delete."+execID, cmd.Delete, execID, nil)
+	if err != nil {
+		return err
+	}
+
+	return wire.ScheduleCmd(ctx, e.In, execID, wire.TimerDelete, recent.Until, c)
+}
+
+// Delete removes a terminal or archived execution and everything derived
+// from it: index entries, blobs, snapshot, pending timers, archived history
+// segments, the archive object and the event log. Nothing is left: the
+// execution reads as never having existed and its id is free again. A
+// running execution, or one that does not exist, is left alone.
+//
+// Message ids are derived from the execution id and the streams remember
+// them for the deduplication window: a new execution under the same id
+// would have its first jobs and commands dropped as duplicates. So an
+// execution is only deleted once that window has passed since it finished;
+// before, Delete returns a *TooRecentError.
+//
+// The index goes first and the sources of truth (archive, log) last, so a
+// delete interrupted half-way still finds the execution when it is retried.
+func (e *Engine) Delete(ctx context.Context, execID string) error {
+	st, _, err := e.Loader.Load(ctx, execID, 0)
+	if err != nil {
+		return err
+	}
+
+	live := st.Exists()
+	if live && !st.Status.Terminal() {
+		return nil
+	}
+
+	if !live {
+		st, _, err = e.Loader.LoadArchived(ctx, execID, 0)
+
+		switch {
+		case errors.Is(err, loader.ErrNotArchived):
+			// Neither live nor archived: only leftovers of an earlier,
+			// interrupted delete can remain.
+			st = nil
+		case err != nil:
+			return err
+		}
+	}
+
+	if st != nil {
+		if until := st.Updated.Add(infra.DedupWindow); e.now().Before(until) {
+			return &TooRecentError{ExecID: execID, Until: until}
+		}
+	}
+
+	e.Cache.Drop(execID)
+
+	errs := []error{
+		projection.Delete(ctx, e.In, execID), blob.EraseExec(ctx, e.In, execID),
+		e.In.EraseKey(ctx, e.In.Names.BucketSnapshots, execID), e.purgeTimers(ctx, execID),
+	}
+	if err = errors.Join(errs...); err != nil {
+		return err
+	}
+
+	if err = e.deleteArchive(ctx, execID, st); err != nil {
+		return err
+	}
+
+	if err = e.Loader.Log.Purge(ctx, execID); err != nil {
+		return err
+	}
+
+	if st != nil {
+		e.Metrics.Deleted.Add(1)
+	}
+
+	return nil
+}
+
+// deleteArchive removes the archive objects of an execution: the history
+// segments its state lists (continue-as-new) and its own archive object.
+func (e *Engine) deleteArchive(ctx context.Context, execID string, st *fold.State) error {
+	var objects []string
+
+	if st != nil {
+		for _, seg := range st.Segments {
+			objects = append(objects, seg.Object)
+		}
+	}
+
+	// The execution's own object last: it is what a retried delete reads the
+	// segments from.
+	for _, name := range append(objects, execID) {
+		if err := e.In.EraseObject(ctx, e.In.Names.ObjectArchive, name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// purgeTimers drops the pending schedules of an execution.
+func (e *Engine) purgeTimers(ctx context.Context, execID string) error {
+	s, err := e.In.JS.Stream(ctx, e.In.Names.StreamCmd)
+	if err != nil {
+		return err
+	}
+
+	return s.Purge(ctx, jetstream.WithPurgeSubject(e.In.Names.TimerExecFilter(execID)))
 }

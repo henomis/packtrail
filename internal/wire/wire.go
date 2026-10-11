@@ -29,6 +29,7 @@ import (
 	"github.com/henomis/packtrail/internal/blob"
 	"github.com/henomis/packtrail/internal/cmd"
 	"github.com/henomis/packtrail/internal/infra"
+	"github.com/henomis/packtrail/internal/sched"
 )
 
 // Header names.
@@ -44,10 +45,12 @@ const (
 // "invalid" (malformed or does not fit the flow), "rejected" (refused in the
 // execution's current state), "not_found", "failed" (dead-lettered).
 type Reply struct {
-	OK    bool   `json:"ok"`
-	Seq   uint64 `json:"seq,omitempty"`
-	Code  string `json:"code,omitempty"`
-	Error string `json:"error,omitempty"`
+	OK  bool   `json:"ok"`
+	Seq uint64 `json:"seq,omitempty"`
+	// Joined marks a start that found its execution already there.
+	Joined bool   `json:"joined,omitempty"`
+	Code   string `json:"code,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // Reply codes.
@@ -56,6 +59,7 @@ const (
 	ReplyRejected = "rejected"
 	ReplyNotFound = "not_found"
 	ReplyFailed   = "failed"
+	ReplyConflict = "conflict"
 )
 
 // Progress is an intermediate result a worker publishes while it runs a job:
@@ -248,6 +252,40 @@ func PublishCmd(ctx context.Context, in *infra.Infra, c cmd.Command, traceparent
 
 	if _, err = in.JS.PublishMsg(ctx, m); err != nil {
 		return fmt.Errorf("wire: publish %s command: %w", c.Type, err)
+	}
+
+	return nil
+}
+
+// Timer ids of the expiry of an execution. They are not flow timers: no
+// timer command fires for them.
+const (
+	// TimerExpire archives or deletes a terminal execution after its flow's
+	// retention.
+	TimerExpire = "archive"
+	// TimerDelete deletes an execution: an archived one after its flow's
+	// archive retention, or one whose deletion had to wait for the
+	// deduplication window.
+	TimerDelete = "delete"
+)
+
+// ScheduleCmd installs a one-shot JetStream schedule on the timer subject
+// that publishes command c to the execution's command subject at time at.
+// The schedule subject is a rollup, so re-installing it is idempotent.
+func ScheduleCmd(ctx context.Context, in *infra.Infra, execID, timerID string, at time.Time, c cmd.Command) error {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+
+	m := nats.NewMsg(in.Names.TimerSubject(execID, timerID))
+	m.Header.Set(sched.HeaderSchedule, sched.At(at))
+	m.Header.Set(sched.HeaderScheduleTarget, in.CmdSubject(execID))
+	m.Header.Set(cmd.HeaderType, string(c.Type))
+	m.Data = b
+
+	if _, err = in.JS.PublishMsg(ctx, m); err != nil {
+		return fmt.Errorf("wire: schedule %s command: %w", c.Type, err)
 	}
 
 	return nil

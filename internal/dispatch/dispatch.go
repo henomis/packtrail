@@ -53,7 +53,6 @@ import (
 	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/metrics"
 	"github.com/henomis/packtrail/internal/projection"
-	"github.com/henomis/packtrail/internal/sched"
 	"github.com/henomis/packtrail/internal/statecache"
 	"github.com/henomis/packtrail/internal/wire"
 )
@@ -615,18 +614,7 @@ func (d *Dispatcher) timer(ctx context.Context, execID string, t *event.Timer) e
 // publishes command c to the execution's command subject at time at. The
 // schedule subject is a rollup, so re-installing it is idempotent.
 func (d *Dispatcher) schedule(ctx context.Context, execID, timerID string, at time.Time, c cmd.Command) error {
-	b, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
-
-	m := nats.NewMsg(d.In.Names.TimerSubject(execID, timerID))
-	m.Header.Set(sched.HeaderSchedule, sched.At(at))
-	m.Header.Set(sched.HeaderScheduleTarget, d.In.CmdSubject(execID))
-	m.Header.Set(cmd.HeaderType, string(c.Type))
-	m.Data = b
-
-	if _, err = d.In.JS.PublishMsg(ctx, m); err != nil {
+	if err := wire.ScheduleCmd(ctx, d.In, execID, timerID, at, c); err != nil {
 		return fmt.Errorf("dispatch: schedule timer: %w", err)
 	}
 
@@ -701,12 +689,18 @@ func (d *Dispatcher) terminal(ctx context.Context, e statecache.Entry, ev event.
 	}
 
 	if r := e.Def.Retention.D(); r > 0 {
-		c, err := cmd.New("archive."+st.ExecID, cmd.Archive, st.ExecID, nil)
+		// Expiry: the execution is archived, or deleted when the flow says so.
+		typ := cmd.Archive
+		if e.Def.DeletesOnExpire() {
+			typ = cmd.Delete
+		}
+
+		c, err := cmd.New(string(typ)+"."+st.ExecID, typ, st.ExecID, nil)
 		if err != nil {
 			return err
 		}
 
-		return d.schedule(ctx, st.ExecID, "archive", ev.Time.Add(r), c)
+		return d.schedule(ctx, st.ExecID, wire.TimerExpire, ev.Time.Add(r), c)
 	}
 
 	return nil

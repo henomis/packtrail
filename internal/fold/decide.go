@@ -42,7 +42,22 @@ var (
 	// ErrRejected is a well-formed command the execution refuses in its
 	// current state (an update after it finished): an answer, not poison.
 	ErrRejected = errors.New("fold: command rejected")
+	// ErrConflict is a start whose execution id belongs to another flow. It
+	// is always wrapped together with ErrRejected.
+	ErrConflict = errors.New("fold: execution id belongs to another flow")
 )
+
+// CheckJoin is the decision on a start for an execution that already exists
+// as st (live or archived): nil joins it (I-03), an error wrapping
+// ErrConflict and ErrRejected refuses a start of another flow.
+func CheckJoin(st *State, flowName string) error {
+	if st.Flow == flowName {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %w: %s is an execution of %s, not %s", ErrRejected, ErrConflict, st.ExecID, st.Flow,
+		flowName)
+}
 
 // decider produces the events of one command. Every event is applied to the
 // state as soon as it is emitted, so later decisions in the same command see
@@ -280,13 +295,13 @@ func (d *decider) alloc() int { return d.st.N + 1 }
 // Start and routing
 
 func (d *decider) start(c cmd.Command) error {
-	if d.st.Exists() {
-		return nil // idempotent start (I-03)
-	}
-
 	var p cmd.StartData
 	if err := c.Payload(&p); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+
+	if d.st.Exists() {
+		return CheckJoin(d.st, p.Flow) // idempotent start (I-03)
 	}
 
 	input := p.Input

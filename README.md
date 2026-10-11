@@ -165,6 +165,15 @@ by the fold.
   connection, so CI or a `validate` command can reject a bad configuration.
   `ValidateNamespace`, `ValidateName` and `ValidateCron` expose the
   identifier and cron rules, so callers don't have to copy the patterns.
+- **Retention.** A flow's `retention` is how long a finished execution
+  stays live. Then it is archived (the default: still readable, no longer
+  drivable, kept forever unless the flow sets `archive_retention`) or, with
+  `on_expire: delete`, deleted with nothing left behind — not even delete
+  markers, so storage does not grow with the executions that ever ran.
+  `Engine.Archive` and `Engine.Delete` (`packtrail archive | delete <exec>`)
+  do it by hand. A deleted id is free again; since message ids are derived
+  from it and deduplicated for ten minutes, an execution is never deleted
+  sooner than that after it finished.
 - **Long histories.** Once an execution's live log holds 10 000 events
   (`WithHistoryLimit`), it is continued as new under the same id: the log so
   far is archived as a segment and replaced by one event carrying the state.

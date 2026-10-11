@@ -281,6 +281,10 @@ func TestValidateRejects(t *testing.T) {
 		{"map parallel cap", "name: x\nnodes: [{id: m, type: map, kind: k, over: input.x, max_parallel: 257}]", "max_parallel"},
 		{"fanout width cap", fanWide(257), "at most 256 branches"},
 		{"dynamic unknown", "name: x\nnodes: [{id: a, type: task, kind: k, dynamic: [zz]}]", "unknown node"},
+		{"on_expire unknown", "name: x\nretention: 1h\non_expire: burn\nnodes: [{id: a, type: task, kind: k}]", "on_expire: unknown value"},
+		{"on_expire without retention", "name: x\non_expire: delete\nnodes: [{id: a, type: task, kind: k}]", "on_expire: needs a retention"},
+		{"archive_retention negative", "name: x\nretention: 1h\narchive_retention: -1h\nnodes: [{id: a, type: task, kind: k}]", "archive_retention: must not be negative"},
+		{"archive_retention with delete", "name: x\nretention: 1h\non_expire: delete\narchive_retention: 1h\nnodes: [{id: a, type: task, kind: k}]", "archive_retention: has no effect"},
 	}
 
 	for _, c := range cases {
@@ -294,6 +298,61 @@ func TestValidateRejects(t *testing.T) {
 				t.Fatalf("err = %v carries no *ValidationError", err)
 			}
 		})
+	}
+}
+
+// TestExpiry: what a flow may say about the end of its executions, and that
+// saying nothing leaves the definition, and so its hash, as it was.
+func TestExpiry(t *testing.T) {
+	const nodes = "\nnodes: [{id: a, type: task, kind: k}]"
+
+	cases := []struct {
+		yaml    string
+		deletes bool
+		archive time.Duration
+	}{
+		{"name: x" + nodes, false, 0},
+		{"name: x\nretention: 1h" + nodes, false, 0},
+		{"name: x\nretention: 1h\non_expire: archive" + nodes, false, 0},
+		{"name: x\nretention: 1h\non_expire: delete" + nodes, true, 0},
+		{"name: x\nretention: 1h\narchive_retention: 720h" + nodes, false, 720 * time.Hour},
+		// Archives made by hand expire too.
+		{"name: x\narchive_retention: 720h" + nodes, false, 720 * time.Hour},
+	}
+
+	for _, c := range cases {
+		f, err := Parse([]byte(c.yaml))
+		if err != nil {
+			t.Fatalf("%q: %v", c.yaml, err)
+		}
+
+		if f.DeletesOnExpire() != c.deletes || f.ArchiveRetention.D() != c.archive {
+			t.Errorf("%q: deletes %v, archive retention %s", c.yaml, f.DeletesOnExpire(), f.ArchiveRetention.D())
+		}
+	}
+
+	plain, err := Parse([]byte("name: x\nretention: 1h" + nodes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := plain.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(b), "on_expire") || strings.Contains(string(b), "archive_retention") {
+		t.Fatalf("a flow without expiry settings encodes them: %s", b)
+	}
+
+	deleting, err := Parse([]byte("name: x\nretention: 1h\non_expire: delete" + nodes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h1, _ := plain.Hash()
+	if h2, _ := deleting.Hash(); h1 == h2 {
+		t.Fatal("on_expire is not part of the flow hash")
 	}
 }
 

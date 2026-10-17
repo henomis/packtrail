@@ -181,6 +181,14 @@ func TestSubflowBranchFailure(t *testing.T) {
 	y.ok("a", `{}`)
 	y.childEnds("c", "completed", `{}`)
 	y.task("z")
+
+	// min:1 is met by c, yet the join waits for b instead of cancelling it.
+	w := newH(t, fmt.Sprintf(childFan, "'min:1'"))
+	w.start(`{}`)
+	w.failT("a", false)
+	w.childEnds("c", "completed", `{}`)
+	w.childEnds("b", "failed", ``)
+	w.task("z")
 }
 
 const childMap = `

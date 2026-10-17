@@ -85,7 +85,7 @@ func (c *Client) Watch(ctx context.Context, execID string, from uint64) (<-chan 
 
 			evs, lerr := c.ld.Log.Decode(ctx, msg)
 			if lerr != nil {
-				c.in.Logger.Warn("packtrail: watch decode", "lerr", lerr)
+				c.in.Logger.WarnContext(ctx, "packtrail: watch stopped on an undecodable event", "exec", execID, "err", lerr)
 
 				return
 			}
@@ -409,7 +409,7 @@ func (c *Client) wait(ctx context.Context, execID string, cond func(*State) bool
 			return nil, err // the client never attached: retrying cannot help
 		}
 
-		c.in.Logger.Debug("packtrail: wait, will retry", "exec", execID, "in", delay, "err", err)
+		c.in.Logger.DebugContext(ctx, "packtrail: wait, will retry", "exec", execID, "in", delay, "err", err)
 
 		select {
 		case <-ctx.Done():

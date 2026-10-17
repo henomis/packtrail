@@ -100,6 +100,11 @@ func TestCLI(t *testing.T) {
 	// The execution can be driven right away; a missing one cannot.
 	cli("cancel", "e-1", "-reason", "done")
 
+	if out := cli("timeline", "e-1"); !strings.Contains(out, `"status": "cancelled"`) ||
+		!strings.Contains(out, `"type": "await"`) {
+		t.Fatalf("timeline: %s", out)
+	}
+
 	var out bytes.Buffer
 	if err := run(append(append([]string{}, srv...), "cancel", "nope"), &out); err == nil {
 		t.Fatal("cancel of a missing execution succeeded")
@@ -111,5 +116,12 @@ func TestCLI(t *testing.T) {
 
 	if out := cli("schedules"); strings.TrimSpace(out) != "null" {
 		t.Fatalf("schedules: %s", out)
+	}
+}
+
+func TestCLIRejectsBadLogFlags(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"-log-level", "loud"}, &out); err == nil || !strings.Contains(err.Error(), "log level") {
+		t.Fatalf("bad -log-level accepted: %v", err)
 	}
 }

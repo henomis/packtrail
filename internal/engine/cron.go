@@ -25,11 +25,13 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/flow"
 	"github.com/henomis/packtrail/internal/cmd"
 	"github.com/henomis/packtrail/internal/consume"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/wire"
 )
 
@@ -87,7 +89,12 @@ func (e *Engine) handleCron(ctx context.Context, msg jetstream.Msg) {
 		Flow: spec.Flow, Version: spec.Version, Input: spec.Input,
 	})
 	if err == nil {
-		err = wire.PublishCmd(ctx, e.In, c, "")
+		sctx, span := e.In.Tracer.Start(ctx, "packtrail.cron "+name, trace.WithSpanKind(trace.SpanKindProducer),
+			trace.WithAttributes(obs.AttrSchedule.String(name), obs.AttrExecID.String(execID),
+				obs.AttrFlow.String(spec.Flow)))
+		err = wire.PublishCmd(sctx, e.In, c, obs.Traceparent(sctx))
+		obs.Fail(span, err)
+		span.End()
 	}
 
 	if err != nil {
@@ -139,7 +146,7 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 				execID = names.TriggerMsgExecID(def.Name, id)
 			}
 
-			if err = e.startFromTrigger(ctx, def, execID, msg.Data()); err != nil {
+			if err = e.startFromTrigger(ctx, def, execID, msg.Data(), msg.Headers()); err != nil {
 				if md.NumDelivered >= e.triggerDeliveries() {
 					// One record per flow: flows triggered by the same
 					// message must not dedupe each other's dead letter.
@@ -153,7 +160,7 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 					return
 				}
 
-				e.In.Logger.Warn("packtrail: trigger start failed, will retry", "flow", def.Name, "exec", execID,
+				e.In.Logger.WarnContext(ctx, "packtrail: trigger start failed, will retry", "flow", def.Name, "exec", execID,
 					"deliveries", md.NumDelivered, "err", err)
 
 				_ = msg.NakWithDelay(retryDelay(md.NumDelivered))
@@ -185,8 +192,8 @@ func (e *Engine) runCoreTrigger(ctx context.Context, def *flow.Flow, tr flow.Tri
 			execID = names.TriggerMsgExecID(def.Name, id)
 		}
 
-		if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
-			e.In.Logger.Warn("packtrail: trigger start failed", "flow", def.Name, "err", err)
+		if err := e.startFromTrigger(ctx, def, execID, m.Data, m.Header); err != nil {
+			e.In.Logger.WarnContext(ctx, "packtrail: trigger start failed", "flow", def.Name, "err", err)
 		}
 	})
 	if err != nil {
@@ -218,11 +225,23 @@ func (e *Engine) readyWhenFlushed(ctx context.Context, ready func()) {
 	}
 }
 
-func (e *Engine) startFromTrigger(ctx context.Context, def *flow.Flow, execID string, data []byte) error {
+// startFromTrigger starts def for a trigger message. The start continues the
+// message's trace context, as a redriven trigger dead letter does.
+func (e *Engine) startFromTrigger(ctx context.Context, def *flow.Flow, execID string, data []byte,
+	h nats.Header,
+) error {
 	c, err := wire.TriggerStart(def.Name, execID, data)
 	if err != nil {
 		return err
 	}
 
-	return wire.PublishCmd(ctx, e.In, c, "")
+	ctx, span := e.In.Tracer.Start(obs.Extract(ctx, h), "packtrail.trigger "+def.Name,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(obs.AttrFlow.String(def.Name), obs.AttrExecID.String(execID)))
+	defer span.End()
+
+	err = wire.PublishCmd(ctx, e.In, c, obs.Traceparent(ctx))
+	obs.Fail(span, err)
+
+	return err
 }

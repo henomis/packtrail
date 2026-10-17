@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"mime"
 	"net/http"
 	"slices"
@@ -45,9 +46,10 @@ const (
 // api serves every namespace of the NATS account (or only an allowlist of
 // them), keeping one lazily attached client per namespace.
 type api struct {
-	nc    *nats.Conn
-	def   string
-	allow []string // nil: any namespace discovered on the account
+	nc     *nats.Conn
+	def    string
+	allow  []string // nil: any namespace discovered on the account
+	logger *slog.Logger
 
 	mu      sync.Mutex
 	clients map[string]*packtrail.Client
@@ -56,7 +58,7 @@ type api struct {
 // newAPI returns the API. def is the namespace the UI selects first; allow,
 // when non-nil, restricts the UI to those namespaces.
 func newAPI(nc *nats.Conn, def string, allow []string) *api {
-	return &api{nc: nc, def: def, allow: allow, clients: map[string]*packtrail.Client{}}
+	return &api{nc: nc, def: def, allow: allow, logger: slog.Default(), clients: map[string]*packtrail.Client{}}
 }
 
 // nsHandler is a handler bound to the client of the {ns} path segment.
@@ -131,7 +133,7 @@ func (a *api) client(ctx context.Context, ns string) (*packtrail.Client, error) 
 		return nil, fmt.Errorf("%w: namespace %q", packtrail.ErrNotFound, ns)
 	}
 
-	c, err = packtrail.NewClient(a.nc, packtrail.WithClientNamespace(ns))
+	c, err = packtrail.NewClient(a.nc, packtrail.WithClientNamespace(ns), packtrail.WithClientLogger(a.logger))
 	if err != nil {
 		return nil, err
 	}

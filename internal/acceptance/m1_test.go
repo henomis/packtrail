@@ -157,7 +157,9 @@ func TestM1FanoutPolicies(t *testing.T) {
 }
 
 func TestM1FanoutFailures(t *testing.T) {
-	e := NewEnv(t, []string{fmt.Sprintf(m1Fan, "all", "all"), fmt.Sprintf(m1Fan, "any", "any")})
+	e := NewEnv(t, []string{
+		fmt.Sprintf(m1Fan, "all", "all"), fmt.Sprintf(m1Fan, "any", "any"), fmt.Sprintf(m1Fan, "min", "min:1"),
+	})
 	e.Worker("echo", Echo)
 	e.Worker("branch", branchWorker(map[string]time.Duration{"a": 200 * time.Millisecond},
 		map[string]bool{"b": true, "c": true}), worker.WithConcurrency(8))
@@ -170,6 +172,16 @@ func TestM1FanoutFailures(t *testing.T) {
 	anyS := e.Completed(e.Start("fan-any", nil))
 	if anyS.Branches["a"] != "completed" {
 		t.Fatalf("any: branches %v", anyS.Branches)
+	}
+
+	// min:1 tolerates the two fast failures and waits for the slow success.
+	minS := e.Completed(e.Start("fan-min", nil))
+	if minS.Branches["a"] != "completed" || minS.Branches["b"] != "failed" || minS.Branches["c"] != "failed" {
+		t.Fatalf("min: branches %v", minS.Branches)
+	}
+
+	if _, ok := minS.Errors["b"]; !ok || string(minS.Results["join"]) != `{"a":{"branch":"a"}}` {
+		t.Fatalf("min: errors %v join %s", minS.Errors, minS.Results["join"])
 	}
 }
 

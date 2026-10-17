@@ -112,6 +112,7 @@ type TaskRef struct {
 // CompleteData is the payload of Complete.
 type CompleteData struct {
 	TaskRef
+	Report
 
 	Output   json.RawMessage            `json:"output,omitempty"`
 	Writes   map[string]json.RawMessage `json:"writes,omitempty"`
@@ -121,9 +122,18 @@ type CompleteData struct {
 	Cached   bool                       `json:"cached,omitempty"`
 }
 
+// Report is what a worker tells about an attempt besides its outcome: when
+// its handler started, and a summary of what it did (any JSON). Both are
+// recorded on the attempt's event and never folded.
+type Report struct {
+	Started time.Time       `json:"started,omitzero"`
+	Summary json.RawMessage `json:"summary,omitempty"`
+}
+
 // FailData is the payload of Fail.
 type FailData struct {
 	TaskRef
+	Report
 
 	Error     string             `json:"error"`
 	Retryable bool               `json:"retryable"`
@@ -134,6 +144,7 @@ type FailData struct {
 // InterruptData is the payload of Interrupt.
 type InterruptData struct {
 	TaskRef
+	Report
 
 	Payload json.RawMessage    `json:"payload,omitempty"`
 	Usage   map[string]float64 `json:"usage,omitempty"`

@@ -36,7 +36,7 @@ func TestUsageKeptWhenAnswerCannotBeEncoded(t *testing.T) {
 		"NaN output":           {&Result{Output: map[string]any{"score": math.NaN()}, Usage: u}, nil},
 		"unencodable question": {nil, WithUsage(Interrupt(map[string]any{"ch": make(chan int)}), u)},
 	} {
-		c, err := resultCmd("id", wj, ref, tc.res, tc.err)
+		c, err := resultCmd("id", wj, ref, tc.res, tc.err, cmd.Report{})
 		if err != nil {
 			t.Fatal(err)
 		}

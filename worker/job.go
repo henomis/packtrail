@@ -32,6 +32,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 )
 
 // Job is one attempt of a task instance.
@@ -60,6 +62,54 @@ type Job struct {
 
 	progress *progressSink
 	store    *Store
+	logger   *slog.Logger
+}
+
+// Logger returns the worker's logger with this attempt bound: exec, flow,
+// node, key, kind, generation and attempt, plus trace_id when the job carries
+// a W3C traceparent. Handlers log through it so their lines join the engine's
+// and the worker's on the same keys.
+func (j *Job) Logger() *slog.Logger {
+	if j.logger == nil {
+		j.logger = jobLogger(slog.Default(), j)
+	}
+
+	return j.logger
+}
+
+func jobLogger(l *slog.Logger, j *Job) *slog.Logger {
+	attrs := []any{
+		"exec", j.ExecID, "flow", j.Flow, "node", j.Node, "key", j.Key, "kind", j.Kind,
+		"generation", j.Generation, "attempt", j.Attempt,
+	}
+
+	if id := TraceID(j.Traceparent); id != "" {
+		attrs = append(attrs, "trace_id", id)
+	}
+
+	return l.With(attrs...)
+}
+
+// TraceID returns the trace id of a W3C traceparent
+// ("00-<trace id>-<parent id>-<flags>"), or "" when tp is not one.
+func TraceID(tp string) string {
+	const (
+		parts    = 4
+		idLength = 32
+	)
+
+	f := strings.Split(tp, "-")
+	if len(f) != parts || len(f[1]) != idLength || strings.Trim(f[1], "0") == "" {
+		return ""
+	}
+
+	for _, r := range f[1] {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return ""
+		}
+	}
+
+	return f[1]
 }
 
 // NodeError is how a node last failed permanently.
@@ -159,6 +209,10 @@ type Result struct {
 	Next string
 	// Usage reports generic counters (budgets).
 	Usage map[string]float64
+	// Summary describes what the attempt did (any value that encodes to
+	// JSON): it is recorded on the attempt's event, for timelines and
+	// audits, and never read by the flow. Keep it small.
+	Summary any
 }
 
 // Error classes.
@@ -205,6 +259,38 @@ func WithUsage(err error, usage map[string]float64) error {
 	}
 
 	return &UsageError{Err: err, Usage: usage}
+}
+
+// SummaryError carries the summary of a run that ended with an error (see
+// WithSummary). It unwraps to Err, so the error is classified as Err is.
+type SummaryError struct {
+	Err     error
+	Summary any
+}
+
+func (e *SummaryError) Error() string { return e.Err.Error() }
+func (e *SummaryError) Unwrap() error { return e.Err }
+
+// WithSummary attaches a summary to the error a handler returns, so a run
+// that interrupts or fails still records what it did, as Result.Summary does
+// for a run that completes. It composes with WithUsage, Interrupt,
+// Permanent and %w wrapping in any order. WithSummary(nil, …) is nil.
+func WithSummary(err error, summary any) error {
+	if err == nil {
+		return nil
+	}
+
+	return &SummaryError{Err: err, Summary: summary}
+}
+
+// summaryOf returns the summary attached to err, if any.
+func summaryOf(err error) any {
+	var s *SummaryError
+	if errors.As(err, &s) {
+		return s.Summary
+	}
+
+	return nil
 }
 
 // usageOf returns the usage attached to err, if any.

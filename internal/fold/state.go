@@ -211,6 +211,10 @@ type State struct {
 	Updated    time.Time `json:"updated"`
 	ForkedFrom string    `json:"forked_from,omitempty"`
 	ForkSeq    uint64    `json:"fork_seq,omitempty"`
+	// Trace is the W3C traceparent the execution was started (or forked)
+	// under: its trace, which every later decision keeps. Empty when the
+	// start carried none.
+	Trace string `json:"trace,omitempty"`
 
 	// Base is the index of the last ExecutionContinued (0: none): the live log
 	// starts there. Segments are the archived stretches before it, in order.
@@ -393,7 +397,7 @@ func (s *State) apply(def *flow.Flow, ev event.Event) error {
 	case *event.Started:
 		s.applyStarted(def, ev, d)
 	case *event.Forked:
-		return s.applyForked(d)
+		return s.applyForked(ev, d)
 	case *event.Continued:
 		src, err := Unmarshal(d.State)
 		if err != nil {
@@ -426,6 +430,7 @@ func (s *State) applyStarted(def *flow.Flow, ev event.Event, d *event.Started) {
 	s.Input, s.Parent, s.Attrs = d.Input, d.Parent, d.Attrs
 	s.Status = StatusRunning
 	s.Created = ev.Time
+	s.Trace = ev.Trace
 
 	if def != nil {
 		for name, c := range def.Channels {
@@ -437,7 +442,7 @@ func (s *State) applyStarted(def *flow.Flow, ev event.Event, d *event.Started) {
 	}
 }
 
-func (s *State) applyForked(d *event.Forked) error {
+func (s *State) applyForked(ev event.Event, d *event.Forked) error {
 	src, err := Unmarshal(d.State)
 	if err != nil {
 		return err
@@ -446,6 +451,7 @@ func (s *State) applyForked(d *event.Forked) error {
 	*s = *src
 	s.ExecID = d.ExecID
 	s.ForkedFrom, s.ForkSeq = d.From, d.Seq
+	s.Trace = ev.Trace          // a fork is a trace of its own
 	s.Base, s.Segments = 0, nil // the fork's history starts at the fork
 	s.Timers = map[string]*event.Timer{}
 	s.Events, s.LastSeq = 0, 0

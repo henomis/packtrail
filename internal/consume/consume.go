@@ -175,7 +175,7 @@ func ensureConsumerRetry(ctx context.Context, js jetstream.JetStream, cfg Config
 			return nil, shutdownErr(ctx, cfg, cc, err)
 		}
 
-		cfg.Logger.Warn("packtrail: cannot set up consumer, will retry", "consumer", cc.Durable,
+		cfg.Logger.WarnContext(ctx, "packtrail: cannot set up consumer, will retry", "consumer", cc.Durable,
 			"stream", cfg.Stream, "in", delay, "err", err)
 
 		select {
@@ -329,7 +329,7 @@ func (r *runner) fetchBatch(ctx context.Context, cons jetstream.Consumer, want i
 	batch, err := cons.Fetch(want, opts...)
 	if err != nil {
 		if ctx.Err() == nil {
-			r.cfg.Logger.Debug("packtrail: fetch", "consumer", r.cfg.Consumer.Durable, "err", err)
+			r.cfg.Logger.DebugContext(ctx, "packtrail: fetch", "consumer", r.cfg.Consumer.Durable, "err", err)
 			time.Sleep(fetchRetry)
 		}
 
@@ -404,7 +404,7 @@ func (r *runner) handle(msg jetstream.Msg) {
 
 	defer func() {
 		if p := recover(); p != nil {
-			r.cfg.Logger.Error("packtrail: handler panic", "consumer", r.cfg.Consumer.Durable, "panic", p,
+			r.cfg.Logger.ErrorContext(r.procCtx, "packtrail: handler panic", "consumer", r.cfg.Consumer.Durable, "panic", p,
 				"stack", string(debug.Stack()))
 
 			_ = msg.Nak()
@@ -426,7 +426,8 @@ func (r *runner) keepAlive(msg jetstream.Msg) func() {
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				r.cfg.Logger.Error("packtrail: heartbeat panic", "consumer", r.cfg.Consumer.Durable, "panic", p)
+				r.cfg.Logger.ErrorContext(r.procCtx, "packtrail: heartbeat panic", "consumer", r.cfg.Consumer.Durable,
+					"panic", p)
 			}
 		}()
 
@@ -458,7 +459,7 @@ func (r *runner) drain() {
 	select {
 	case <-done:
 	case <-time.After(r.cfg.Drain):
-		r.cfg.Logger.Warn("packtrail: drain budget exhausted, cancelling in-flight work",
+		r.cfg.Logger.WarnContext(r.procCtx, "packtrail: drain budget exhausted, cancelling in-flight work",
 			"consumer", r.cfg.Consumer.Durable)
 		r.procCancel()
 		<-done

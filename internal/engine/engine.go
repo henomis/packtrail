@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/event"
 	"github.com/henomis/packtrail/flow"
@@ -41,6 +42,7 @@ import (
 	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/metrics"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/projection"
 	"github.com/henomis/packtrail/internal/registry"
 	"github.com/henomis/packtrail/internal/statecache"
@@ -79,6 +81,8 @@ type Engine struct {
 	// Redispatch lifts the quarantine of an execution (wired to the
 	// dispatcher's replay).
 	Redispatch func(ctx context.Context, execID string) error
+	// Obs records command and execution metrics (nil: none).
+	Obs *obs.Engine
 
 	// triggerMaxDeliver overrides maxDeliver for stream trigger messages
 	// (tests; 0 = maxDeliver).
@@ -246,7 +250,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 		_ = msg.Ack()
 	case errors.Is(err, fold.ErrRejected):
 		// Refused in the execution's current state: final, not poison.
-		e.In.Logger.Info("packtrail: command rejected", "exec", c.ExecID, "type", c.Type, "err", err)
+		e.In.Logger.InfoContext(ctx, "packtrail: command rejected", "exec", c.ExecID, "type", c.Type, "err", err)
 
 		_ = msg.Ack()
 	case isNotFound(err) && n < notFoundGrace:
@@ -262,7 +266,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 		e.reply(c, wire.Reply{Code: wire.ReplyNotFound, Error: err.Error()})
 
 		if archived, aerr := e.Loader.IsArchived(ctx, c.ExecID); aerr == nil && archived {
-			e.In.Logger.Info("packtrail: command for archived execution ignored", "exec", c.ExecID, "type", c.Type)
+			e.In.Logger.InfoContext(ctx, "packtrail: command for archived execution ignored", "exec", c.ExecID, "type", c.Type)
 
 			_ = msg.Ack()
 
@@ -279,7 +283,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 			return
 		}
 
-		e.In.Logger.Warn("packtrail: command failed, will retry", "exec", c.ExecID, "type", c.Type,
+		e.In.Logger.WarnContext(ctx, "packtrail: command failed, will retry", "exec", c.ExecID, "type", c.Type,
 			"deliveries", n, "err", err)
 
 		_ = msg.NakWithDelay(retryDelay(n))
@@ -319,7 +323,7 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	d.Subject, d.Header, d.Body = msg.Subject(), msg.Headers(), msg.Data()
 
 	if err := wire.PublishDLQ(ctx, e.In, d, dedup); err != nil {
-		e.In.Logger.Error("packtrail: dead letter failed", "err", err)
+		e.In.Logger.ErrorContext(ctx, "packtrail: dead letter failed", "err", err)
 
 		_ = msg.NakWithDelay(nakDelay)
 
@@ -327,21 +331,39 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	}
 
 	e.Metrics.DeadLetters.Add(1)
-	e.In.Logger.Warn("packtrail: dead-lettered", "kind", d.Kind, "key", d.Key, "reason", d.Reason)
+	e.In.Logger.WarnContext(ctx, "packtrail: dead-lettered", "kind", d.Kind, "key", d.Key, "reason", d.Reason)
 
 	if err := msg.Term(); err != nil {
-		e.In.Logger.Warn("packtrail: term failed", "err", err)
+		e.In.Logger.WarnContext(ctx, "packtrail: term failed", "err", err)
 	}
 }
 
 // apply decides and appends, retrying on concurrent appends. It returns the
 // sequence of the stored decision (for a no-op, of the last one) and whether
-// the decision appended events.
-func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, bool, error) {
-	for range maxConflicts {
+// the decision appended events. header is the command's traceparent.
+func (e *Engine) apply(ctx context.Context, c cmd.Command, header string) (uint64, bool, error) {
+	began := time.Now()
+
+	var span trace.Span
+
+	defer func() {
+		e.instruments().Command(ctx, string(c.Type), time.Since(began))
+
+		if span != nil {
+			span.End()
+		}
+	}()
+
+	for conflicts := range maxConflicts {
 		ent, expected, evs, err := e.decide(ctx, c)
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
+
+			if span == nil {
+				_, span = e.startDecide(ctx, c, header, "", began)
+			}
+
+			obs.Fail(span, err)
 
 			return 0, false, err
 		}
@@ -350,7 +372,18 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 			return expected, false, nil
 		}
 
-		if ent, evs, err = e.fitDecision(ctx, c, ent, evs, trace); err != nil {
+		var sctx context.Context
+		if span == nil {
+			sctx, span = e.startDecide(ctx, c, header, ent.State.Trace, began)
+		} else {
+			sctx = trace.ContextWithSpan(ctx, span)
+		}
+
+		span.SetAttributes(obs.AttrFlow.String(ent.State.Flow), obs.AttrConflicts.Int(conflicts))
+
+		if ent, evs, err = e.fitDecision(ctx, c, ent, evs, obs.Traceparent(sctx)); err != nil {
+			obs.Fail(span, err)
+
 			return 0, false, err
 		}
 
@@ -366,27 +399,101 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 
 		if err != nil {
 			e.Cache.Drop(c.ExecID)
+			obs.Fail(span, err)
 
 			return 0, false, err
 		}
 
 		e.Metrics.EventsAppended.Add(int64(len(evs)))
+		span.SetAttributes(obs.AttrEvents.Int(len(evs)))
 
 		ent.State.LastSeq = last
 		e.Cache.Put(c.ExecID, ent)
 
 		e.afterAppend(ctx, c.ExecID, ent, before)
+		e.recordExecutions(ctx, ent.State, evs)
+
+		e.In.Logger.DebugContext(ctx, "packtrail: decision applied", "exec", c.ExecID, "type", c.Type, "cmd", c.ID,
+			"events", len(evs), "seq", last, "duration", time.Since(began))
 
 		return last, true, nil
 	}
 
-	return 0, false, fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
+	err := fmt.Errorf("engine: %s: too many concurrent appends", c.ExecID)
+	obs.Fail(span, err)
+
+	return 0, false, err
 }
+
+// startDecide starts the span of a decision, backdated to began. Its parent
+// is the command's trace context when it belongs to the execution's trace (or
+// the execution has none yet: a start, a fork); otherwise the execution's,
+// with a link to the command's, so a signal from elsewhere still lands in the
+// execution's trace. The events of the decision carry this span's context.
+func (e *Engine) startDecide(ctx context.Context, c cmd.Command, header, execTrace string, began time.Time) (
+	context.Context, trace.Span,
+) {
+	hdr, st := obs.SpanContext(header), obs.SpanContext(execTrace)
+
+	var links []trace.Link
+
+	switch {
+	case hdr.IsValid() && (!st.IsValid() || hdr.TraceID() == st.TraceID()):
+		ctx = trace.ContextWithRemoteSpanContext(ctx, hdr)
+	case st.IsValid():
+		ctx = trace.ContextWithRemoteSpanContext(ctx, st)
+
+		if hdr.IsValid() {
+			links = append(links, trace.Link{SpanContext: hdr})
+		}
+	}
+
+	return e.In.Tracer.Start(ctx, "packtrail.decide "+string(c.Type),
+		trace.WithSpanKind(trace.SpanKindConsumer), trace.WithTimestamp(began), trace.WithLinks(links...),
+		trace.WithAttributes(obs.AttrExecID.String(c.ExecID), obs.AttrCommandType.String(string(c.Type)),
+			obs.AttrCommandID.String(c.ID)))
+}
+
+// recordExecutions counts the executions a stored decision started or ended.
+func (e *Engine) recordExecutions(ctx context.Context, st *fold.State, evs []event.Event) {
+	for _, ev := range evs {
+		switch {
+		case ev.Type == event.ExecutionForked && st.Status.Terminal() && !endsIn(evs):
+			// A fork of a finished execution is born finished: it neither
+			// starts nor ends.
+		case ev.Type == event.ExecutionStarted || ev.Type == event.ExecutionForked:
+			e.instruments().Started(ctx, st.Flow)
+		case ev.Type.Terminal():
+			e.instruments().Ended(ctx, st.Flow, string(st.Status), ev.Time.Sub(st.Created))
+		}
+	}
+}
+
+// endsIn reports whether evs hold a final event.
+func endsIn(evs []event.Event) bool {
+	for _, ev := range evs {
+		if ev.Type.Terminal() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (e *Engine) instruments() *obs.Engine {
+	if e.Obs == nil {
+		return noopInstruments
+	}
+
+	return e.Obs
+}
+
+var noopInstruments = obs.NewEngine(nil)
 
 // fitDecision stamps the trace on the decided events and replaces a decision
 // too large to append by the failure of the execution.
 func (e *Engine) fitDecision(ctx context.Context, c cmd.Command, ent statecache.Entry, evs []event.Event,
-	trace string,
+	tp string,
 ) (statecache.Entry, []event.Event, error) {
 	if len(evs) > e.maxEvents() {
 		var err error
@@ -396,7 +503,13 @@ func (e *Engine) fitDecision(ctx context.Context, c cmd.Command, ent statecache.
 	}
 
 	for i := range evs {
-		evs[i].Trace = trace
+		evs[i].Trace = tp
+	}
+
+	// The fold takes an execution's trace from its first event; the cached
+	// state, decided before the trace was stamped, must agree with a replay.
+	if len(evs) > 0 && (evs[0].Type == event.ExecutionStarted || evs[0].Type == event.ExecutionForked) {
+		ent.State.Trace = tp
 	}
 
 	return ent, evs, nil
@@ -437,7 +550,7 @@ func (e *Engine) abortTooLarge(ctx context.Context, c cmd.Command,
 		return ent, nil, err
 	}
 
-	e.In.Logger.Error("packtrail: decision too large, execution failed", "exec", c.ExecID, "events", n)
+	e.In.Logger.ErrorContext(ctx, "packtrail: decision too large, execution failed", "exec", c.ExecID, "events", n)
 
 	return ent, out, nil
 }
@@ -559,13 +672,13 @@ func (e *Engine) decideFork(ctx context.Context, st *fold.State, c cmd.Command,
 func (e *Engine) afterAppend(ctx context.Context, execID string, ent statecache.Entry, before int) {
 	if e.Loader.Snaps.Due(before, ent.State.Events) {
 		if err := e.Loader.Snaps.Save(ctx, ent.State); err != nil {
-			e.In.Logger.Warn("packtrail: snapshot failed", "exec", execID, "err", err)
+			e.In.Logger.WarnContext(ctx, "packtrail: snapshot failed", "exec", execID, "err", err)
 		}
 	}
 
 	if e.HistoryLimit > 0 && ent.State.Events-ent.State.Base >= e.HistoryLimit {
 		if err := e.continueAsNew(ctx, execID, ent); err != nil {
-			e.In.Logger.Warn("packtrail: continue-as-new failed", "exec", execID, "err", err)
+			e.In.Logger.WarnContext(ctx, "packtrail: continue-as-new failed", "exec", execID, "err", err)
 		}
 	}
 }
@@ -643,7 +756,7 @@ func (e *Engine) continueAsNew(ctx context.Context, execID string, ent statecach
 	e.Metrics.EventsAppended.Add(int64(len(out)))
 
 	if err = e.Loader.Snaps.Save(ctx, next); err != nil {
-		e.In.Logger.Warn("packtrail: snapshot failed", "exec", execID, "err", err)
+		e.In.Logger.WarnContext(ctx, "packtrail: snapshot failed", "exec", execID, "err", err)
 	}
 
 	// Purge only what the dispatcher already processed: a message it has not

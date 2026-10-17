@@ -501,10 +501,10 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <table class="doctable">
         <thead><tr><th>join field</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. Once settled, branches still running are cancelled — a subflow branch's child too, unless its <code>on_parent_close</code> is <code>abandon</code>: then it carries on, unlinked from the join.</td></tr>
+          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. These settle as soon as the outcome is known; branches still running are then cancelled — a subflow branch's child too, unless its <code>on_parent_close</code> is <code>abandon</code>: then it carries on, unlinked from the join. <code>min:N</code>: waits for every branch, then succeeds if at least N did (<code>min:0</code> never fails); the output holds every success, and <code>branches</code> and <code>errors</code> tell which failed and why — the way to tolerate failures without losing results.</td></tr>
           <tr><td>wait_for</td><td>The branches the policy counts (default: all branches of the fanout).</td></tr>
           <tr><td>next</td><td>Successor once the policy is met.</td></tr>
-          <tr><td>on_failure</td><td>Handler when the policy can no longer be met; without it the execution fails with <code>join_failed</code>.</td></tr>
+          <tr><td>on_failure</td><td>Handler when the policy can no longer be met (for <code>min:N</code>, once every branch has finished); without it the execution fails with <code>join_failed</code>.</td></tr>
         </tbody>
       </table>
       <p>
@@ -752,7 +752,8 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Interrupted(&amp;v)</td><td>On a resumed run (every attempt), the payload this node interrupted with.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
-          <tr><td>Traceparent</td><td>W3C trace context propagated from the start command.</td></tr>
+          <tr><td>Traceparent</td><td>The W3C trace context of this attempt's span (see <a href="#tracing">tracing</a>); the handler's <code>ctx</code> carries the same span.</td></tr>
+          <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, <code>attempt</code>, and <code>trace_id</code> when the job carries a traceparent. See <a href="#logging">logging</a>.</td></tr>
           <tr><td>Meta, DecodeMeta(&amp;v)</td><td>The node's <code>meta</code> from the execution's flow version (raw JSON, nil when absent), and a decoder for it.</td></tr>
         </tbody>
       </table>
@@ -764,6 +765,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>nil, err</td><td>Fail the attempt; retried by the node's policy.</td></tr>
           <tr><td>worker.Permanent(err)</td><td>Fail without retry; <code>on_failure</code> or execution failure follows.</td></tr>
           <tr><td>worker.Interrupt(payload)</td><td>Pause at this node until <code>Client.Resume</code> — see <a href="#human">human in the loop</a>.</td></tr>
+          <tr><td>Result.Summary, worker.WithSummary(err, v)</td><td>What the attempt did, any value that encodes to JSON (tools called, tokens, a model name…): recorded on the attempt's event with the time the handler started, shown by the <a href="#timeline">timeline</a>, never read by the flow. A summary that cannot be encoded is dropped with a warning. Keep it small.</td></tr>
           <tr><td>worker.WithUsage(err, usage)</td><td>Any of the errors above, plus the usage the run spent: added to the counters like <code>Result.Usage</code>, for every attempt. It composes with <code>Permanent</code>, <code>Interrupt</code> and <code>%w</code> in any order (the outermost counts). A counter past its budget fails the execution at this node: no retry, no pause. A run that never returns (cancelled, timed out) reports nothing.</td></tr>
         </tbody>
       </table>
@@ -790,7 +792,9 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
       <p>
         <code>eng.Client()</code> returns a client bound to the engine's namespace; from another process
         use <code>packtrail.NewClient(nc, packtrail.WithClientNamespace("acme"))</code>. It is safe for
-        concurrent use and performs no I/O until the first call.
+        concurrent use and performs no I/O until the first call. <code>WithClientLogger(l)</code> sets the
+        logger for its own diagnostics (default <code>slog.Default()</code>) and
+        <code>WithClientTracerProvider(tp)</code> where its spans go; the engine's client uses the engine's.
       </p>
       <table class="doctable">
         <thead><tr><th>Method</th><th>Description</th></tr></thead>
@@ -807,6 +811,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Progress(exec)</td><td>Stream workers' progress messages from now on.</td></tr>
           <tr><td>List(filter)</td><td>Indexed executions by status, flow or search attribute, newest first.</td></tr>
           <tr><td>History, StateAt, OutputHistory</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
+          <tr><td>Timeline(exec)</td><td>The execution's steps with their timings and outcomes, from the event log: see <a href="#timeline">timeline</a>. <code>BuildTimeline(events)</code> does the same over events you already hold.</td></tr>
           <tr><td>Fork, Rerun</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
           <tr><td>Register, Flows, Flow</td><td>Store a definition (new version when changed), list versions, read one.</td></tr>
           <tr><td>Schedule, Unschedule, Schedules</td><td>Manage cron schedules.</td></tr>
@@ -957,6 +962,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
           <tr><td>WithReadTimeout(d)</td><td>One batched read of an event log (default 5s).</td></tr>
           <tr><td>WithBlobThreshold(n), WithBlobTimeout(d)</td><td>Claim-check: bodies above n bytes go to the object store (default: server max payload minus a margin); transfer timeout (default 2m).</td></tr>
           <tr><td>WithLogger, WithClock</td><td>A <code>*slog.Logger</code>; the decision clock (tests).</td></tr>
+          <tr><td>WithTracerProvider, WithMeterProvider</td><td>Where spans and metrics go (default: the global OpenTelemetry providers, no-ops until the application installs an SDK). See <a href="#tracing">tracing</a>.</td></tr>
         </tbody>
       </table>
       <p>
@@ -990,6 +996,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
           <tr><td>WithReconfigure()</td><td>Apply this worker's kind-wide settings to the shared consumer. Without it the first worker's settings stay.</td></tr>
           <tr><td>WithLiveCheck(d)</td><td>Period of the log-head check that stops jobs whose execution ended.</td></tr>
           <tr><td>WithDrainTimeout(d), WithBlobTimeout(d), WithLogger(l)</td><td>Shutdown drain, claim-check transfer timeout, logger.</td></tr>
+          <tr><td>WithTracerProvider(tp), WithMeterProvider(mp)</td><td>Where the job spans and worker metrics go (default: the global providers).</td></tr>
         </tbody>
       </table>
     </section>
@@ -1026,12 +1033,92 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
         <code>packtrail unquarantine &lt;exec&gt;</code> replays what was skipped. Transient outages never
         quarantine: the dispatcher waits and retries forever.
       </p>
+      <h3 id="logging">Logging</h3>
+      <p>
+        The engine (<code>WithLogger</code>), workers (<code>worker.WithLogger</code>) and clients
+        (<code>WithClientLogger</code>) log through a <code>*slog.Logger</code>, with the request context
+        when there is one. Messages start with <code>packtrail:</code> or <code>worker:</code>, and attributes
+        use the same keys everywhere: <code>exec</code>, <code>flow</code>, <code>node</code>,
+        <code>key</code>, <code>kind</code>, <code>generation</code>, <code>attempt</code>, <code>cmd</code>,
+        <code>type</code>, <code>seq</code>, <code>err</code>, <code>duration</code>, <code>trace_id</code>.
+      </p>
+      <table class="doctable">
+        <thead><tr><th>Level</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td>Error</td><td>Work lost or an operator must act: an execution quarantined, a dead letter not written, a handler panic.</td></tr>
+          <tr><td>Warn</td><td>Something failed and is retried, or was dead-lettered.</td></tr>
+          <tr><td>Info</td><td>Rejected commands and commands for archived executions.</td></tr>
+          <tr><td>Debug</td><td>One line per decision (<code>packtrail: decision applied</code>: type, events, seq, duration), per job sent (<code>packtrail: job dispatched</code>) and per attempt (<code>worker: job started</code> with the queue wait, <code>worker: job ended</code> with the outcome and duration).</td></tr>
+        </tbody>
+      </table>
+      <p>
+        A handler logs through <code>job.Logger()</code>, so its lines carry the same keys as the
+        engine's: filter on <code>exec</code> to follow one execution across processes.
+      </p>
+      <h3 id="tracing">Tracing</h3>
+      <p>
+        packtrail uses the OpenTelemetry API only: spans go to the provider of <code>WithTracerProvider</code>
+        (engine), <code>worker.WithTracerProvider</code> and <code>WithClientTracerProvider</code>, the global
+        one by default, and are no-ops until the application installs an SDK. Trace context travels as the
+        W3C <code>traceparent</code> header, as before.
+      </p>
+      <p>
+        <strong>An execution is one trace.</strong> Its start (or fork) picks the trace: the caller's span,
+        <code>WithTraceparent</code>, or a new one. Every later decision stays in it, so the jobs released by
+        a signal, a resume, an update or a timer land in the execution's trace too; when the command came
+        from another trace, its decision links to it. Subflows join their parent's trace; a fork starts its
+        own.
+      </p>
+      <table class="doctable">
+        <thead><tr><th>Span</th><th>Kind</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td><code>packtrail.start &lt;flow&gt;</code>, <code>packtrail.signal</code>, <code>.resume</code>, <code>.cancel</code>, <code>.update</code>, <code>.fork</code>, <code>.unquarantine</code></td><td>producer</td><td>A client sending a command.</td></tr>
+          <tr><td><code>packtrail.decide &lt;command&gt;</code></td><td>consumer</td><td>The engine deciding and storing one command; attributes: execution, command type and id, events, conflicts.</td></tr>
+          <tr><td><code>packtrail.dispatch &lt;kind&gt;</code></td><td>producer</td><td>A job sent to a worker (or answered from the result cache).</td></tr>
+          <tr><td><code>packtrail.job &lt;node&gt;</code></td><td>consumer</td><td>One attempt in a worker, with its outcome. The handler's <code>ctx</code> carries it: spans the handler starts are its children.</td></tr>
+          <tr><td><code>packtrail.cron &lt;schedule&gt;</code>, <code>packtrail.trigger &lt;flow&gt;</code></td><td>producer, consumer</td><td>A schedule firing; a trigger message starting a flow, continuing the message's trace context.</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Attributes are namespaced: <code>packtrail.exec.id</code>, <code>packtrail.flow.name</code>,
+        <code>packtrail.node</code>, <code>packtrail.task.key</code>, <code>packtrail.task.generation</code>,
+        <code>packtrail.task.attempt</code>, <code>packtrail.worker.kind</code>,
+        <code>packtrail.command.type</code>, <code>packtrail.job.outcome</code>. A task step makes about three
+        spans per attempt: sample large map fan-outs with a parent-based sampler.
+      </p>
       <h3>Metrics &amp; alerting</h3>
       <p>
         <code>Engine.Metrics(ctx)</code> returns counters (commands, conflicts, events appended, jobs
         dispatched, cache hits, timers, dead letters, archived, deleted), <code>ProjectionLag</code> and
         <code>DispatchStall</code>: the longest time a partition with pending events has gone without
         progress. Alert when it exceeds a minute or so.
+      </p>
+      <p>
+        The same numbers, and more, are OpenTelemetry instruments on the provider of
+        <code>WithMeterProvider</code> and <code>worker.WithMeterProvider</code>. They never carry an
+        execution id.
+      </p>
+      <table class="doctable">
+        <thead><tr><th>Instrument</th><th>Type</th><th>Attributes</th></tr></thead>
+        <tbody>
+          <tr><td><code>packtrail.engine.commands</code>, <code>.conflicts</code>, <code>.events.appended</code>, <code>.dead_letters</code>, <code>.timers</code>; <code>packtrail.dispatch.jobs</code>, <code>.cache_hits</code>; <code>packtrail.executions.archived</code>, <code>.deleted</code></td><td>counter</td><td>—</td></tr>
+          <tr><td><code>packtrail.engine.command.duration</code></td><td>histogram, s</td><td>command type</td></tr>
+          <tr><td><code>packtrail.executions.started</code>, <code>packtrail.executions.ended</code></td><td>counter</td><td>flow; status for ended</td></tr>
+          <tr><td><code>packtrail.execution.duration</code></td><td>histogram, s (1 s to 30 days)</td><td>flow, status</td></tr>
+          <tr><td><code>packtrail.dispatch.lag</code></td><td>gauge, events</td><td>—</td></tr>
+          <tr><td><code>packtrail.dispatch.stall</code></td><td>gauge, s</td><td>partition — alert above a minute</td></tr>
+          <tr><td><code>packtrail.worker.jobs</code></td><td>counter</td><td>kind, outcome (<code>completed</code>, <code>failed</code>, <code>retryable_failed</code>, <code>interrupted</code>, <code>cancelled</code>, <code>publish_error</code>)</td></tr>
+          <tr><td><code>packtrail.job.duration</code>, <code>packtrail.job.queue_wait</code></td><td>histogram, s</td><td>kind (and outcome for duration)</td></tr>
+          <tr><td><code>packtrail.worker.jobs.active</code></td><td>up-down counter</td><td>kind</td></tr>
+        </tbody>
+      </table>
+      <h3 id="timeline">Timeline</h3>
+      <p>
+        <code>Client.Timeline(ctx, exec)</code> (<code>packtrail timeline &lt;exec&gt;</code>) turns the event log
+        into steps — each task attempt, await and subflow — with when it was scheduled, when the worker
+        started it, when it ended, the queue and run times, the outcome, the usage and the worker's summary.
+        It needs no telemetry backend and works on archived executions. Queue and run times compare the
+        worker's clock with the engine's; they are never negative.
       </p>
       <h3>Long histories</h3>
       <p>
@@ -1092,8 +1179,18 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
       <span class="eyebrow">Operations</span>
       <h2>CLI</h2>
       <p>
-        <code>packtrail [-server URL] [-ns NAMESPACE] &lt;command&gt;</code>. It is a client of the
-        deployment, plus <code>run</code> to host an engine.
+        <code>packtrail [-server URL] [-ns NAMESPACE] [-log-level L] [-log-format F] &lt;command&gt;</code>.
+        It is a client of the deployment, plus <code>run</code> to host an engine. Output is JSON on stdout;
+        logs go to stderr at <code>-log-level</code> (<code>debug</code>, <code>info</code>, <code>warn</code>,
+        <code>error</code>; default <code>$PACKTRAIL_LOG_LEVEL</code> or <code>info</code>) in
+        <code>-log-format</code> (<code>text</code> or <code>json</code>; default
+        <code>$PACKTRAIL_LOG_FORMAT</code> or <code>text</code>). Traces and metrics are exported over OTLP/HTTP
+        when <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> is set (the standard <code>OTEL_*</code> variables
+        apply, <code>OTEL_SERVICE_NAME</code> defaults to <code>packtrail</code>; OTLP/gRPC is not supported
+        and <code>OTEL_EXPORTER_OTLP_PROTOCOL=grpc</code> is refused), and
+        <code>run -metrics-addr ADDR</code> (<code>$PACKTRAIL_METRICS_ADDR</code>) serves Prometheus metrics at
+        <code>/metrics</code>; with neither, nothing is exported. <code>packtrail-ui</code> takes the same
+        two flags.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -1101,7 +1198,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
           <span class="codecard__name">packtrail</span>
         </div>
 <pre class="codecard__body"><code><span class="cm"># engine</span>
-run [-flows DIR] [-partitions N]       <span class="cm"># run an engine until interrupted</span>
+run [-flows DIR] [-partitions N] [-metrics-addr ADDR]  <span class="cm"># run an engine until interrupted</span>
 init [-flows DIR] [-partitions N]      <span class="cm"># provision the namespace and register flows</span>
 rebuild-index                          <span class="cm"># rebuild the visibility index from the log</span>
 archive &lt;exec&gt;                         <span class="cm"># archive a finished execution now</span>
@@ -1120,6 +1217,7 @@ resume &lt;exec&gt; &lt;node&gt; [-value JSON]
 cancel &lt;exec&gt; [-reason TEXT]
 get &lt;exec&gt; [-seq N]                    <span class="cm"># state now, or right after event N</span>
 history &lt;exec&gt;
+timeline &lt;exec&gt;                        <span class="cm"># steps with queue and run times, outcome, usage, summary</span>
 watch &lt;exec&gt;                           <span class="cm"># stream events until the execution ends</span>
 progress &lt;exec&gt;                        <span class="cm"># stream workers' progress messages</span>
 wait &lt;exec&gt;
@@ -1213,9 +1311,9 @@ unquarantine &lt;exec&gt;</code></pre>
         <tbody>
           <tr><td>start</td><td><code>flow, version?, input?, parent?</code> — idempotent per execution id (command id <code>start.&lt;exec&gt;</code>); <code>conflict</code> when the id is an execution of another flow</td></tr>
           <tr><td>fork</td><td><code>from, seq, writes?</code></td></tr>
-          <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?</code></td></tr>
-          <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?</code></td></tr>
-          <tr><td>interrupt</td><td><code>key, generation, attempt, payload?</code></td></tr>
+          <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?, started?, summary?</code></td></tr>
+          <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?, usage?, started?, summary?</code></td></tr>
+          <tr><td>interrupt</td><td><code>key, generation, attempt, payload?, usage?, started?, summary?</code></td></tr>
           <tr><td>resume</td><td><code>node, key?, value?</code></td></tr>
           <tr><td>signal</td><td><code>name, payload?</code> — the command id is the signal id</td></tr>
           <tr><td>update</td><td><code>writes</code> — send with <code>reply</code>; the command id is the update id</td></tr>
@@ -1260,7 +1358,9 @@ unquarantine &lt;exec&gt;</code></pre>
         <li>Publishes exactly one command to <code>reply</code> — <code>complete</code>, <code>fail</code> or
           <code>interrupt</code> — with <code>key</code>, <code>generation</code>, <code>attempt</code> copied
           from the job and command id <code>w.&lt;exec&gt;.&lt;key&gt;.&lt;generation&gt;.&lt;attempt&gt;</code>,
-          then acks. If publishing fails, it naks.</li>
+          then acks. If publishing fails, it naks. It may add <code>started</code> (when the handler started,
+          RFC 3339) and <code>summary</code> (any JSON), and send its own span's <code>traceparent</code> on the
+          command, or the job's.</li>
         <li>When deliveries exceed its cap, publishes a non-retryable <code>fail</code> (reason
           <code>delivery_failed</code>), records a dead letter and terminates the message.</li>
       </ol>
@@ -1318,6 +1418,9 @@ unquarantine &lt;exec&gt;</code></pre>
       </div>
       <p>
         <code>i</code> is the 1-based index of the event in its execution (the fold rejects a gap).
+        <code>trace</code> is the trace context of the decision that stored the event, in the execution's
+        trace (see <a href="#tracing">tracing</a>). <code>started</code> and <code>summary</code> on a task's
+        events are what its worker reported; the fold never reads them.
         Readers reject unknown types and versions rather than fold wrongly; types are added, never
         repurposed.
       </p>
@@ -1332,9 +1435,9 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>ExecutionCancelled</td><td><code>reason, cancel_children[]</code></td></tr>
           <tr><td>NodeEntered</td><td><code>node</code></td></tr>
           <tr><td>NodeScheduled</td><td><code>key, node, kind, index?, generation, attempt, owner?, item?, resume?</code></td></tr>
-          <tr><td>NodeCompleted</td><td><code>key, node, generation, attempt, output?, writes?, next?, usage?, cached?, cache_key?</code></td></tr>
-          <tr><td>NodeFailed</td><td><code>key, node, generation, attempt, error, reason, will_retry</code></td></tr>
-          <tr><td>NodeInterrupted</td><td><code>key, node, generation, payload?</code></td></tr>
+          <tr><td>NodeCompleted</td><td><code>key, node, generation, attempt, output?, writes?, next?, usage?, cached?, cache_key?, started?, summary?</code></td></tr>
+          <tr><td>NodeFailed</td><td><code>key, node, generation, attempt, error, reason, will_retry, usage?, started?, summary?</code></td></tr>
+          <tr><td>NodeInterrupted</td><td><code>key, node, generation, payload?, usage?, started?, summary?</code></td></tr>
           <tr><td>NodeCancelled</td><td><code>key, node, reason</code></td></tr>
           <tr><td>ChoiceEvaluated</td><td><code>node, rule, to, error?</code></td></tr>
           <tr><td>FanoutStarted</td><td><code>node, join, branches[]</code></td></tr>

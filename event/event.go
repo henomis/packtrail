@@ -82,8 +82,9 @@ type Event struct {
 	Index int `json:"i"`
 	// CmdID is the id of the command whose decision produced the event.
 	CmdID string `json:"cmd_id,omitempty"`
-	// Trace is the W3C traceparent of the command that caused the event,
-	// propagated to the jobs and commands derived from it.
+	// Trace is the W3C traceparent of the decision that stored the event, in
+	// the execution's trace (the one its start or fork chose), propagated to
+	// the jobs and commands derived from it.
 	Trace string `json:"trace,omitempty"`
 	// Data is a pointer to the type-specific payload struct.
 	Data any `json:"data"`
@@ -215,6 +216,11 @@ type NodeDone struct {
 	Usage      map[string]float64         `json:"usage,omitempty"`
 	Cached     bool                       `json:"cached,omitempty"`
 	CacheKey   string                     `json:"cache_key,omitempty"`
+	// Started is when the worker's handler started (zero when the worker
+	// did not say, or the result came from the cache); Summary is what the
+	// worker reported doing. Both are audit data: the fold ignores them.
+	Started time.Time       `json:"started,omitzero"`
+	Summary json.RawMessage `json:"summary,omitempty"`
 }
 
 // NodeFail is the payload of NodeFailed. WillRetry says whether another
@@ -228,6 +234,8 @@ type NodeFail struct {
 	Reason     string             `json:"reason"`
 	WillRetry  bool               `json:"will_retry"`
 	Usage      map[string]float64 `json:"usage,omitempty"`
+	Started    time.Time          `json:"started,omitzero"`
+	Summary    json.RawMessage    `json:"summary,omitempty"`
 }
 
 // Interrupted is the payload of NodeInterrupted.
@@ -237,6 +245,8 @@ type Interrupted struct {
 	Generation int                `json:"generation"`
 	Payload    json.RawMessage    `json:"payload,omitempty"`
 	Usage      map[string]float64 `json:"usage,omitempty"`
+	Started    time.Time          `json:"started,omitzero"`
+	Summary    json.RawMessage    `json:"summary,omitempty"`
 }
 
 // NodeCancel is the payload of NodeCancelled: an in-flight instance abandoned

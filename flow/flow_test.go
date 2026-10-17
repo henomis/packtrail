@@ -99,6 +99,10 @@ func TestParseFull(t *testing.T) {
 		t.Fatalf("join kind = %s %d", kind, q)
 	}
 
+	if kind, q := (&Node{Policy: " min:0 "}).JoinKind(); kind != JoinMin || q != 0 {
+		t.Fatalf("min join kind = %s %d", kind, q)
+	}
+
 	if f.Node("draft").Timeout.D() != 30*time.Second || f.Node("draft").MaxAttempts() != 3 {
 		t.Fatal("task policy not decoded")
 	}
@@ -262,6 +266,10 @@ func TestValidateRejects(t *testing.T) {
 		{"wait foreign", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [t], next: t}, {id: t, type: task, kind: k}]", "not a branch of its fanout"},
 		{"wait dup", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, wait_for: [a, a]}]", "twice"},
 		{"quorum too big", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'quorum:2'}]", "exceeds"},
+		{"min too big", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'min:2'}]", "min:2 exceeds"},
+		{"min not a number", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'min:one'}]", "min:N needs N >= 0"},
+		{"min negative", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'min:-1'}]", "min:N needs N >= 0"},
+		{"quorum not a number", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: 'quorum:two'}]", "quorum:N needs N > 0"},
 		{"bad policy", "name: x\nnodes: [{id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join, policy: some}]", "unknown policy"},
 		{"orphan join", "name: x\nnodes: [{id: t, type: task, kind: k, next: j}, {id: j, type: join}]", "join"},
 		{"route into branch", "name: x\nnodes: [{id: t, type: task, kind: k, next: f}, {id: f, type: fanout, branches: [a], next: j}, {id: a, type: task, kind: k}, {id: j, type: join}, {id: c, type: choice, rules: [{default: true, to: a}]}]", "a branch of fanout"},

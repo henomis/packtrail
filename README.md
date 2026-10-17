@@ -157,9 +157,28 @@ by the fold.
   skipped. Transient outages never quarantine: dispatching waits.
 - **Alert on stalls.** The dispatcher retries infrastructure errors forever
   (it never gives up on an execution for a transient reason). Export
-  `Engine.Metrics().DispatchStall` — the longest time a partition with
-  pending events has gone without progress — and alert when it exceeds a
-  minute or so.
+  `Engine.Metrics().DispatchStall` (the `packtrail.dispatch.stall` gauge) —
+  the longest time a partition with pending events has gone without
+  progress — and alert when it exceeds a minute or so.
+- **Logs.** The engine, workers and clients log through `slog`
+  (`WithLogger`, `worker.WithLogger`, `WithClientLogger`) on shared keys
+  (`exec`, `flow`, `node`, `key`, `kind`, `attempt`, `err`, ...). Debug adds
+  one line per decision, dispatched job and attempt; a handler's
+  `job.Logger()` carries the same keys and the trace id. The CLIs take
+  `-log-level debug|info|warn|error` and `-log-format text|json`
+  (`PACKTRAIL_LOG_LEVEL`, `PACKTRAIL_LOG_FORMAT`).
+- **Traces and metrics.** packtrail speaks the OpenTelemetry API
+  (`WithTracerProvider`, `WithMeterProvider`, and the same on workers and
+  clients): an execution is one trace, from its start through every
+  decision, dispatch and job attempt, even when a signal or a timer moves it
+  on; a handler's spans nest under its job. Metrics cover commands,
+  executions, jobs, queue waits and the dispatch stall. The CLIs export over
+  OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and `packtrail run
+  -metrics-addr :9090` serves Prometheus metrics. Without an SDK it all costs
+  nothing.
+- **Timeline.** `Client.Timeline` (`packtrail timeline <exec>`) lists an
+  execution's steps with their queue and run times, outcome, usage and the
+  worker's summary (`Result.Summary`), straight from the event log.
 - **Validate offline.** `packtrail.ValidateOptions(opts...)` runs every
   check `New` does (flows, schedules, namespace, tuning) without a NATS
   connection, so CI or a `validate` command can reject a bad configuration.

@@ -42,6 +42,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/event"
 	"github.com/henomis/packtrail/flow"
@@ -52,6 +53,7 @@ import (
 	"github.com/henomis/packtrail/internal/infra"
 	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/metrics"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/projection"
 	"github.com/henomis/packtrail/internal/statecache"
 	"github.com/henomis/packtrail/internal/wire"
@@ -357,6 +359,23 @@ func (d *Dispatcher) job(ctx context.Context, e statecache.Entry, ev event.Event
 		return err
 	}
 
+	ctx, span := d.In.Tracer.Start(obs.ContextWithTraceparent(ctx, ev.Trace), "packtrail.dispatch "+s.Kind,
+		trace.WithSpanKind(trace.SpanKindProducer), trace.WithAttributes(
+			obs.AttrExecID.String(st.ExecID), obs.AttrFlow.String(st.Flow), obs.AttrNode.String(s.Node),
+			obs.AttrTaskKey.String(s.Key), obs.AttrKind.String(s.Kind), obs.AttrGeneration.Int(s.Generation),
+			obs.AttrAttempt.Int(s.Attempt), obs.AttrMessagingDest.String(d.In.Names.WorkSubject(s.Kind))))
+
+	err := d.dispatchJob(ctx, e, s, t)
+	obs.Fail(span, err)
+	span.End()
+
+	return err
+}
+
+// dispatchJob sends the job of a scheduled task, or answers it from the
+// result cache. ctx carries the dispatch span, which the job continues.
+func (d *Dispatcher) dispatchJob(ctx context.Context, e statecache.Entry, s *event.Scheduled, t *fold.Task) error {
+	st := e.State
 	n := e.Def.Node(s.Node)
 
 	view := st.ContextView(t)
@@ -369,7 +388,7 @@ func (d *Dispatcher) job(ctx context.Context, e statecache.Entry, ev event.Event
 	job := wire.Job{
 		ExecID: st.ExecID, Flow: st.Flow, FlowHash: st.FlowHash, Node: s.Node, Kind: s.Kind, Key: s.Key,
 		Index: s.Index, Generation: s.Generation, Attempt: s.Attempt, Context: ctxJSON, Meta: n.MetaJSON(),
-		Reply: d.In.CmdSubject(st.ExecID), Traceparent: ev.Trace,
+		Reply: d.In.CmdSubject(st.ExecID), Traceparent: obs.Traceparent(ctx),
 	}
 
 	if n.Cache != nil {

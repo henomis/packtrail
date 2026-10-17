@@ -45,6 +45,7 @@ import (
 	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/metrics"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/projection"
 	"github.com/henomis/packtrail/internal/ready"
 	"github.com/henomis/packtrail/internal/registry"
@@ -135,6 +136,8 @@ func (e *Engine) Init(ctx context.Context) error {
 		return err
 	}
 
+	in.Tracer = obs.Tracer(e.cfg.tracer)
+
 	if e.cfg.blobThreshold > 0 {
 		in.BlobThreshold = e.cfg.blobThreshold
 	}
@@ -150,7 +153,7 @@ func (e *Engine) Init(ctx context.Context) error {
 	e.ld = loader.New(in, eventlog.New(in), snapshot.New(in, e.cfg.snapshotEvery), registry.New(in))
 	e.eng = &engine.Engine{
 		In: in, Loader: e.ld, Cache: statecache.New(e.cfg.cacheSize), Metrics: e.metrics, Drain: e.cfg.drain,
-		Now: e.cfg.clock, HistoryLimit: historyLimit(e.cfg.historyLimit),
+		Now: e.cfg.clock, HistoryLimit: historyLimit(e.cfg.historyLimit), Obs: obs.NewEngine(obs.Meter(e.cfg.meter)),
 	}
 	e.disp = &dispatch.Dispatcher{
 		In: in, Loader: e.ld, Cache: statecache.New(e.cfg.cacheSize), Metrics: e.metrics, Drain: e.cfg.drain,
@@ -203,6 +206,13 @@ func (e *Engine) Run(ctx context.Context) error {
 
 		defer stopControl()
 	}
+
+	reg, rerr := obs.ObserveEngine(obs.Meter(e.cfg.meter), e.metrics.Snapshot, e.dispatchLag)
+	if rerr != nil {
+		return fmt.Errorf("packtrail: metrics: %w", rerr)
+	}
+
+	defer func() { _ = reg.Unregister() }()
 
 	parts := e.components()
 
@@ -293,6 +303,15 @@ func (e *Engine) Register(ctx context.Context, def *flow.Flow) (string, error) {
 
 // Partitions returns the deployed partition count. Valid after Init.
 func (e *Engine) Partitions() int { return e.in.Partitions }
+
+// dispatchLag reads the dispatcher's lag and stall for the metrics
+// callback, bounded by the read timeout.
+func (e *Engine) dispatchLag(ctx context.Context) Metrics {
+	ctx, cancel := context.WithTimeout(ctx, e.in.ReadTimeout)
+	defer cancel()
+
+	return e.Metrics(ctx)
+}
 
 // Metrics returns the engine counters and the dispatcher lag.
 func (e *Engine) Metrics(ctx context.Context) Metrics {

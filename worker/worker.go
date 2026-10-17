@@ -28,6 +28,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/internal/apierr"
 	"github.com/henomis/packtrail/internal/blob"
@@ -35,6 +37,7 @@ import (
 	"github.com/henomis/packtrail/internal/consume"
 	"github.com/henomis/packtrail/internal/infra"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/ready"
 	"github.com/henomis/packtrail/internal/wire"
 )
@@ -167,6 +170,35 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
+// WithTracerProvider sets where the worker's spans go (default: the global
+// OpenTelemetry provider). Each job runs in a span whose context the handler
+// gets, so spans the handler starts are its children.
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(w *Worker) error {
+		if tp == nil {
+			return errors.New("worker: nil tracer provider")
+		}
+
+		w.tracer = tp
+
+		return nil
+	}
+}
+
+// WithMeterProvider sets where the worker's metrics go (default: the global
+// OpenTelemetry provider).
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(w *Worker) error {
+		if mp == nil {
+			return errors.New("worker: nil meter provider")
+		}
+
+		w.meter = mp
+
+		return nil
+	}
+}
+
 // Worker serves one kind.
 type Worker struct {
 	nc          *nats.Conn
@@ -187,8 +219,11 @@ type Worker struct {
 	drain       time.Duration
 	logger      *slog.Logger
 	blobTimeout time.Duration
+	tracer      trace.TracerProvider
+	meter       metric.MeterProvider
 
-	in *infra.Infra
+	in  *infra.Infra
+	obs *obs.Worker
 
 	// running jobs, matched by stop notices; liveCheck is how often a running
 	// job checks its execution's log head (G5-02).
@@ -247,7 +282,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		in.BlobTimeout = w.blobTimeout
 	}
 
+	in.Tracer = obs.Tracer(w.tracer)
 	w.in = in
+	w.obs = obs.NewWorker(obs.Meter(w.meter))
 
 	sub, err := w.subscribeStops()
 	if err != nil {
@@ -351,14 +388,29 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 
 	defer w.running.remove(wj.ExecID, rj)
 
+	jctx, span := w.startJob(jctx, msg, wj, md)
+	defer span.End()
+
+	began := time.Now()
+	done := w.obs.Begin(jctx, wj.Kind, queueWait(md, began))
 	stopLive := w.watchLive(jctx, wj, cancel)
 	c, err := w.run(jctx, wj, md)
 
 	stopLive()
+	w.answer(ctx, jctx, msg, wj, c, err, func(outcome string, ferr error) {
+		w.endJob(span, done, outcome, began, ferr)
+	})
+}
 
+// answer publishes the command answering a job (unless the work is no
+// longer wanted) and acks the message; end records how the attempt ended.
+func (w *Worker) answer(ctx, jctx context.Context, msg jetstream.Msg, wj wire.Job, c cmd.Command, err error,
+	end func(outcome string, err error),
+) {
 	if errors.Is(context.Cause(jctx), ErrCancelled) {
 		// The work is no longer wanted: its result would be stale (G5-02).
 		w.logger.DebugContext(ctx, "worker: job cancelled", "exec", wj.ExecID, "node", wj.Node, "key", wj.Key)
+		end(outcomeCancelled, nil)
 
 		_ = msg.Ack()
 
@@ -369,15 +421,65 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 		w.logger.WarnContext(ctx, "worker: cannot build result", "exec", wj.ExecID, "node", wj.Node, "err", err)
 	}
 
-	if err = w.publish(ctx, wj, c); err != nil {
+	if err = w.publish(ctx, wj, c, obs.Traceparent(jctx)); err != nil {
 		w.logger.WarnContext(ctx, "worker: cannot publish result, job will be redelivered", "exec", wj.ExecID, "err", err)
+		end(outcomePublishError, err)
 
 		_ = msg.NakWithDelay(time.Second)
 
 		return
 	}
 
+	end(outcome(c), failure(c))
+
 	_ = msg.Ack()
+}
+
+// Job outcomes beyond those of a result command.
+const (
+	outcomeCancelled    = "cancelled"
+	outcomePublishError = "publish_error"
+)
+
+// startJob starts the span of a job attempt. Its parent is the trace context
+// of the job message (the dispatch span), else the job's traceparent.
+func (w *Worker) startJob(ctx context.Context, msg jetstream.Msg, wj wire.Job, md *jetstream.MsgMetadata) (
+	context.Context, trace.Span,
+) {
+	pctx := obs.Extract(ctx, msg.Headers())
+	if !trace.SpanContextFromContext(pctx).IsValid() {
+		pctx = obs.ContextWithTraceparent(ctx, wj.Traceparent)
+	}
+
+	return w.in.Tracer.Start(pctx, "packtrail.job "+wj.Node, trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(obs.AttrExecID.String(wj.ExecID), obs.AttrFlow.String(wj.Flow),
+			obs.AttrNode.String(wj.Node), obs.AttrTaskKey.String(wj.Key), obs.AttrKind.String(wj.Kind),
+			obs.AttrGeneration.Int(wj.Generation), obs.AttrAttempt.Int(wj.Attempt),
+			obs.AttrDeliveries.Int64(int64(md.NumDelivered)))) //nolint:gosec // a delivery count.
+}
+
+// endJob ends a job attempt's span and records its metrics.
+func (w *Worker) endJob(span trace.Span, done func(string, time.Duration), outcome string, began time.Time,
+	err error,
+) {
+	span.SetAttributes(obs.AttrOutcome.String(outcome))
+
+	if err != nil {
+		obs.Fail(span, err)
+		span.SetAttributes(obs.AttrRetryable.Bool(outcome == outcomeRetryable || outcome == outcomePublishError))
+	}
+
+	done(outcome, time.Since(began))
+}
+
+// queueWait is how long a job waited for its first delivery; -1 for a
+// redelivery, whose wait says nothing about the queue.
+func queueWait(md *jetstream.MsgMetadata, now time.Time) time.Duration {
+	if md.NumDelivered > 1 {
+		return -1
+	}
+
+	return max(now.Sub(md.Timestamp), 0)
 }
 
 // resolve reads a claim-checked job body. A read failure is retried while the
@@ -426,6 +528,11 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, md *jetstream.MsgMetadata
 		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: md.NumDelivered,
 		Traceparent: wj.Traceparent, Meta: wj.Meta, progress: w.progressSink(wj), store: &Store{in: w.in},
 	}
+
+	if tp := obs.Traceparent(ctx); tp != "" {
+		job.Traceparent = tp // the job span: a handler's outgoing calls continue it
+	}
+
 	job.logger = jobLogger(w.logger, job)
 
 	ref := cmd.TaskRef{Key: wj.Key, Generation: wj.Generation, Attempt: wj.Attempt}
@@ -440,7 +547,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, md *jetstream.MsgMetadata
 		"queue_wait", began.Sub(md.Timestamp))
 
 	res, err := w.call(ctx, job)
-	c, cerr := resultCmd(id, wj, ref, res, err)
+	c, cerr := resultCmd(id, wj, ref, res, err, w.report(ctx, job, began, res, err))
 
 	job.logger.DebugContext(ctx, "worker: job ended", "outcome", outcome(c), "duration", time.Since(began))
 
@@ -456,14 +563,58 @@ func outcome(c cmd.Command) string {
 
 	var f cmd.FailData
 	if json.Unmarshal(c.Data, &f) == nil && f.Retryable {
-		return "retryable_failed"
+		return outcomeRetryable
 	}
 
 	return "failed"
 }
 
+const outcomeRetryable = "retryable_failed"
+
+// failure is the error a fail command reports, nil for any other command.
+func failure(c cmd.Command) error {
+	if c.Type != cmd.Fail {
+		return nil
+	}
+
+	var f cmd.FailData
+	if err := json.Unmarshal(c.Data, &f); err != nil {
+		return err
+	}
+
+	return errors.New(f.Error)
+}
+
+// report is what the worker tells about an attempt besides its outcome. A
+// summary that cannot be encoded is dropped: it never fails the attempt.
+func (w *Worker) report(ctx context.Context, job *Job, started time.Time, res *Result, herr error) cmd.Report {
+	rep := cmd.Report{Started: started.UTC()}
+
+	summary := summaryOf(herr)
+	if herr == nil && res != nil {
+		summary = res.Summary
+	}
+
+	if summary == nil {
+		return rep
+	}
+
+	b, err := json.Marshal(summary)
+	if err != nil {
+		job.logger.WarnContext(ctx, "worker: summary dropped, it cannot be encoded", "err", err)
+
+		return rep
+	}
+
+	rep.Summary = b
+
+	return rep
+}
+
 // resultCmd turns what a handler returned into the command answering its job.
-func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error) (cmd.Command, error) {
+func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error, rep cmd.Report) (
+	cmd.Command, error,
+) {
 	var (
 		intr *InterruptError
 		c    cmd.Command
@@ -477,13 +628,15 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 			return failCmd(id, wj.ExecID, ref, merr.Error(), usageOf(herr))
 		}
 
-		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p, Usage: usageOf(herr)})
+		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{
+			TaskRef: ref, Payload: p, Usage: usageOf(herr), Report: rep,
+		})
 	case herr != nil:
 		c, err = cmd.New(id, cmd.Fail, wj.ExecID, cmd.FailData{
-			TaskRef: ref, Error: herr.Error(), Retryable: !IsPermanent(herr), Usage: usageOf(herr),
+			TaskRef: ref, Error: herr.Error(), Retryable: !IsPermanent(herr), Usage: usageOf(herr), Report: rep,
 		})
 	default:
-		c, err = completeCmd(id, wj, ref, res)
+		c, err = completeCmd(id, wj, ref, res, rep)
 	}
 
 	// A result that cannot be encoded (NaN usage, invalid raw JSON) would
@@ -524,7 +677,7 @@ func failCmd(id, execID string, ref cmd.TaskRef, msg string, usage map[string]fl
 	return c, err
 }
 
-func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Command, error) {
+func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, rep cmd.Report) (cmd.Command, error) {
 	if res == nil {
 		res = &Result{}
 	}
@@ -555,10 +708,11 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 
 	return cmd.New(id, cmd.Complete, wj.ExecID, cmd.CompleteData{
 		TaskRef: ref, Output: out, Writes: writes, Next: res.Next, Usage: res.Usage, CacheKey: wj.CacheKey,
+		Report: rep,
 	})
 }
 
-func (w *Worker) publish(ctx context.Context, wj wire.Job, c cmd.Command) error {
+func (w *Worker) publish(ctx context.Context, wj wire.Job, c cmd.Command, traceparent string) error {
 	b, err := json.Marshal(c)
 	if err != nil {
 		return err
@@ -569,8 +723,12 @@ func (w *Worker) publish(ctx context.Context, wj wire.Job, c cmd.Command) error 
 	m.Header.Set(cmd.HeaderType, string(c.Type))
 	m.Header.Set(wire.HeaderProtocol, infra.ProtocolVersion)
 
-	if wj.Traceparent != "" {
-		m.Header.Set(wire.HeaderTraceparent, wj.Traceparent)
+	if traceparent == "" {
+		traceparent = wj.Traceparent
+	}
+
+	if traceparent != "" {
+		m.Header.Set(wire.HeaderTraceparent, traceparent)
 	}
 
 	if m.Data, err = blob.Offload(ctx, w.in, wj.ExecID, b, m.Header); err != nil {
@@ -594,7 +752,7 @@ func (w *Worker) exhausted(ctx context.Context, msg jetstream.Msg, md *jetstream
 			Reason: "delivery_failed",
 		})
 	if err == nil {
-		err = w.publish(ctx, wj, c)
+		err = w.publish(ctx, wj, c, "")
 	}
 
 	if err != nil {

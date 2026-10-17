@@ -55,7 +55,7 @@ func TestWithUsageClassification(t *testing.T) {
 	ref := cmd.TaskRef{Key: "n", Generation: 1, Attempt: 1}
 
 	for _, c := range cases {
-		got, err := resultCmd("id", wj, ref, c.res, c.err)
+		got, err := resultCmd("id", wj, ref, c.res, c.err, cmd.Report{})
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}

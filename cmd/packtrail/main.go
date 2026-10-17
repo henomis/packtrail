@@ -25,21 +25,32 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail"
 	"github.com/henomis/packtrail/cmd/internal/logflags"
+	"github.com/henomis/packtrail/cmd/internal/telemetry"
 	"github.com/henomis/packtrail/flow"
 )
 
 // keyExecID names the execution id in JSON output.
 const keyExecID = "exec_id"
+
+// cmdRun names the command that hosts an engine; serviceName is the CLI's
+// OpenTelemetry service name.
+const (
+	cmdRun      = "run"
+	serviceName = "packtrail"
+)
 
 const usage = `usage: packtrail [-server URL] [-ns NAMESPACE] [-log-level L] [-log-format F] <command> [args]
 
@@ -47,7 +58,8 @@ const usage = `usage: packtrail [-server URL] [-ns NAMESPACE] [-log-level L] [-l
   -log-format text|json                  default $PACKTRAIL_LOG_FORMAT or text; logs go to stderr
 
 engine:
-  run [-flows DIR] [-partitions N]      run an engine until interrupted
+  run [-flows DIR] [-partitions N] [-metrics-addr ADDR]
+                                         run an engine until interrupted; -metrics-addr serves /metrics
   init [-flows DIR] [-partitions N]     provision the namespace and register flows
   rebuild-index                          rebuild the visibility index from the log
   archive <exec>                         archive a finished execution now
@@ -66,6 +78,7 @@ executions:
   cancel <exec> [-reason TEXT]
   get <exec> [-seq N]                    state now, or right after event N
   history <exec>
+  timeline <exec>                        steps with their queue and run times, outcome, usage and summary
   watch <exec>                           stream events until the execution ends
   progress <exec>                        stream workers' progress messages (JSON lines) until it ends
   wait <exec>
@@ -133,6 +146,15 @@ func run(args []string, out io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if rest[0] != cmdRun { // run sets up its own, with -metrics-addr
+		tel, terr := telemetry.Setup(ctx, telemetry.Config{ServiceName: serviceName})
+		if terr != nil {
+			return terr
+		}
+
+		defer func() { _ = tel.Shutdown() }()
+	}
+
 	nc, err := nats.Connect(a.server, nats.Name("packtrail-cli"))
 	if err != nil {
 		return err
@@ -151,12 +173,13 @@ func run(args []string, out io.Writer) error {
 
 func (a *app) dispatch(ctx context.Context, name string, args []string) error {
 	handlers := map[string]func(context.Context, []string) error{
-		"run": a.runEngine, "init": a.initEngine, "rebuild-index": a.rebuildIndex, "archive": a.archive,
+		cmdRun: a.runEngine, "init": a.initEngine, "rebuild-index": a.rebuildIndex, "archive": a.archive,
 		"delete":   a.delete,
 		"register": a.register, "flows": a.flows, "start": a.start, "signal": a.signal, "update": a.update,
 		"resume": a.resume,
-		"cancel": a.cancel, "get": a.get, "history": a.history, "watch": a.watch, "progress": a.progress,
-		"wait": a.wait, "fork": a.fork,
+		"cancel": a.cancel, "get": a.get, "history": a.history, "timeline": a.timeline, "watch": a.watch,
+		"progress": a.progress,
+		"wait":     a.wait, "fork": a.fork,
 		"rerun": a.rerun, "list": a.list, "schedule": a.schedule, "unschedule": a.unschedule,
 		"schedules": a.schedules, "dlq": a.dlq, "redrive": a.redrive, "quarantined": a.quarantined,
 		"unquarantine": a.unquarantine,
@@ -247,13 +270,66 @@ func (a *app) engine(fs *flag.FlagSet, args []string) (*packtrail.Engine, error)
 }
 
 func (a *app) runEngine(ctx context.Context, args []string) error {
-	eng, err := a.engine(flag.NewFlagSet("run", flag.ContinueOnError), args)
+	fs := flag.NewFlagSet(cmdRun, flag.ContinueOnError)
+	metricsAddr := fs.String("metrics-addr", os.Getenv("PACKTRAIL_METRICS_ADDR"),
+		"serve Prometheus metrics on this address at /metrics")
+
+	eng, err := a.engine(fs, args)
 	if err != nil {
 		return err
 	}
 
+	tel, err := telemetry.Setup(ctx, telemetry.Config{ServiceName: serviceName, Prometheus: *metricsAddr != ""})
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = tel.Shutdown() }()
+
+	if *metricsAddr != "" {
+		stopMetrics, merr := serveMetrics(ctx, *metricsAddr, tel.Handler, a.logger)
+		if merr != nil {
+			return merr
+		}
+
+		defer stopMetrics()
+	}
+
 	return eng.Run(ctx)
 }
+
+// serveMetrics serves h at /metrics on addr until the returned function is
+// called.
+func serveMetrics(ctx context.Context, addr string, h http.Handler, logger *slog.Logger) (func(), error) {
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: %w", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", h)
+
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: metricsReadTimeout}
+
+	go func() {
+		if serr := srv.Serve(ln); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+			logger.Error("packtrail: metrics server", "err", serr)
+		}
+	}()
+
+	logger.InfoContext(ctx, "packtrail: metrics endpoint", "addr", ln.Addr().String())
+
+	return func() {
+		sh, cancel := context.WithTimeout(context.Background(), metricsReadTimeout)
+		defer cancel()
+
+		_ = srv.Shutdown(sh)
+	}, nil
+}
+
+// metricsReadTimeout bounds reading a scrape request's header and shutting
+// the metrics server down.
+const metricsReadTimeout = 5 * time.Second
 
 func (a *app) initEngine(ctx context.Context, args []string) error {
 	eng, err := a.engine(flag.NewFlagSet("init", flag.ContinueOnError), args)
@@ -525,6 +601,20 @@ func (a *app) get(ctx context.Context, args []string) error {
 	}
 
 	return a.print(st)
+}
+
+func (a *app) timeline(ctx context.Context, args []string) error {
+	pos, err := parse(flag.NewFlagSet("timeline", flag.ContinueOnError), args, 1)
+	if err != nil {
+		return err
+	}
+
+	tl, err := a.client.Timeline(ctx, pos[0])
+	if err != nil {
+		return err
+	}
+
+	return a.print(tl)
 }
 
 func (a *app) history(ctx context.Context, args []string) error {

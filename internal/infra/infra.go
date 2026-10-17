@@ -28,9 +28,11 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/internal/apierr"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 )
 
 // MetaPartitions is the command-stream metadata key holding the partition
@@ -70,6 +72,8 @@ type Infra struct {
 	Names      names.Names
 	Partitions int
 	Logger     *slog.Logger
+	// Tracer creates packtrail's spans (default: from the global provider).
+	Tracer trace.Tracer
 	// BlobThreshold is the body size above which a message body is moved to
 	// the blobs object store (claim-check).
 	BlobThreshold int
@@ -104,7 +108,7 @@ func New(nc *nats.Conn, ns names.Names, logger *slog.Logger) (*Infra, error) {
 	}
 
 	return &Infra{
-		NC: nc, JS: js, Names: ns, Logger: logger, Partitions: DefaultPartitions,
+		NC: nc, JS: js, Names: ns, Logger: logger, Tracer: obs.Tracer(nil), Partitions: DefaultPartitions,
 		BlobThreshold: DefaultBlobThreshold(nc), ReadTimeout: DefaultReadTimeout, BlobTimeout: DefaultBlobTimeout,
 		kvs: map[string]jetstream.KeyValue{}, obs: map[string]jetstream.ObjectStore{},
 	}, nil

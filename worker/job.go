@@ -209,6 +209,10 @@ type Result struct {
 	Next string
 	// Usage reports generic counters (budgets).
 	Usage map[string]float64
+	// Summary describes what the attempt did (any value that encodes to
+	// JSON): it is recorded on the attempt's event, for timelines and
+	// audits, and never read by the flow. Keep it small.
+	Summary any
 }
 
 // Error classes.
@@ -255,6 +259,38 @@ func WithUsage(err error, usage map[string]float64) error {
 	}
 
 	return &UsageError{Err: err, Usage: usage}
+}
+
+// SummaryError carries the summary of a run that ended with an error (see
+// WithSummary). It unwraps to Err, so the error is classified as Err is.
+type SummaryError struct {
+	Err     error
+	Summary any
+}
+
+func (e *SummaryError) Error() string { return e.Err.Error() }
+func (e *SummaryError) Unwrap() error { return e.Err }
+
+// WithSummary attaches a summary to the error a handler returns, so a run
+// that interrupts or fails still records what it did, as Result.Summary does
+// for a run that completes. It composes with WithUsage, Interrupt,
+// Permanent and %w wrapping in any order. WithSummary(nil, …) is nil.
+func WithSummary(err error, summary any) error {
+	if err == nil {
+		return nil
+	}
+
+	return &SummaryError{Err: err, Summary: summary}
+}
+
+// summaryOf returns the summary attached to err, if any.
+func summaryOf(err error) any {
+	var s *SummaryError
+	if errors.As(err, &s) {
+		return s.Summary
+	}
+
+	return nil
 }
 
 // usageOf returns the usage attached to err, if any.

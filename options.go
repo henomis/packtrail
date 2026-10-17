@@ -20,6 +20,9 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/henomis/packtrail/flow"
 	"github.com/henomis/packtrail/internal/infra"
 )
@@ -42,6 +45,8 @@ type config struct {
 	historyLimit  int
 	drain         time.Duration
 	logger        *slog.Logger
+	tracer        trace.TracerProvider
+	meter         metric.MeterProvider
 	cacheSize     int
 	clock         func() time.Time
 	blobThreshold int
@@ -284,6 +289,34 @@ func WithBlobTimeout(d time.Duration) Option {
 		}
 
 		c.timeouts.blob = d
+
+		return nil
+	}
+}
+
+// WithTracerProvider sets where the engine's spans go (default: the global
+// OpenTelemetry provider, a no-op until the application installs an SDK).
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(c *config) error {
+		if tp == nil {
+			return fmt.Errorf("%w: nil tracer provider", ErrInvalidArgument)
+		}
+
+		c.tracer = tp
+
+		return nil
+	}
+}
+
+// WithMeterProvider sets where the engine's metrics go (default: the global
+// OpenTelemetry provider, a no-op until the application installs an SDK).
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(c *config) error {
+		if mp == nil {
+			return fmt.Errorf("%w: nil meter provider", ErrInvalidArgument)
+		}
+
+		c.meter = mp
 
 		return nil
 	}

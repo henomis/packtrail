@@ -25,6 +25,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/henomis/packtrail/event"
 	"github.com/henomis/packtrail/flow"
@@ -34,6 +36,7 @@ import (
 	"github.com/henomis/packtrail/internal/infra"
 	"github.com/henomis/packtrail/internal/loader"
 	"github.com/henomis/packtrail/internal/names"
+	"github.com/henomis/packtrail/internal/obs"
 	"github.com/henomis/packtrail/internal/projection"
 	"github.com/henomis/packtrail/internal/registry"
 	"github.com/henomis/packtrail/internal/snapshot"
@@ -68,6 +71,7 @@ type Client struct {
 	ns       string
 	timeouts timeouts
 	logger   *slog.Logger
+	tracer   trace.TracerProvider
 
 	// attachMu guards attaching: in and ld are set by the first attach that
 	// succeeds, and never change after.
@@ -101,6 +105,22 @@ func WithClientLogger(l *slog.Logger) ClientOption {
 		}
 
 		c.logger = l
+
+		return nil
+	}
+}
+
+// WithClientTracerProvider sets where the client's spans go (default: the
+// global OpenTelemetry provider). Start, Signal, Resume, Cancel, Update, Fork
+// and Unquarantine each run in a span whose context the command carries, so
+// the engine's work continues the caller's trace.
+func WithClientTracerProvider(tp trace.TracerProvider) ClientOption {
+	return func(c *Client) error {
+		if tp == nil {
+			return fmt.Errorf("%w: nil tracer provider", ErrInvalidArgument)
+		}
+
+		c.tracer = tp
 
 		return nil
 	}
@@ -169,6 +189,8 @@ func (c *Client) attach(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	in.Tracer = obs.Tracer(c.tracer)
 
 	if err = in.Attach(ctx); err != nil {
 		return err
@@ -293,10 +315,16 @@ func (c *Client) Start(ctx context.Context, flowName string, input any, opts ...
 		return "", err
 	}
 
-	r, published, rerr := c.request(ctx, start, o.trace, true)
+	ctx, span := c.span(ctx, o.trace, "packtrail.start "+flowName, obs.AttrExecID.String(o.id),
+		obs.AttrFlow.String(flowName))
+	defer span.End()
+
+	r, published, rerr := c.request(ctx, start, obs.Traceparent(ctx), true)
 	if rerr == nil && r.lost {
 		rerr = c.checkStartedFlow(ctx, o.id, flowName)
 	}
+
+	obs.Fail(span, rerr)
 
 	switch {
 	case errors.Is(rerr, ErrExecutionConflict):
@@ -358,7 +386,9 @@ func (c *Client) exists(ctx context.Context, execID string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, execID)
 }
 
-func (c *Client) send(ctx context.Context, id string, t cmd.Type, execID string, data any) error {
+func (c *Client) send(ctx context.Context, id string, t cmd.Type, execID string, data any,
+	attrs ...attribute.KeyValue,
+) error {
 	if err := c.exists(ctx, execID); err != nil {
 		return err
 	}
@@ -368,7 +398,28 @@ func (c *Client) send(ctx context.Context, id string, t cmd.Type, execID string,
 		return err
 	}
 
-	return wire.PublishCmd(ctx, c.in, command, "")
+	ctx, span := c.span(ctx, "", "packtrail."+string(t), append(attrs, obs.AttrExecID.String(execID),
+		obs.AttrCommandID.String(id))...)
+	defer span.End()
+
+	err = wire.PublishCmd(ctx, c.in, command, obs.Traceparent(ctx))
+	obs.Fail(span, err)
+
+	return err
+}
+
+// span starts the span of a client operation: a child of parent (a W3C
+// traceparent) when given, else of the span in ctx, else a new trace.
+func (c *Client) span(ctx context.Context, parent, name string, attrs ...attribute.KeyValue) (
+	context.Context, trace.Span,
+) {
+	tracer := obs.Tracer(c.tracer)
+	if c.attached() {
+		tracer = c.in.Tracer
+	}
+
+	return tracer.Start(obs.ContextWithTraceparent(ctx, parent), name,
+		trace.WithSpanKind(trace.SpanKindProducer), trace.WithAttributes(attrs...))
 }
 
 // SignalOption configures Signal.
@@ -396,7 +447,7 @@ func (c *Client) Signal(ctx context.Context, execID, name string, payload any, o
 		o(&id)
 	}
 
-	return c.send(ctx, id, cmd.Signal, execID, cmd.SignalData{Name: name, Payload: b})
+	return c.send(ctx, id, cmd.Signal, execID, cmd.SignalData{Name: name, Payload: b}, obs.AttrSignal.String(name))
 }
 
 // Resume re-runs an interrupted node, passing value to its worker as
@@ -603,7 +654,13 @@ func (c *Client) Unquarantine(ctx context.Context, execID string) error {
 		return err
 	}
 
-	return wire.PublishCmd(ctx, c.in, command, "")
+	ctx, span := c.span(ctx, "", "packtrail.unquarantine", obs.AttrExecID.String(execID))
+	defer span.End()
+
+	err = wire.PublishCmd(ctx, c.in, command, obs.Traceparent(ctx))
+	obs.Fail(span, err)
+
+	return err
 }
 
 // ListFilter selects executions in List. Empty fields match everything.
@@ -693,7 +750,12 @@ func (c *Client) fork(ctx context.Context, execID string, seq uint64, opts []For
 		return "", err
 	}
 
-	if _, published, rerr := c.request(ctx, f, "", true); rerr != nil {
+	ctx, span := c.span(ctx, "", "packtrail.fork", obs.AttrExecID.String(o.id), obs.AttrSourceExecID.String(execID))
+	defer span.End()
+
+	if _, published, rerr := c.request(ctx, f, obs.Traceparent(ctx), true); rerr != nil {
+		obs.Fail(span, rerr)
+
 		if published {
 			return o.id, rerr
 		}
@@ -788,8 +850,13 @@ func (c *Client) Update(ctx context.Context, execID string, writes map[string]an
 		return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 
-	r, _, err := c.request(ctx, command, "", false)
+	ctx, span := c.span(ctx, "", "packtrail.update", obs.AttrExecID.String(execID), obs.AttrCommandID.String(id))
+	defer span.End()
+
+	r, _, err := c.request(ctx, command, obs.Traceparent(ctx), false)
 	if err != nil {
+		obs.Fail(span, err)
+
 		return nil, err
 	}
 

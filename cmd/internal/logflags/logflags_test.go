@@ -16,11 +16,14 @@ package logflags
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"strings"
 	"testing"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 func parse(t *testing.T, args ...string) *Flags {
@@ -83,5 +86,30 @@ func TestInvalid(t *testing.T) {
 		if _, err := parse(t, args...).NewLogger(&bytes.Buffer{}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%v: err %v", args, err)
 		}
+	}
+}
+
+func TestTraceIDs(t *testing.T) {
+	var buf bytes.Buffer
+
+	l, err := parse(t, "-log-format", "json").NewLogger(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tid, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	sid, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+	ctx := trace.ContextWithSpanContext(context.Background(),
+		trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid}))
+
+	l.InfoContext(ctx, "plain")
+	l.With("trace_id", "bound").InfoContext(ctx, "bound")
+	l.WithGroup("g").InfoContext(ctx, "grouped", "k", "v")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 || !strings.Contains(lines[0], `"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"`) ||
+		!strings.Contains(lines[0], `"span_id":"00f067aa0ba902b7"`) ||
+		strings.Count(lines[1], "trace_id") != 1 || strings.Contains(lines[2], "trace_id") {
+		t.Fatalf("lines:\n%s", buf.String())
 	}
 }

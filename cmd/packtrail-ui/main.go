@@ -44,6 +44,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail/cmd/internal/logflags"
+	"github.com/henomis/packtrail/cmd/internal/telemetry"
 	"github.com/henomis/packtrail/internal/names"
 )
 
@@ -88,6 +89,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	tel, err := telemetry.Setup(ctx, telemetry.Config{ServiceName: "packtrail-ui"})
+	if err != nil {
+		logger.Error("telemetry", "err", err)
+		os.Exit(1)
+	}
+
+	defer func() { _ = tel.Shutdown() }()
 
 	static, _ := fs.Sub(webFS, "web")
 	ui := newAPI(nc, *ns, allow)

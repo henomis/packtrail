@@ -19,6 +19,7 @@
 package logflags
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -62,14 +65,54 @@ func (f *Flags) NewLogger(w io.Writer) (*slog.Logger, error) {
 
 	opts := &slog.HandlerOptions{Level: level}
 
+	var h slog.Handler
+
 	switch strings.ToLower(f.Format) {
 	case formatText:
-		return slog.New(slog.NewTextHandler(w, opts)), nil
+		h = slog.NewTextHandler(w, opts)
 	case formatJSON:
-		return slog.New(slog.NewJSONHandler(w, opts)), nil
+		h = slog.NewJSONHandler(w, opts)
 	default:
 		return nil, fmt.Errorf("%w: log format %q (want text or json)", ErrInvalid, f.Format)
 	}
+
+	return slog.New(traceHandler{Handler: h}), nil
+}
+
+// traceHandler adds trace_id and span_id to records logged with a context
+// holding a span, so log lines and traces join. A trace_id already bound
+// to the logger (a worker's job logger) is not repeated. Once the logger
+// has a group, the ids would land inside it: they are left out.
+type traceHandler struct {
+	slog.Handler
+
+	traceBound bool
+	grouped    bool
+}
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() && !h.grouped {
+		if !h.traceBound {
+			r.AddAttrs(slog.String("trace_id", sc.TraceID().String()))
+		}
+
+		r.AddAttrs(slog.String("span_id", sc.SpanID().String()))
+	}
+
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	bound := h.traceBound
+	for _, a := range attrs {
+		bound = bound || (a.Key == "trace_id" && !h.grouped)
+	}
+
+	return traceHandler{Handler: h.Handler.WithAttrs(attrs), traceBound: bound, grouped: h.grouped}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{Handler: h.Handler.WithGroup(name), traceBound: h.traceBound, grouped: h.grouped || name != ""}
 }
 
 func envOr(key, def string) string {

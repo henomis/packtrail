@@ -65,6 +65,7 @@ const (
 	JoinAll    = "all"
 	JoinAny    = "any"
 	JoinQuorum = "quorum"
+	JoinMin    = "min"
 )
 
 // Retry backoff kinds.
@@ -306,7 +307,10 @@ type Node struct {
 
 	// join
 	WaitFor []string `yaml:"wait_for,omitempty" json:"wait_for,omitempty"`
-	Policy  string   `yaml:"policy,omitempty" json:"policy,omitempty"`
+	// Policy is all (default), any or quorum:N, which settle as soon as the
+	// outcome is known and cancel the branches still running, or min:N,
+	// which waits for every branch and succeeds when N of them did.
+	Policy string `yaml:"policy,omitempty" json:"policy,omitempty"`
 
 	// await (Timeout is required)
 	Signal    string `yaml:"signal,omitempty" json:"signal,omitempty"`
@@ -414,8 +418,9 @@ func (f *Flow) Clone() (*Flow, error) {
 	return ParseJSON(b)
 }
 
-// JoinKind returns the join policy and, for quorum, the required count.
-func (n *Node) JoinKind() (kind string, quorum int) {
+// JoinKind returns the join policy and, for quorum and min, the
+// required count (-1 when it is not a number).
+func (n *Node) JoinKind() (kind string, count int) {
 	p := strings.TrimSpace(n.Policy)
 
 	switch {
@@ -424,11 +429,21 @@ func (n *Node) JoinKind() (kind string, quorum int) {
 	case p == JoinAny:
 		return JoinAny, 0
 	case strings.HasPrefix(p, JoinQuorum+":"):
-		q, _ := strconv.Atoi(strings.TrimPrefix(p, JoinQuorum+":"))
-		return JoinQuorum, q
+		return JoinQuorum, joinCount(strings.TrimPrefix(p, JoinQuorum+":"))
+	case strings.HasPrefix(p, JoinMin+":"):
+		return JoinMin, joinCount(strings.TrimPrefix(p, JoinMin+":"))
 	default:
 		return p, 0
 	}
+}
+
+func joinCount(s string) int {
+	q, err := strconv.Atoi(s)
+	if err != nil {
+		return -1
+	}
+
+	return q
 }
 
 // MaxAttempts returns the attempt budget of a task (at least 1).

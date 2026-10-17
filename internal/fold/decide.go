@@ -872,7 +872,8 @@ func (d *decider) fanout(n *flow.Node) error {
 
 // evalJoin settles the join of fan-out fan when its policy is decided: enough
 // successes, or too many failures for the policy to still be met. Branches
-// still in flight are cancelled (their late completions become stale).
+// still in flight are cancelled (their late completions become stale). A
+// min join is decided only once every branch has finished.
 func (d *decider) evalJoin(fan string) error {
 	f := d.st.Fans[fan]
 	join := d.def.Node(f.Join)
@@ -894,12 +895,17 @@ func (d *decider) evalJoin(fan string) error {
 	}
 
 	need := len(waits)
+	kind, q := join.JoinKind()
 
-	switch kind, q := join.JoinKind(); kind {
+	switch kind {
 	case flow.JoinAny:
 		need = 1
-	case flow.JoinQuorum:
+	case flow.JoinQuorum, flow.JoinMin:
 		need = q
+	}
+
+	if kind == flow.JoinMin && pending > 0 {
+		return nil // waits for every branch
 	}
 
 	ok := len(succeeded) >= need

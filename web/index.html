@@ -157,7 +157,7 @@
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--fan"></span>Fan-out, join &amp; map</h3>
-      <p>Static branches joined with <code>all</code>, <code>any</code> or <code>quorum:N</code>; dynamic maps over a list computed at run time, with bounded parallelism and ordered results.</p>
+      <p>Static branches joined with <code>all</code>, <code>any</code>, <code>quorum:N</code> or <code>min:N</code>; dynamic maps over a list computed at run time, with bounded parallelism and ordered results.</p>
     </article>
     <article class="feature reveal">
       <h3><span class="dot dot--choice"></span>Typed state channels</h3>
@@ -284,7 +284,7 @@
     <div class="optlist reveal">
       <div class="optlist__row"><code><span class="dot dot--task"></span> task</code><span>A job for a worker of <code>kind</code>; retries, timeout, cache, concurrency, output schema, dynamic edges.</span></div>
       <div class="optlist__row"><code><span class="dot dot--choice"></span> choice</code><span>First matching <code>when</code> rule wins; exactly one <code>default</code>.</span></div>
-      <div class="optlist__row"><code><span class="dot dot--fan"></span> fanout · join</code><span>Parallel task branches, closed by a join with <code>all</code>, <code>any</code> or <code>quorum:N</code>.</span></div>
+      <div class="optlist__row"><code><span class="dot dot--fan"></span> fanout · join</code><span>Parallel task branches, closed by a join with <code>all</code>, <code>any</code>, <code>quorum:N</code> or <code>min:N</code>.</span></div>
       <div class="optlist__row"><code><span class="dot dot--await"></span> await</code><span>Wait for a named signal; <code>timeout</code> is mandatory, <code>on_timeout</code> routes.</span></div>
       <div class="optlist__row"><code><span class="dot dot--map"></span> map</code><span>One task per element of <code>over</code>, at most <code>max_parallel</code> at a time.</span></div>
       <div class="optlist__row"><code><span class="dot dot--subflow"></span> subflow</code><span>Run another flow as a child; its output and counters flow back.</span></div>

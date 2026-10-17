@@ -501,10 +501,10 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <table class="doctable">
         <thead><tr><th>join field</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. Once settled, branches still running are cancelled — a subflow branch's child too, unless its <code>on_parent_close</code> is <code>abandon</code>: then it carries on, unlinked from the join.</td></tr>
+          <tr><td>policy</td><td><code>all</code> (default): every branch must succeed. <code>any</code>: the first success settles it. <code>quorum:N</code>: N successes. These settle as soon as the outcome is known; branches still running are then cancelled — a subflow branch's child too, unless its <code>on_parent_close</code> is <code>abandon</code>: then it carries on, unlinked from the join. <code>min:N</code>: waits for every branch, then succeeds if at least N did (<code>min:0</code> never fails); the output holds every success, and <code>branches</code> and <code>errors</code> tell which failed and why — the way to tolerate failures without losing results.</td></tr>
           <tr><td>wait_for</td><td>The branches the policy counts (default: all branches of the fanout).</td></tr>
           <tr><td>next</td><td>Successor once the policy is met.</td></tr>
-          <tr><td>on_failure</td><td>Handler when the policy can no longer be met; without it the execution fails with <code>join_failed</code>.</td></tr>
+          <tr><td>on_failure</td><td>Handler when the policy can no longer be met (for <code>min:N</code>, once every branch has finished); without it the execution fails with <code>join_failed</code>.</td></tr>
         </tbody>
       </table>
       <p>

@@ -600,6 +600,85 @@ func TestFanoutQuorum(t *testing.T) {
 	y.status(StatusFailed) // quorum unreachable
 }
 
+func TestFanoutMinWaitsForEveryBranch(t *testing.T) {
+	// min:1 is met by b, yet the join waits for c instead of cancelling it.
+	x := newH(t, fmt.Sprintf(fanFlow, "'min:1'"))
+	x.start(`{}`)
+	x.failT("a", false)
+	x.ok("b", `{"v":2}`)
+
+	if _, ok := x.st.Tasks["z"]; ok {
+		t.Fatal("min settled before every branch finished")
+	}
+
+	x.task("c")
+	x.ok("c", `{"v":3}`)
+	x.task("z")
+
+	var out map[string]any
+
+	_ = json.Unmarshal(x.st.Results["j"], &out)
+
+	if len(out) != 2 || out["b"] == nil || out["c"] == nil {
+		t.Fatalf("join output %s", x.st.Results["j"])
+	}
+
+	if x.st.Branches["a"] != BranchFailed || x.st.Branches["c"] != BranchCompleted {
+		t.Fatalf("branches %v", x.st.Branches)
+	}
+
+	if _, ok := x.st.Errors["a"]; !ok {
+		t.Fatalf("errors %v", x.st.Errors)
+	}
+
+	// Unmet once every branch has finished, not before.
+	y := newH(t, fmt.Sprintf(fanFlow, "'min:2'"))
+	y.start(`{}`)
+	y.failT("a", false)
+	y.failT("b", false)
+	y.status(StatusRunning)
+	y.ok("c", `{}`)
+	y.status(StatusFailed)
+
+	if y.st.Reason != event.ReasonJoin {
+		t.Fatalf("reason = %s", y.st.Reason)
+	}
+
+	// min:0 never fails: downstream reads branches and errors.
+	w := newH(t, fmt.Sprintf(fanFlow, "'min:0'"))
+	w.start(`{}`)
+	w.failT("a", false)
+	w.failT("b", false)
+	w.failT("c", false)
+	w.task("z")
+
+	if string(w.st.Results["j"]) != `{}` {
+		t.Fatalf("join output %s", w.st.Results["j"])
+	}
+}
+
+func TestFanoutMinOnFailure(t *testing.T) {
+	x := newH(t, `
+name: fan
+nodes:
+  - {id: f, type: fanout, branches: [a, b], next: j}
+  - {id: a, type: task, kind: k}
+  - {id: b, type: task, kind: k}
+  - {id: j, type: join, policy: 'min:2', next: z, on_failure: h}
+  - {id: z, type: task, kind: k}
+  - {id: h, type: task, kind: k}
+`)
+	x.start(`{}`)
+	x.failT("a", false)
+	x.task("b")
+	x.ok("b", `{}`)
+	x.task("h")
+
+	if x.st.Branches["b"] != BranchCompleted || string(x.st.Results["j"]) != `{"b":{}}` {
+		t.Fatalf("branches %v output %s", x.st.Branches, x.st.Results["j"])
+	}
+}
+
 func TestFanoutRevisitUsesFreshState(t *testing.T) {
 	x := newH(t, `
 name: loop

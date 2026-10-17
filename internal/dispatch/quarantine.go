@@ -148,7 +148,7 @@ func (d *Dispatcher) quarantine(ctx context.Context, msg jetstream.Msg, execID s
 	d.markQuarantined(execID)
 	d.Cache.Drop(execID)
 	d.Metrics.DeadLetters.Add(1)
-	d.In.Logger.Error("packtrail: execution quarantined", "exec", execID, "reason", reason)
+	d.In.Logger.ErrorContext(ctx, "packtrail: execution quarantined", "exec", execID, "reason", reason)
 
 	return nil
 }
@@ -172,7 +172,7 @@ func (d *Dispatcher) handleQuarantined(ctx context.Context, msg jetstream.Msg, e
 			return
 		}
 
-		d.In.Logger.Warn("packtrail: quarantined decision unreadable, will retry", "exec", execID,
+		d.In.Logger.WarnContext(ctx, "packtrail: quarantined decision unreadable, will retry", "exec", execID,
 			"deliveries", delivered, "err", err)
 
 		_ = msg.NakWithDelay(backoff(delivered))
@@ -195,7 +195,7 @@ func (d *Dispatcher) handleQuarantined(ctx context.Context, msg jetstream.Msg, e
 			delivered = md.NumDelivered
 		}
 
-		d.In.Logger.Warn("packtrail: closing a quarantined execution failed, will retry", "exec", execID,
+		d.In.Logger.WarnContext(ctx, "packtrail: closing a quarantined execution failed, will retry", "exec", execID,
 			"err", err)
 
 		_ = msg.NakWithDelay(backoff(delivered))

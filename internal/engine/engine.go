@@ -246,7 +246,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 		_ = msg.Ack()
 	case errors.Is(err, fold.ErrRejected):
 		// Refused in the execution's current state: final, not poison.
-		e.In.Logger.Info("packtrail: command rejected", "exec", c.ExecID, "type", c.Type, "err", err)
+		e.In.Logger.InfoContext(ctx, "packtrail: command rejected", "exec", c.ExecID, "type", c.Type, "err", err)
 
 		_ = msg.Ack()
 	case isNotFound(err) && n < notFoundGrace:
@@ -262,7 +262,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 		e.reply(c, wire.Reply{Code: wire.ReplyNotFound, Error: err.Error()})
 
 		if archived, aerr := e.Loader.IsArchived(ctx, c.ExecID); aerr == nil && archived {
-			e.In.Logger.Info("packtrail: command for archived execution ignored", "exec", c.ExecID, "type", c.Type)
+			e.In.Logger.InfoContext(ctx, "packtrail: command for archived execution ignored", "exec", c.ExecID, "type", c.Type)
 
 			_ = msg.Ack()
 
@@ -279,7 +279,7 @@ func (e *Engine) ackOrRetry(ctx context.Context, msg jetstream.Msg, c cmd.Comman
 			return
 		}
 
-		e.In.Logger.Warn("packtrail: command failed, will retry", "exec", c.ExecID, "type", c.Type,
+		e.In.Logger.WarnContext(ctx, "packtrail: command failed, will retry", "exec", c.ExecID, "type", c.Type,
 			"deliveries", n, "err", err)
 
 		_ = msg.NakWithDelay(retryDelay(n))
@@ -319,7 +319,7 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	d.Subject, d.Header, d.Body = msg.Subject(), msg.Headers(), msg.Data()
 
 	if err := wire.PublishDLQ(ctx, e.In, d, dedup); err != nil {
-		e.In.Logger.Error("packtrail: dead letter failed", "err", err)
+		e.In.Logger.ErrorContext(ctx, "packtrail: dead letter failed", "err", err)
 
 		_ = msg.NakWithDelay(nakDelay)
 
@@ -327,10 +327,10 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 	}
 
 	e.Metrics.DeadLetters.Add(1)
-	e.In.Logger.Warn("packtrail: dead-lettered", "kind", d.Kind, "key", d.Key, "reason", d.Reason)
+	e.In.Logger.WarnContext(ctx, "packtrail: dead-lettered", "kind", d.Kind, "key", d.Key, "reason", d.Reason)
 
 	if err := msg.Term(); err != nil {
-		e.In.Logger.Warn("packtrail: term failed", "err", err)
+		e.In.Logger.WarnContext(ctx, "packtrail: term failed", "err", err)
 	}
 }
 
@@ -338,6 +338,8 @@ func (e *Engine) deadLetterAs(ctx context.Context, msg jetstream.Msg, d wire.Dea
 // sequence of the stored decision (for a no-op, of the last one) and whether
 // the decision appended events.
 func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64, bool, error) {
+	began := time.Now()
+
 	for range maxConflicts {
 		ent, expected, evs, err := e.decide(ctx, c)
 		if err != nil {
@@ -376,6 +378,9 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 		e.Cache.Put(c.ExecID, ent)
 
 		e.afterAppend(ctx, c.ExecID, ent, before)
+
+		e.In.Logger.DebugContext(ctx, "packtrail: decision applied", "exec", c.ExecID, "type", c.Type, "cmd", c.ID,
+			"events", len(evs), "seq", last, "duration", time.Since(began))
 
 		return last, true, nil
 	}
@@ -437,7 +442,7 @@ func (e *Engine) abortTooLarge(ctx context.Context, c cmd.Command,
 		return ent, nil, err
 	}
 
-	e.In.Logger.Error("packtrail: decision too large, execution failed", "exec", c.ExecID, "events", n)
+	e.In.Logger.ErrorContext(ctx, "packtrail: decision too large, execution failed", "exec", c.ExecID, "events", n)
 
 	return ent, out, nil
 }
@@ -559,13 +564,13 @@ func (e *Engine) decideFork(ctx context.Context, st *fold.State, c cmd.Command,
 func (e *Engine) afterAppend(ctx context.Context, execID string, ent statecache.Entry, before int) {
 	if e.Loader.Snaps.Due(before, ent.State.Events) {
 		if err := e.Loader.Snaps.Save(ctx, ent.State); err != nil {
-			e.In.Logger.Warn("packtrail: snapshot failed", "exec", execID, "err", err)
+			e.In.Logger.WarnContext(ctx, "packtrail: snapshot failed", "exec", execID, "err", err)
 		}
 	}
 
 	if e.HistoryLimit > 0 && ent.State.Events-ent.State.Base >= e.HistoryLimit {
 		if err := e.continueAsNew(ctx, execID, ent); err != nil {
-			e.In.Logger.Warn("packtrail: continue-as-new failed", "exec", execID, "err", err)
+			e.In.Logger.WarnContext(ctx, "packtrail: continue-as-new failed", "exec", execID, "err", err)
 		}
 	}
 }
@@ -643,7 +648,7 @@ func (e *Engine) continueAsNew(ctx context.Context, execID string, ent statecach
 	e.Metrics.EventsAppended.Add(int64(len(out)))
 
 	if err = e.Loader.Snaps.Save(ctx, next); err != nil {
-		e.In.Logger.Warn("packtrail: snapshot failed", "exec", execID, "err", err)
+		e.In.Logger.WarnContext(ctx, "packtrail: snapshot failed", "exec", execID, "err", err)
 	}
 
 	// Purge only what the dispatcher already processed: a message it has not

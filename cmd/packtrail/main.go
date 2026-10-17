@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -33,13 +34,17 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/henomis/packtrail"
+	"github.com/henomis/packtrail/cmd/internal/logflags"
 	"github.com/henomis/packtrail/flow"
 )
 
 // keyExecID names the execution id in JSON output.
 const keyExecID = "exec_id"
 
-const usage = `usage: packtrail [-server URL] [-ns NAMESPACE] <command> [args]
+const usage = `usage: packtrail [-server URL] [-ns NAMESPACE] [-log-level L] [-log-format F] <command> [args]
+
+  -log-level debug|info|warn|error       default $PACKTRAIL_LOG_LEVEL or info
+  -log-format text|json                  default $PACKTRAIL_LOG_FORMAT or text; logs go to stderr
 
 engine:
   run [-flows DIR] [-partitions N]      run an engine until interrupted
@@ -91,6 +96,7 @@ type app struct {
 	ns     string
 	nc     *nats.Conn
 	client *packtrail.Client
+	logger *slog.Logger
 }
 
 func run(args []string, out io.Writer) error {
@@ -99,11 +105,19 @@ func run(args []string, out io.Writer) error {
 
 	global.StringVar(&a.server, "server", envOr("NATS_URL", nats.DefaultURL), "NATS server URL")
 	global.StringVar(&a.ns, "ns", envOr("PACKTRAIL_NAMESPACE", "packtrail"), "namespace")
+	logs := logflags.Register(global, "PACKTRAIL")
 	global.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
 	if err := global.Parse(args); err != nil {
 		return err
 	}
+
+	logger, err := logs.NewLogger(os.Stderr)
+	if err != nil {
+		return err
+	}
+
+	a.logger = logger
 
 	rest := global.Args()
 	if len(rest) == 0 {
@@ -127,7 +141,8 @@ func run(args []string, out io.Writer) error {
 
 	a.nc = nc
 
-	if a.client, err = packtrail.NewClient(nc, packtrail.WithClientNamespace(a.ns)); err != nil {
+	if a.client, err = packtrail.NewClient(nc, packtrail.WithClientNamespace(a.ns),
+		packtrail.WithClientLogger(a.logger)); err != nil {
 		return err
 	}
 
@@ -219,7 +234,7 @@ func (a *app) engine(fs *flag.FlagSet, args []string) (*packtrail.Engine, error)
 		return nil, err
 	}
 
-	opts := []packtrail.Option{packtrail.WithNamespace(a.ns)}
+	opts := []packtrail.Option{packtrail.WithNamespace(a.ns), packtrail.WithLogger(a.logger)}
 	if *dir != "" {
 		opts = append(opts, packtrail.WithFlowsDir(*dir))
 	}
@@ -254,7 +269,7 @@ func (a *app) initEngine(ctx context.Context, args []string) error {
 }
 
 func (a *app) rebuildIndex(ctx context.Context, _ []string) error {
-	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns))
+	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns), packtrail.WithLogger(a.logger))
 	if err != nil {
 		return err
 	}
@@ -273,7 +288,7 @@ func (a *app) archive(ctx context.Context, args []string) error {
 		return err
 	}
 
-	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns))
+	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns), packtrail.WithLogger(a.logger))
 	if err != nil {
 		return err
 	}
@@ -291,7 +306,7 @@ func (a *app) delete(ctx context.Context, args []string) error {
 		return err
 	}
 
-	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns))
+	eng, err := packtrail.New(a.nc, packtrail.WithNamespace(a.ns), packtrail.WithLogger(a.logger))
 	if err != nil {
 		return err
 	}

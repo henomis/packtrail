@@ -153,7 +153,7 @@ func (e *Engine) RunTrigger(ctx context.Context, def *flow.Flow, i int, tr flow.
 					return
 				}
 
-				e.In.Logger.Warn("packtrail: trigger start failed, will retry", "flow", def.Name, "exec", execID,
+				e.In.Logger.WarnContext(ctx, "packtrail: trigger start failed, will retry", "flow", def.Name, "exec", execID,
 					"deliveries", md.NumDelivered, "err", err)
 
 				_ = msg.NakWithDelay(retryDelay(md.NumDelivered))
@@ -186,7 +186,7 @@ func (e *Engine) runCoreTrigger(ctx context.Context, def *flow.Flow, tr flow.Tri
 		}
 
 		if err := e.startFromTrigger(ctx, def, execID, m.Data); err != nil {
-			e.In.Logger.Warn("packtrail: trigger start failed", "flow", def.Name, "err", err)
+			e.In.Logger.WarnContext(ctx, "packtrail: trigger start failed", "flow", def.Name, "err", err)
 		}
 	})
 	if err != nil {

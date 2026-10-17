@@ -32,6 +32,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 )
 
 // Job is one attempt of a task instance.
@@ -60,6 +62,54 @@ type Job struct {
 
 	progress *progressSink
 	store    *Store
+	logger   *slog.Logger
+}
+
+// Logger returns the worker's logger with this attempt bound: exec, flow,
+// node, key, kind, generation and attempt, plus trace_id when the job carries
+// a W3C traceparent. Handlers log through it so their lines join the engine's
+// and the worker's on the same keys.
+func (j *Job) Logger() *slog.Logger {
+	if j.logger == nil {
+		j.logger = jobLogger(slog.Default(), j)
+	}
+
+	return j.logger
+}
+
+func jobLogger(l *slog.Logger, j *Job) *slog.Logger {
+	attrs := []any{
+		"exec", j.ExecID, "flow", j.Flow, "node", j.Node, "key", j.Key, "kind", j.Kind,
+		"generation", j.Generation, "attempt", j.Attempt,
+	}
+
+	if id := TraceID(j.Traceparent); id != "" {
+		attrs = append(attrs, "trace_id", id)
+	}
+
+	return l.With(attrs...)
+}
+
+// TraceID returns the trace id of a W3C traceparent
+// ("00-<trace id>-<parent id>-<flags>"), or "" when tp is not one.
+func TraceID(tp string) string {
+	const (
+		parts    = 4
+		idLength = 32
+	)
+
+	f := strings.Split(tp, "-")
+	if len(f) != parts || len(f[1]) != idLength || strings.Trim(f[1], "0") == "" {
+		return ""
+	}
+
+	for _, r := range f[1] {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return ""
+		}
+	}
+
+	return f[1]
 }
 
 // NodeError is how a node last failed permanently.

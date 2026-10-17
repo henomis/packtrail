@@ -110,7 +110,7 @@ func (d *Dispatcher) handle(ctx context.Context, msg jetstream.Msg) {
 
 	skip, err := d.skip(ctx, execID)
 	if err != nil {
-		d.In.Logger.Warn("packtrail: quarantine check failed, will retry", "exec", execID, "err", err)
+		d.In.Logger.WarnContext(ctx, "packtrail: quarantine check failed, will retry", "exec", execID, "err", err)
 
 		_ = msg.NakWithDelay(retryFirst)
 
@@ -149,12 +149,13 @@ func (d *Dispatcher) handle(ctx context.Context, msg jetstream.Msg) {
 
 			return
 		} else { //nolint:revive // keep the quarantine failure next to its cause.
-			d.In.Logger.Error("packtrail: cannot quarantine, will retry", "exec", execID, "cause", err,
+			d.In.Logger.ErrorContext(ctx, "packtrail: cannot quarantine, will retry", "exec", execID, "err", err,
 				"err", qerr)
 		}
 	}
 
-	d.In.Logger.Warn("packtrail: dispatch failed, will retry", "subject", msg.Subject(), "deliveries", delivered,
+	d.In.Logger.WarnContext(ctx, "packtrail: dispatch failed, will retry", "subject", msg.Subject(),
+		"deliveries", delivered,
 		"err", err)
 
 	_ = msg.NakWithDelay(backoff(delivered))
@@ -489,6 +490,8 @@ func (d *Dispatcher) publishJob(ctx context.Context, job wire.Job) error {
 	}
 
 	d.Metrics.JobsDispatched.Add(1)
+	d.In.Logger.DebugContext(ctx, "packtrail: job dispatched", "exec", job.ExecID, "flow", job.Flow, "node", job.Node,
+		"key", job.Key, "kind", job.Kind, "generation", job.Generation, "attempt", job.Attempt)
 
 	return nil
 }
@@ -532,7 +535,7 @@ func (d *Dispatcher) cachedResult(ctx context.Context, job wire.Job) (bool, erro
 			return false, nil
 		}
 
-		d.In.Logger.Warn("packtrail: result cache read failed", "err", err)
+		d.In.Logger.WarnContext(ctx, "packtrail: result cache read failed", "err", err)
 
 		return false, nil
 	}
@@ -586,7 +589,7 @@ func (d *Dispatcher) storeCache(ctx context.Context, def *flow.Flow, done *event
 
 	if _, err = kv.Put(ctx, done.CacheKey, b); err != nil {
 		// I-05: a failed put only costs a future miss, but is logged.
-		d.In.Logger.Warn("packtrail: result cache write failed", "key", done.CacheKey, "err", err)
+		d.In.Logger.WarnContext(ctx, "packtrail: result cache write failed", "key", done.CacheKey, "err", err)
 	}
 
 	return nil
@@ -715,6 +718,6 @@ func (d *Dispatcher) purgeTimers(ctx context.Context, execID string) {
 	}
 
 	if err != nil {
-		d.In.Logger.Debug("packtrail: purge timers", "exec", execID, "err", err)
+		d.In.Logger.DebugContext(ctx, "packtrail: purge timers", "exec", execID, "err", err)
 	}
 }

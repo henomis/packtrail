@@ -753,6 +753,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
           <tr><td>Traceparent</td><td>W3C trace context propagated from the start command.</td></tr>
+          <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, and <code>attempt</code>. See <a href="#logging">logging</a>.</td></tr>
           <tr><td>Meta, DecodeMeta(&amp;v)</td><td>The node's <code>meta</code> from the execution's flow version (raw JSON, nil when absent), and a decoder for it.</td></tr>
         </tbody>
       </table>
@@ -790,7 +791,9 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
       <p>
         <code>eng.Client()</code> returns a client bound to the engine's namespace; from another process
         use <code>packtrail.NewClient(nc, packtrail.WithClientNamespace("acme"))</code>. It is safe for
-        concurrent use and performs no I/O until the first call.
+        concurrent use and performs no I/O until the first call. <code>WithClientLogger(l)</code> sets the
+        logger for its own diagnostics (default <code>slog.Default()</code>); the engine's client uses the
+        engine's logger.
       </p>
       <table class="doctable">
         <thead><tr><th>Method</th><th>Description</th></tr></thead>
@@ -1026,6 +1029,28 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
         <code>packtrail unquarantine &lt;exec&gt;</code> replays what was skipped. Transient outages never
         quarantine: the dispatcher waits and retries forever.
       </p>
+      <h3 id="logging">Logging</h3>
+      <p>
+        The engine (<code>WithLogger</code>), workers (<code>worker.WithLogger</code>) and clients
+        (<code>WithClientLogger</code>) log through a <code>*slog.Logger</code>, with the request context
+        when there is one. Messages start with <code>packtrail:</code> or <code>worker:</code>, and attributes
+        use the same keys everywhere: <code>exec</code>, <code>flow</code>, <code>node</code>,
+        <code>key</code>, <code>kind</code>, <code>generation</code>, <code>attempt</code>, <code>cmd</code>,
+        <code>type</code>, <code>seq</code>, <code>err</code>, <code>duration</code>.
+      </p>
+      <table class="doctable">
+        <thead><tr><th>Level</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td>Error</td><td>Work lost or an operator must act: an execution quarantined, a dead letter not written, a handler panic.</td></tr>
+          <tr><td>Warn</td><td>Something failed and is retried, or was dead-lettered.</td></tr>
+          <tr><td>Info</td><td>Rejected commands and commands for archived executions.</td></tr>
+          <tr><td>Debug</td><td>One line per decision (<code>packtrail: decision applied</code>: type, events, seq, duration), per job sent (<code>packtrail: job dispatched</code>) and per attempt (<code>worker: job started</code> with the queue wait, <code>worker: job ended</code> with the outcome and duration).</td></tr>
+        </tbody>
+      </table>
+      <p>
+        A handler logs through <code>job.Logger()</code>, so its lines carry the same keys as the
+        engine's: filter on <code>exec</code> to follow one execution across processes.
+      </p>
       <h3>Metrics &amp; alerting</h3>
       <p>
         <code>Engine.Metrics(ctx)</code> returns counters (commands, conflicts, events appended, jobs
@@ -1092,8 +1117,13 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
       <span class="eyebrow">Operations</span>
       <h2>CLI</h2>
       <p>
-        <code>packtrail [-server URL] [-ns NAMESPACE] &lt;command&gt;</code>. It is a client of the
-        deployment, plus <code>run</code> to host an engine.
+        <code>packtrail [-server URL] [-ns NAMESPACE] [-log-level L] [-log-format F] &lt;command&gt;</code>.
+        It is a client of the deployment, plus <code>run</code> to host an engine. Output is JSON on stdout;
+        logs go to stderr at <code>-log-level</code> (<code>debug</code>, <code>info</code>, <code>warn</code>,
+        <code>error</code>; default <code>$PACKTRAIL_LOG_LEVEL</code> or <code>info</code>) in
+        <code>-log-format</code> (<code>text</code> or <code>json</code>; default
+        <code>$PACKTRAIL_LOG_FORMAT</code> or <code>text</code>). <code>packtrail-ui</code> takes the same
+        two flags.
       </p>
       <div class="codecard">
         <div class="codecard__bar">

@@ -173,7 +173,7 @@ func (w *Worker) handBack(ctx context.Context, msg jetstream.Msg, wj wire.Job) b
 	copyMsg.Header.Set(sched.HeaderScheduleTarget, w.in.Names.WorkSubject(wj.Kind))
 
 	if _, err := w.in.JS.PublishMsg(ctx, copyMsg); err != nil {
-		w.logger.Warn("worker: cannot hand a busy job back, keeping it", "exec", wj.ExecID, "err", err)
+		w.logger.WarnContext(ctx, "worker: cannot hand a busy job back, keeping it", "exec", wj.ExecID, "err", err)
 
 		return false
 	}
@@ -248,7 +248,7 @@ func (w *Worker) renewSlot(ctx context.Context, kv jetstream.KeyValue, key, hold
 ) {
 	defer func() {
 		if p := recover(); p != nil {
-			w.logger.Error("worker: semaphore renewal panic", "panic", p)
+			w.logger.ErrorContext(ctx, "worker: semaphore renewal panic", "panic", p)
 		}
 	}()
 

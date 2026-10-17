@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 // Job is one attempt of a task instance.
@@ -60,6 +61,25 @@ type Job struct {
 
 	progress *progressSink
 	store    *Store
+	logger   *slog.Logger
+}
+
+// Logger returns the worker's logger with this attempt bound: exec, flow,
+// node, key, kind, generation and attempt. Handlers log through it so their
+// lines join the engine's and the worker's on the same keys.
+func (j *Job) Logger() *slog.Logger {
+	if j.logger == nil {
+		j.logger = jobLogger(slog.Default(), j)
+	}
+
+	return j.logger
+}
+
+func jobLogger(l *slog.Logger, j *Job) *slog.Logger {
+	return l.With(
+		"exec", j.ExecID, "flow", j.Flow, "node", j.Node, "key", j.Key, "kind", j.Kind,
+		"generation", j.Generation, "attempt", j.Attempt,
+	)
 }
 
 // NodeError is how a node last failed permanently.

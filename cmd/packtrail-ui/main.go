@@ -33,7 +33,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,6 +43,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/henomis/packtrail/cmd/internal/logflags"
 	"github.com/henomis/packtrail/internal/names"
 )
 
@@ -61,12 +61,19 @@ func main() {
 	ns := flag.String("namespace", envOr("PACKTRAIL_NAMESPACE", "packtrail"), "namespace selected first")
 	allowFlag := flag.String("namespaces", os.Getenv("PACKTRAIL_UI_NAMESPACES"),
 		"comma-separated namespaces the UI may serve (default: every namespace on the NATS account)")
+	logs := logflags.Register(flag.CommandLine, "PACKTRAIL")
 
 	flag.Parse()
 
+	logger, err := logs.NewLogger(os.Stderr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "packtrail-ui:", err)
+		os.Exit(1)
+	}
+
 	allow, err := parseAllow(*allowFlag)
 	if err != nil {
-		slog.Error("namespaces", "err", err)
+		logger.Error("namespaces", "err", err)
 		os.Exit(1)
 	}
 
@@ -74,7 +81,7 @@ func main() {
 
 	nc, err := nats.Connect(url, nats.Name("packtrail-ui"))
 	if err != nil {
-		slog.Error("connect NATS", "url", url, "err", err)
+		logger.Error("connect NATS", "url", url, "err", err)
 		os.Exit(1)
 	}
 	defer nc.Close()
@@ -83,8 +90,11 @@ func main() {
 	defer stop()
 
 	static, _ := fs.Sub(webFS, "web")
+	ui := newAPI(nc, *ns, allow)
+	ui.logger = logger
+
 	srv := &http.Server{
-		Addr: *addr, Handler: newAPI(nc, *ns, allow).routes(http.FileServerFS(static)), ReadHeaderTimeout: readHeaderTimeout,
+		Addr: *addr, Handler: ui.routes(http.FileServerFS(static)), ReadHeaderTimeout: readHeaderTimeout,
 	}
 
 	go func() {
@@ -96,11 +106,11 @@ func main() {
 		_ = srv.Shutdown(sh)
 	}()
 
-	slog.Warn("packtrail-ui has no authentication and can drive executions; keep it on a trusted address")
-	slog.Info("packtrail-ui listening", "addr", *addr, "namespace", *ns, "allow", allow, "nats", url)
+	logger.Warn("packtrail-ui has no authentication and can drive executions; keep it on a trusted address")
+	logger.Info("packtrail-ui listening", "addr", *addr, "namespace", *ns, "allow", allow, "nats", url)
 
 	if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		slog.Error("http", "err", err)
+		logger.Error("http", "err", err)
 		os.Exit(1)
 	}
 }

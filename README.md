@@ -160,6 +160,13 @@ by the fold.
   `Engine.Metrics().DispatchStall` — the longest time a partition with
   pending events has gone without progress — and alert when it exceeds a
   minute or so.
+- **Logs.** The engine, workers and clients log through `slog`
+  (`WithLogger`, `worker.WithLogger`, `WithClientLogger`) on shared keys
+  (`exec`, `flow`, `node`, `key`, `kind`, `attempt`, `err`, ...). Debug adds
+  one line per decision, dispatched job and attempt; a handler's
+  `job.Logger()` carries the same keys. The CLIs take
+  `-log-level debug|info|warn|error` and `-log-format text|json`
+  (`PACKTRAIL_LOG_LEVEL`, `PACKTRAIL_LOG_FORMAT`).
 - **Validate offline.** `packtrail.ValidateOptions(opts...)` runs every
   check `New` does (flows, schedules, namespace, tuning) without a NATS
   connection, so CI or a `validate` command can reject a bad configuration.

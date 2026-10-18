@@ -352,13 +352,13 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	defer w.running.remove(wj.ExecID, rj)
 
 	stopLive := w.watchLive(jctx, wj, cancel)
-	c, err := w.run(jctx, wj, md.NumDelivered)
+	c, err := w.run(jctx, wj, md)
 
 	stopLive()
 
 	if errors.Is(context.Cause(jctx), ErrCancelled) {
 		// The work is no longer wanted: its result would be stale (G5-02).
-		w.logger.Debug("worker: job cancelled", "exec", wj.ExecID, "node", wj.Node, "key", wj.Key)
+		w.logger.DebugContext(ctx, "worker: job cancelled", "exec", wj.ExecID, "node", wj.Node, "key", wj.Key)
 
 		_ = msg.Ack()
 
@@ -366,11 +366,11 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	if err != nil {
-		w.logger.Warn("worker: cannot build result", "exec", wj.ExecID, "node", wj.Node, "err", err)
+		w.logger.WarnContext(ctx, "worker: cannot build result", "exec", wj.ExecID, "node", wj.Node, "err", err)
 	}
 
 	if err = w.publish(ctx, wj, c); err != nil {
-		w.logger.Warn("worker: cannot publish result, job will be redelivered", "exec", wj.ExecID, "err", err)
+		w.logger.WarnContext(ctx, "worker: cannot publish result, job will be redelivered", "exec", wj.ExecID, "err", err)
 
 		_ = msg.NakWithDelay(time.Second)
 
@@ -401,7 +401,7 @@ func (w *Worker) resolve(ctx context.Context, msg jetstream.Msg) (body []byte, o
 			}
 		}
 
-		w.logger.Warn("worker: cannot read job body, will retry", "subject", msg.Subject(), "err", rerr)
+		w.logger.WarnContext(ctx, "worker: cannot read job body, will retry", "subject", msg.Subject(), "err", rerr)
 
 		select {
 		case <-ctx.Done():
@@ -420,12 +420,13 @@ func (w *Worker) resolve(ctx context.Context, msg jetstream.Msg) (body []byte, o
 const blobNotFoundTries = 3
 
 // run invokes the handler and turns its outcome into a command.
-func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.Command, error) {
+func (w *Worker) run(ctx context.Context, wj wire.Job, md *jetstream.MsgMetadata) (cmd.Command, error) {
 	job := &Job{
 		ExecID: wj.ExecID, Flow: wj.Flow, FlowHash: wj.FlowHash, Node: wj.Node, Kind: wj.Kind, Key: wj.Key,
-		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: deliveries,
+		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: md.NumDelivered,
 		Traceparent: wj.Traceparent, Meta: wj.Meta, progress: w.progressSink(wj), store: &Store{in: w.in},
 	}
+	job.logger = jobLogger(w.logger, job)
 
 	ref := cmd.TaskRef{Key: wj.Key, Generation: wj.Generation, Attempt: wj.Attempt}
 	id := wire.CmdID(wj.ExecID, wj.Key, wj.Generation, wj.Attempt)
@@ -434,9 +435,31 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, deliveries uint64) (cmd.C
 		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error(), nil)
 	}
 
-	res, err := w.call(ctx, job)
+	began := time.Now()
+	job.logger.DebugContext(ctx, "worker: job started", "deliveries", md.NumDelivered,
+		"queue_wait", began.Sub(md.Timestamp))
 
-	return resultCmd(id, wj, ref, res, err)
+	res, err := w.call(ctx, job)
+	c, cerr := resultCmd(id, wj, ref, res, err)
+
+	job.logger.DebugContext(ctx, "worker: job ended", "outcome", outcome(c), "duration", time.Since(began))
+
+	return c, cerr
+}
+
+// outcome names how an attempt ended, for logs: completed, interrupted,
+// failed (permanently) or retryable_failed.
+func outcome(c cmd.Command) string {
+	if c.Type != cmd.Fail {
+		return map[cmd.Type]string{cmd.Complete: "completed", cmd.Interrupt: "interrupted"}[c.Type]
+	}
+
+	var f cmd.FailData
+	if json.Unmarshal(c.Data, &f) == nil && f.Retryable {
+		return "retryable_failed"
+	}
+
+	return "failed"
 }
 
 // resultCmd turns what a handler returned into the command answering its job.
@@ -480,7 +503,7 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			w.logger.Error("worker: handler panic", "exec", job.ExecID, "node", job.Node, "panic", p,
+			w.logger.ErrorContext(ctx, "worker: handler panic", "exec", job.ExecID, "node", job.Node, "panic", p,
 				"stack", string(debug.Stack()))
 
 			res, err = nil, fmt.Errorf("handler panic: %v", p)
@@ -596,6 +619,6 @@ func (w *Worker) deadLetter(ctx context.Context, msg jetstream.Msg, md *jetstrea
 	}
 
 	if err := msg.Term(); err != nil {
-		w.logger.Warn("worker: term failed", "err", err)
+		w.logger.WarnContext(ctx, "worker: term failed", "err", err)
 	}
 }

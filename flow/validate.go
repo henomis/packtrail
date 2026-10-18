@@ -581,15 +581,19 @@ func (f *Flow) validateJoin(p *problems, n *Node) {
 		seen[w] = true
 	}
 
-	kind, quorum := n.JoinKind()
+	kind, count := n.JoinKind()
 	switch kind {
 	case JoinAll, JoinAny:
 	case JoinQuorum:
-		if quorum <= 0 {
+		if count <= 0 {
 			p.add(n.ID, fPolicy, nil, "quorum:N needs N > 0")
 		}
+	case JoinMin:
+		if count < 0 {
+			p.add(n.ID, fPolicy, nil, "min:N needs N >= 0")
+		}
 	default:
-		p.add(n.ID, fPolicy, nil, "unknown policy %q (want all, any or quorum:N)", n.Policy)
+		p.add(n.ID, fPolicy, nil, "unknown policy %q (want all, any, quorum:N or min:N)", n.Policy)
 	}
 }
 

@@ -67,6 +67,7 @@ type Client struct {
 	nc       *nats.Conn
 	ns       string
 	timeouts timeouts
+	logger   *slog.Logger
 
 	// attachMu guards attaching: in and ld are set by the first attach that
 	// succeeds, and never change after.
@@ -86,6 +87,20 @@ func WithClientNamespace(ns string) ClientOption {
 		}
 
 		c.ns = ns
+
+		return nil
+	}
+}
+
+// WithClientLogger sets the logger for the client's own diagnostics, such as
+// a Watch that stops on an undecodable event (default slog.Default()).
+func WithClientLogger(l *slog.Logger) ClientOption {
+	return func(c *Client) error {
+		if l == nil {
+			return fmt.Errorf("%w: nil logger", ErrInvalidArgument)
+		}
+
+		c.logger = l
 
 		return nil
 	}
@@ -125,7 +140,7 @@ func NewClient(nc *nats.Conn, opts ...ClientOption) (*Client, error) {
 		return nil, fmt.Errorf("%w: nil connection", ErrInvalidArgument)
 	}
 
-	c := &Client{nc: nc, ns: names.Default}
+	c := &Client{nc: nc, ns: names.Default, logger: slog.Default()}
 	for _, o := range opts {
 		if err := o(c); err != nil {
 			return nil, err
@@ -136,7 +151,7 @@ func NewClient(nc *nats.Conn, opts ...ClientOption) (*Client, error) {
 }
 
 func newClientFromInfra(in *infra.Infra, ld *loader.Loader) *Client {
-	return &Client{nc: in.NC, ns: in.Names.Prefix, in: in, ld: ld}
+	return &Client{nc: in.NC, ns: in.Names.Prefix, logger: in.Logger, in: in, ld: ld}
 }
 
 // attach binds the client to its namespace on first use. A failed attempt
@@ -150,7 +165,7 @@ func (c *Client) attach(ctx context.Context) error {
 		return nil
 	}
 
-	in, err := infra.New(c.nc, names.New(c.ns), slog.Default())
+	in, err := infra.New(c.nc, names.New(c.ns), c.logger)
 	if err != nil {
 		return err
 	}

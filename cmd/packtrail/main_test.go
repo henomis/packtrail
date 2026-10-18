@@ -113,3 +113,10 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("schedules: %s", out)
 	}
 }
+
+func TestCLIRejectsBadLogFlags(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"-log-level", "loud"}, &out); err == nil || !strings.Contains(err.Error(), "log level") {
+		t.Fatalf("bad -log-level accepted: %v", err)
+	}
+}

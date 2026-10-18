@@ -47,7 +47,7 @@ func (f *Flow) WaitFor(join string) []string {
 //     what happens after the fan);
 //   - a fanout's next is a join, each join closes exactly one fanout, and its
 //     wait_for is a subset of that fanout's branches;
-//   - a quorum fits the number of awaited branches.
+//   - a quorum or min count fits the number of awaited branches.
 //
 // It runs after every reference has resolved.
 func (f *Flow) validateFans(p *problems) {
@@ -152,8 +152,8 @@ func (f *Flow) validateJoinFan(p *problems, n *Node) {
 		}
 	}
 
-	if kind, q := n.JoinKind(); kind == JoinQuorum && q > len(f.WaitFor(n.ID)) {
-		p.add(n.ID, fPolicy, nil, "quorum:%d exceeds the %d awaited branches", q, len(f.WaitFor(n.ID)))
+	if kind, q := n.JoinKind(); (kind == JoinQuorum || kind == JoinMin) && q > len(f.WaitFor(n.ID)) {
+		p.add(n.ID, fPolicy, nil, "%s exceeds the %d awaited branches", n.Policy, len(f.WaitFor(n.ID)))
 	}
 }
 

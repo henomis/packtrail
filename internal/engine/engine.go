@@ -379,8 +379,15 @@ func (e *Engine) apply(ctx context.Context, c cmd.Command, trace string) (uint64
 
 		e.afterAppend(ctx, c.ExecID, ent, before)
 
-		e.In.Logger.DebugContext(ctx, "packtrail: decision applied", "exec", c.ExecID, "type", c.Type, "cmd", c.ID,
-			"events", len(evs), "seq", last, "duration", time.Since(began))
+		args := []any{
+			"exec", c.ExecID, "type", c.Type, "cmd", c.ID,
+			"events", len(evs), "seq", last, "duration", time.Since(began),
+		}
+		if traceID, _, ok := wire.TraceIDs(trace); ok {
+			args = append(args, "trace_id", traceID)
+		}
+
+		e.In.Logger.DebugContext(ctx, "packtrail: decision applied", args...)
 
 		return last, true, nil
 	}

@@ -145,6 +145,8 @@ type ResumeData struct {
 	Node  string          `json:"node"`
 	Key   string          `json:"key,omitempty"`
 	Value json.RawMessage `json:"value,omitempty"`
+	// By is who resumed (a reviewer, a service); recorded, never interpreted.
+	By string `json:"by,omitempty"`
 }
 
 // SignalData is the payload of Signal. The command id is the signal id.

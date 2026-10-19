@@ -372,7 +372,7 @@ func (d *decider) enter(id string) error {
 
 	switch n.Type {
 	case flow.NodeTask:
-		return d.schedule(n, n.ID, "", 0, nil, nil, 0, 1)
+		return d.schedule(n, n.ID, "", 0, nil, resumption{}, 0, 1)
 	case flow.NodeChoice:
 		return d.choose(n)
 	case flow.NodeFanout:
@@ -478,7 +478,7 @@ func (d *decider) cancel(p *cmd.CancelData) error {
 
 // schedule emits one attempt of a task instance. gen 0 allocates a fresh
 // generation.
-func (d *decider) schedule(n *flow.Node, key, owner string, index int, item, resume json.RawMessage,
+func (d *decider) schedule(n *flow.Node, key, owner string, index int, item json.RawMessage, rs resumption,
 	gen, attempt int,
 ) error {
 	if gen == 0 {
@@ -487,7 +487,7 @@ func (d *decider) schedule(n *flow.Node, key, owner string, index int, item, res
 
 	err := d.emit(event.NodeScheduled, &event.Scheduled{
 		Key: key, Node: n.ID, Kind: n.Kind, Index: index, Generation: gen, Attempt: attempt, Owner: owner,
-		Item: item, Resume: resume,
+		Item: item, Resume: rs.value, ResumedBy: rs.by,
 	})
 	if err != nil {
 		return err
@@ -657,7 +657,7 @@ func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string,
 	if willRetry {
 		delay := n.Backoff(tc.Attempt + 1)
 		if delay <= 0 {
-			return d.schedule(n, tc.Key, tc.Owner, tc.Index, tc.Item, tc.Resume, tc.Generation, tc.Attempt+1)
+			return d.schedule(n, tc.Key, tc.Owner, tc.Index, tc.Item, tc.resumption(), tc.Generation, tc.Attempt+1)
 		}
 
 		return d.timerAt(event.TimerRetry, delay, tc.Key, tc.Node, tc.Generation, tc.Attempt+1)
@@ -747,7 +747,7 @@ func (d *decider) resume(p *cmd.ResumeData) error {
 		value = json.RawMessage(jsonNull)
 	}
 
-	return d.schedule(n, t.Key, t.Owner, t.Index, t.Item, value, 0, 1)
+	return d.schedule(n, t.Key, t.Owner, t.Index, t.Item, resumption{value: value, by: p.By}, 0, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +772,7 @@ func (d *decider) timer(p *cmd.TimerData) error {
 			return nil
 		}
 
-		return d.schedule(d.def.Node(t.Node), t.Key, t.Owner, t.Index, t.Item, t.Resume, t.Generation, tc.Attempt)
+		return d.schedule(d.def.Node(t.Node), t.Key, t.Owner, t.Index, t.Item, t.resumption(), t.Generation, tc.Attempt)
 	case event.TimerTimeout:
 		t := d.current(cmd.TaskRef{Key: tc.Key, Generation: tc.Generation, Attempt: tc.Attempt}, TaskScheduled)
 		if t == nil {
@@ -805,7 +805,9 @@ func (d *decider) choose(n *flow.Node) error {
 		ok, err := progs[i].Match(context.Background(), env)
 		if err != nil {
 			if n.OnError == flow.OnErrorFail {
-				if e := d.emit(event.ChoiceEvaluated, &event.Choice{Node: n.ID, Rule: i, Error: err.Error()}); e != nil {
+				if e := d.emit(event.ChoiceEvaluated, &event.Choice{
+					Node: n.ID, Rule: i, Name: r.Name, Error: err.Error(),
+				}); e != nil {
 					return e
 				}
 
@@ -827,7 +829,8 @@ func (d *decider) choose(n *flow.Node) error {
 // to completion. Nothing else is in flight when a choice runs (a choice is
 // never a fan-out branch), so completing here strands no work.
 func (d *decider) route(n *flow.Node, rule int, to string) error {
-	if err := d.emit(event.ChoiceEvaluated, &event.Choice{Node: n.ID, Rule: rule, To: to}); err != nil {
+	err := d.emit(event.ChoiceEvaluated, &event.Choice{Node: n.ID, Rule: rule, Name: n.Rules[rule].Name, To: to})
+	if err != nil {
 		return err
 	}
 
@@ -859,7 +862,7 @@ func (d *decider) fanout(n *flow.Node) error {
 		if bn.Type == flow.NodeSubflow {
 			err = d.startChild(bn, b, n.ID, 0, nil)
 		} else {
-			err = d.schedule(bn, b, n.ID, 0, nil, nil, 0, 1)
+			err = d.schedule(bn, b, n.ID, 0, nil, resumption{}, 0, 1)
 		}
 
 		if err != nil || d.st.Status.Terminal() {
@@ -1100,7 +1103,7 @@ func (d *decider) mapProgress(n *flow.Node) error {
 		if n.Flow != "" {
 			err = d.startChild(n, key, n.ID, i, m.Items[i])
 		} else {
-			err = d.schedule(n, key, n.ID, i, m.Items[i], nil, 0, 1)
+			err = d.schedule(n, key, n.ID, i, m.Items[i], resumption{}, 0, 1)
 		}
 
 		if err != nil || d.st.Status.Terminal() {
@@ -1258,7 +1261,7 @@ func (d *decider) rekick() error {
 			continue
 		}
 
-		if err := d.schedule(d.def.Node(t.Node), t.Key, t.Owner, t.Index, t.Item, t.Resume, 0, 1); err != nil {
+		if err := d.schedule(d.def.Node(t.Node), t.Key, t.Owner, t.Index, t.Item, t.resumption(), 0, 1); err != nil {
 			return err
 		}
 	}

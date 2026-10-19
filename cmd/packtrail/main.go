@@ -62,7 +62,7 @@ executions:
   start <flow> [-input JSON] [-id ID] [-version HASH] [-wait]
   signal <exec> <name> [-payload JSON] [-id ID]
   update <exec> -writes JSON [-id ID]    write channels synchronously; prints the state after the write
-  resume <exec> <node> [-value JSON]
+  resume <exec> <node> [-value JSON] [-by ACTOR]
   cancel <exec> [-reason TEXT]
   get <exec> [-seq N]                    state now, or right after event N
   history <exec>
@@ -484,6 +484,7 @@ func writesJSON(s string) (map[string]any, error) {
 func (a *app) resume(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
 	value := fs.String("value", "", "resume value JSON")
+	by := fs.String("by", "", "who resumes (recorded as resumed_by)")
 
 	pos, err := parse(fs, args, 2) //nolint:mnd // exec and node.
 	if err != nil {
@@ -495,7 +496,7 @@ func (a *app) resume(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return a.client.Resume(ctx, pos[0], pos[1], v)
+	return a.client.Resume(ctx, pos[0], pos[1], v, packtrail.WithResumedBy(*by))
 }
 
 func (a *app) cancel(ctx context.Context, args []string) error {

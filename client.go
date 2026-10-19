@@ -399,15 +399,35 @@ func (c *Client) Signal(ctx context.Context, execID, name string, payload any, o
 	return c.send(ctx, id, cmd.Signal, execID, cmd.SignalData{Name: name, Payload: b})
 }
 
+// ResumeOption configures Resume.
+type ResumeOption func(*cmd.ResumeData)
+
+// maxResumedBy bounds WithResumedBy: an identity, not a payload.
+const maxResumedBy = 256
+
+// WithResumedBy records who resumes (a reviewer, a service): it is kept on
+// the NodeScheduled event and reaches the worker as Job.Context.ResumedBy on
+// every attempt of the resumed run. At most 256 bytes.
+func WithResumedBy(actor string) ResumeOption { return func(d *cmd.ResumeData) { d.By = actor } }
+
 // Resume re-runs an interrupted node, passing value to its worker as
 // `resume` (human-in-the-loop, LangGraph interrupt()).
-func (c *Client) Resume(ctx context.Context, execID, node string, value any) error {
+func (c *Client) Resume(ctx context.Context, execID, node string, value any, opts ...ResumeOption) error {
 	b, err := marshalAny(value)
 	if err != nil {
 		return err
 	}
 
-	return c.send(ctx, "resume."+nuid.Next(), cmd.Resume, execID, cmd.ResumeData{Node: node, Value: b})
+	d := cmd.ResumeData{Node: node, Value: b}
+	for _, o := range opts {
+		o(&d)
+	}
+
+	if len(d.By) > maxResumedBy {
+		return fmt.Errorf("%w: resumed by: longer than %d bytes", ErrInvalidArgument, maxResumedBy)
+	}
+
+	return c.send(ctx, "resume."+nuid.Next(), cmd.Resume, execID, d)
 }
 
 // Cancel cancels an execution. Cancelling a finished execution is a no-op.

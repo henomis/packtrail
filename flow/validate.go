@@ -505,6 +505,22 @@ func compileSchema(doc any) (*jsonschema.Schema, error) {
 	return c.Compile(url)
 }
 
+// checkRuleName checks an optional rule name: a valid token, unique within
+// its node (named holds the names seen so far).
+func checkRuleName(p *problems, node, field, name string, named map[string]bool) {
+	if name == "" {
+		return
+	}
+
+	if err := names.CheckToken("rule name", name); err != nil {
+		p.add(node, field+".name", err, "")
+	} else if named[name] {
+		p.add(node, field+".name", nil, "duplicate rule name %q", name)
+	}
+
+	named[name] = true
+}
+
 func (f *Flow) validateChoice(p *problems, n *Node) {
 	if len(n.Rules) == 0 {
 		p.add(n.ID, fRules, nil, "at least one rule is required")
@@ -512,9 +528,12 @@ func (f *Flow) validateChoice(p *problems, n *Node) {
 
 	defaults := 0
 	n.rules = make([]*expr.Program, len(n.Rules))
+	named := map[string]bool{}
 
 	for i, r := range n.Rules {
 		field := fmt.Sprintf("rules[%d]", i)
+
+		checkRuleName(p, n.ID, field, r.Name, named)
 
 		switch {
 		case r.Default && strings.TrimSpace(r.When) != "":

@@ -151,3 +151,37 @@ func TestResumeWithoutValueKeepsInterruptPayload(t *testing.T) {
 		t.Fatalf("resumed job resume = %q, want null", got)
 	}
 }
+
+// Who resumed reaches every attempt of the resumed run; a later resume that
+// names nobody clears it, and a fresh job never carries one.
+func TestResumedBy(t *testing.T) {
+	x := newH(t, retrying)
+	x.start(`{}`)
+
+	by := func() string { return x.st.ContextView(x.task("a")).ResumedBy }
+
+	if by() != "" {
+		t.Fatal("fresh job carries resumed_by")
+	}
+
+	x.interrupt("a", `{}`)
+	evs := x.do(cmd.Resume, cmd.ResumeData{Node: "a", Value: json.RawMessage(`"ok"`), By: "alice"})
+
+	if s, ok := evs[0].Data.(*event.Scheduled); !ok || s.ResumedBy != "alice" {
+		t.Fatalf("resume events %v", evs)
+	}
+
+	x.failT("a", true)
+	x.fire(event.TimerRetry)
+
+	if a := x.task("a"); a.Attempt != 2 || by() != "alice" {
+		t.Fatalf("retry of a resumed job: attempt %d, resumed_by %q", a.Attempt, by())
+	}
+
+	x.interrupt("a", `{}`)
+	x.do(cmd.Resume, cmd.ResumeData{Node: "a"})
+
+	if by() != "" {
+		t.Fatalf("resume naming nobody kept resumed_by %q", by())
+	}
+}

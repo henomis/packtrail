@@ -201,6 +201,8 @@ type Scheduled struct {
 	Owner      string          `json:"owner,omitempty"`
 	Item       json.RawMessage `json:"item,omitempty"`
 	Resume     json.RawMessage `json:"resume,omitempty"`
+	// ResumedBy is who resumed the instance, when the resume named one.
+	ResumedBy string `json:"resumed_by,omitempty"`
 }
 
 // NodeDone is the payload of NodeCompleted.
@@ -249,8 +251,10 @@ type NodeCancel struct {
 
 // Choice is the payload of ChoiceEvaluated.
 type Choice struct {
-	Node  string `json:"node"`
-	Rule  int    `json:"rule"`
+	Node string `json:"node"`
+	Rule int    `json:"rule"`
+	// Name is the rule's name (flow.Rule.Name), when it has one.
+	Name  string `json:"name,omitempty"`
 	To    string `json:"to"`
 	Error string `json:"error,omitempty"`
 }

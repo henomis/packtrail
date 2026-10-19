@@ -426,6 +426,39 @@ func TestChoice(t *testing.T) {
 	}
 }
 
+// TestChoiceRuleName: a named rule's name is recorded on ChoiceEvaluated, on
+// the matching rule and on the default.
+func TestChoiceRuleName(t *testing.T) {
+	const named = `
+name: c
+start: a
+nodes:
+  - {id: a, type: task, kind: k, next: pick}
+  - id: pick
+    type: choice
+    rules: [{name: high, when: "results.a.score > 5", to: hi}, {name: low, default: true, to: lo}]
+  - {id: hi, type: task, kind: k}
+  - {id: lo, type: task, kind: k}
+`
+
+	for _, tc := range []struct{ out, want string }{{`{"score":9}`, "high"}, {`{"score":1}`, "low"}} {
+		x := newH(t, named)
+		x.start(`{}`)
+
+		var got *event.Choice
+
+		for _, ev := range x.ok("a", tc.out) {
+			if c, ok := ev.Data.(*event.Choice); ok {
+				got = c
+			}
+		}
+
+		if got == nil || got.Name != tc.want {
+			t.Fatalf("choice %+v, want name %q", got, tc.want)
+		}
+	}
+}
+
 // evalOpt is evaluator-optimizer: generate, evaluate, and a choice that loops
 // back or ends the execution.
 const evalOpt = `

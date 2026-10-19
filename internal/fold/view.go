@@ -34,6 +34,7 @@ type Context struct {
 	Item      json.RawMessage            `json:"item,omitempty"`
 	Index     *int                       `json:"index,omitempty"`
 	Resume    json.RawMessage            `json:"resume,omitempty"`
+	ResumedBy string                     `json:"resumed_by,omitempty"`
 	Interrupt json.RawMessage            `json:"interrupt,omitempty"`
 }
 
@@ -52,7 +53,7 @@ func (s *State) ContextView(t *Task) Context {
 	if t != nil {
 		c.Resume = t.Resume
 		if len(t.Resume) > 0 {
-			c.Interrupt = t.Interrupt
+			c.ResumedBy, c.Interrupt = t.ResumedBy, t.Interrupt
 		}
 
 		if m := s.Maps[t.Owner]; m != nil && t.Node == t.Owner {

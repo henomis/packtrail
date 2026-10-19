@@ -15,9 +15,12 @@
 package acceptance
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -340,11 +343,15 @@ func TestM4TraceparentAndMetrics(t *testing.T) {
 
 	got := make(chan string, 3)
 
+	var logs syncBuffer
+
 	e.Worker("echo", func(ctx context.Context, j *worker.Job) (*worker.Result, error) {
 		got <- j.Traceparent
 
+		j.Logger().InfoContext(ctx, "handled")
+
 		return Echo(ctx, j)
-	})
+	}, worker.WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))))
 
 	id := e.Start("linear", nil, packtrail.WithTraceparent(tp))
 	e.Completed(id)
@@ -353,8 +360,35 @@ func TestM4TraceparentAndMetrics(t *testing.T) {
 		t.Fatalf("traceparent %q not propagated to the job", first)
 	}
 
+	// The job logger binds the traceparent's ids (I-125).
+	if out := logs.String(); !strings.Contains(out, `"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"`) ||
+		!strings.Contains(out, `"span_id":"00f067aa0ba902b7"`) {
+		t.Fatalf("job log lines lack trace keys: %s", out)
+	}
+
 	m := e.Engine.Metrics(e.Ctx)
 	if m.Commands == 0 || m.EventsAppended == 0 || m.JobsDispatched != 3 {
 		t.Fatalf("metrics %+v", m)
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger writing from handler
+// goroutines while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
 }

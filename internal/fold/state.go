@@ -76,11 +76,22 @@ type Task struct {
 	Status     string          `json:"status"`
 	Item       json.RawMessage `json:"item,omitempty"`
 	Resume     json.RawMessage `json:"resume,omitempty"`
+	// ResumedBy is who resumed the instance (cmd.ResumeData.By), kept across
+	// the attempts of the resumed run.
+	ResumedBy string `json:"resumed_by,omitempty"`
 	// Interrupt is the payload of the instance's last interrupt: what it is
 	// waiting on while interrupted, then, once resumed, what it was resumed
 	// from (kept across the attempts of the resumed run, absent otherwise).
 	Interrupt json.RawMessage `json:"interrupt,omitempty"`
 }
+
+// resumption is the resume value of a task instance and who resumed it.
+type resumption struct {
+	value json.RawMessage
+	by    string
+}
+
+func (t *Task) resumption() resumption { return resumption{value: t.Resume, by: t.ResumedBy} }
 
 // Fan is an open fan-out.
 type Fan struct {
@@ -500,6 +511,7 @@ func (s *State) applyScheduled(d *event.Scheduled) {
 	t := &Task{
 		Key: d.Key, Node: d.Node, Kind: d.Kind, Index: d.Index, Owner: d.Owner,
 		Generation: d.Generation, Attempt: d.Attempt, Status: TaskScheduled, Item: d.Item, Resume: d.Resume,
+		ResumedBy: d.ResumedBy,
 	}
 
 	// A resumed instance (the resume itself, its retries, a fork's re-dispatch)

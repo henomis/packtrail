@@ -15,6 +15,9 @@
 package worker_test
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"testing"
 
 	"github.com/henomis/packtrail/worker"
@@ -27,5 +30,45 @@ func TestJobLoggerWithoutWorker(t *testing.T) {
 	l := j.Logger()
 	if l == nil || j.Logger() != l {
 		t.Fatal("Logger must be non-nil and stable")
+	}
+}
+
+func TestJobLoggerTraceKeys(t *testing.T) {
+	const tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	for _, tc := range []struct {
+		traceparent string
+		want        bool
+	}{
+		{tp, true},
+		{"", false},
+		{"not-a-traceparent", false},
+	} {
+		var buf bytes.Buffer
+
+		prev := slog.Default()
+
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+
+		j := &worker.Job{ExecID: "e", Node: "n", Traceparent: tc.traceparent}
+		j.Logger().Info("hello")
+
+		slog.SetDefault(prev)
+
+		var line map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatal(err)
+		}
+
+		_, hasTrace := line["trace_id"]
+		_, hasSpan := line["span_id"]
+
+		if hasTrace != tc.want || hasSpan != tc.want {
+			t.Fatalf("%q: trace_id %v span_id %v, want %v", tc.traceparent, hasTrace, hasSpan, tc.want)
+		}
+
+		if tc.want && (line["trace_id"] != "4bf92f3577b34da6a3ce929d0e0e4736" || line["span_id"] != "00f067aa0ba902b7") {
+			t.Fatalf("keys %v", line)
+		}
 	}
 }

@@ -440,7 +440,8 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
       <p>
         Routes on the first rule whose <code>when</code> expression is true; exactly one rule must be
         the <code>default</code>. Every evaluation is recorded as a <code>ChoiceEvaluated</code> event,
-        so the route taken is part of the history.
+        so the route taken is part of the history. A rule may carry a <code>name</code> (unique within
+        the node), recorded on that event so the history says why, not just which rule index.
       </p>
       <div class="codecard">
         <div class="codecard__bar">
@@ -450,7 +451,7 @@ fmt.<span class="fn">Println</span>(st.Status, <span class="kw">string</span>(st
 <pre class="codecard__body"><code>- <span class="k">id</span>: route
   <span class="k">type</span>: <span class="t">choice</span>
   <span class="k">rules</span>:
-    - {<span class="k">when</span>: <span class="s">"signals['manager-decision'].approved"</span>, <span class="k">to</span>: pay}
+    - {<span class="k">name</span>: approved, <span class="k">when</span>: <span class="s">"signals['manager-decision'].approved"</span>, <span class="k">to</span>: pay}
     - {<span class="k">when</span>: <span class="s">"results.check.amount > 1000 &amp;&amp; visits.check &lt; 3"</span>, <span class="k">to</span>: check}
     - {<span class="k">default</span>: true, <span class="k">to</span>: reject}</code></pre>
       </div>
@@ -750,10 +751,11 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Input, Channel, Result, Signal, Item</td><td>Decode a part of the context into a Go value.</td></tr>
           <tr><td>Resumed(&amp;v)</td><td>Whether this run resumes an interrupt, and the resume value.</td></tr>
           <tr><td>Interrupted(&amp;v)</td><td>On a resumed run (every attempt), the payload this node interrupted with.</td></tr>
+          <tr><td>Context.ResumedBy</td><td>On a resumed run (every attempt), who resumed it (<code>WithResumedBy</code>); empty when the resume named nobody.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
-          <tr><td>Traceparent</td><td>W3C trace context propagated from the start command.</td></tr>
-          <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, and <code>attempt</code>. See <a href="#logging">logging</a>.</td></tr>
+          <tr><td>Traceparent</td><td>W3C trace context of the command that scheduled the job: the one given with <code>WithTraceparent</code> at start reaches the jobs that follow from the start. Empty when that command had none, such as a timer, or a signal or resume sent with <code>Client</code>.</td></tr>
+          <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, and <code>attempt</code>, plus <code>trace_id</code> and <code>span_id</code> from a valid traceparent. See <a href="#logging">logging</a>.</td></tr>
           <tr><td>Meta, DecodeMeta(&amp;v)</td><td>The node's <code>meta</code> from the execution's flow version (raw JSON, nil when absent), and a decoder for it.</td></tr>
         </tbody>
       </table>
@@ -801,7 +803,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Start(flow, input, …)</td><td>Start an execution; returns its id. <code>WithExecutionID</code> makes it idempotent on that id (an id of another flow's execution fails with <code>ErrExecutionConflict</code>; <code>WithJoinExisting(false)</code> fails with <code>ErrExecutionExists</code> instead of joining), <code>WithVersion</code> pins a flow version, <code>WithTraceparent</code> propagates a trace.</td></tr>
           <tr><td>Signal(exec, name, payload)</td><td>Deliver a signal (buffered if no await is waiting yet); <code>WithSignalID</code> deduplicates.</td></tr>
           <tr><td>Update(exec, writes)</td><td>Write channels synchronously and return the state right after.</td></tr>
-          <tr><td>Resume(exec, node, value)</td><td>Re-run an interrupted node with a value.</td></tr>
+          <tr><td>Resume(exec, node, value, …)</td><td>Re-run an interrupted node with a value. <code>WithResumedBy(actor)</code> records who resumed it on the history and hands it to the worker.</td></tr>
           <tr><td>Cancel(exec, reason)</td><td>Cancel; a no-op on a finished execution.</td></tr>
           <tr><td>Get(exec)</td><td>Current state (archived executions are read from the archive).</td></tr>
           <tr><td>Wait(exec)</td><td>Block until the execution finishes and return the final state. Only <code>ctx</code> ends it early.</td></tr>
@@ -1049,7 +1051,10 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
       </table>
       <p>
         A handler logs through <code>job.Logger()</code>, so its lines carry the same keys as the
-        engine's: filter on <code>exec</code> to follow one execution across processes.
+        engine's: filter on <code>exec</code> to follow one execution across processes. When the job
+        carries a traceparent (<code>WithTraceparent</code> at start), worker lines also carry
+        <code>trace_id</code> and <code>span_id</code>, and the engine's decision lines <code>trace_id</code>,
+        so logs join the traces of the caller.
       </p>
       <h3>Metrics &amp; alerting</h3>
       <p>
@@ -1146,7 +1151,7 @@ flows                                  <span class="cm"># list registered versio
 start &lt;flow&gt; [-input JSON] [-id ID] [-version HASH] [-wait]
 signal &lt;exec&gt; &lt;name&gt; [-payload JSON] [-id ID]
 update &lt;exec&gt; -writes JSON [-id ID]
-resume &lt;exec&gt; &lt;node&gt; [-value JSON]
+resume &lt;exec&gt; &lt;node&gt; [-value JSON] [-by ACTOR]
 cancel &lt;exec&gt; [-reason TEXT]
 get &lt;exec&gt; [-seq N]                    <span class="cm"># state now, or right after event N</span>
 history &lt;exec&gt;
@@ -1246,7 +1251,7 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?</code></td></tr>
           <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?</code></td></tr>
           <tr><td>interrupt</td><td><code>key, generation, attempt, payload?</code></td></tr>
-          <tr><td>resume</td><td><code>node, key?, value?</code></td></tr>
+          <tr><td>resume</td><td><code>node, key?, value?, by?</code></td></tr>
           <tr><td>signal</td><td><code>name, payload?</code> — the command id is the signal id</td></tr>
           <tr><td>update</td><td><code>writes</code> — send with <code>reply</code>; the command id is the update id</td></tr>
           <tr><td>cancel</td><td><code>reason?</code></td></tr>
@@ -1272,7 +1277,7 @@ unquarantine &lt;exec&gt;</code></pre>
  <span class="s">"key"</span>: <span class="s">"n"</span>, <span class="s">"index"</span>: <span class="num">0</span>, <span class="s">"generation"</span>: <span class="num">3</span>, <span class="s">"attempt"</span>: <span class="num">1</span>,
  <span class="s">"context"</span>: {<span class="s">"input"</span>: {}, <span class="s">"channels"</span>: {}, <span class="s">"results"</span>: {}, <span class="s">"last_node"</span>: <span class="s">""</span>, <span class="s">"visits"</span>: {},
              <span class="s">"signals"</span>: {}, <span class="s">"branches"</span>: {}, <span class="s">"counters"</span>: {}, <span class="s">"errors"</span>: {},
-             <span class="s">"item"</span>: …, <span class="s">"index"</span>: …, <span class="s">"resume"</span>: …, <span class="s">"interrupt"</span>: …},
+             <span class="s">"item"</span>: …, <span class="s">"index"</span>: …, <span class="s">"resume"</span>: …, <span class="s">"resumed_by"</span>: …, <span class="s">"interrupt"</span>: …},
  <span class="s">"reply"</span>: <span class="s">"&lt;ns&gt;.cmd.&lt;p&gt;.e1"</span>, <span class="s">"cache_key"</span>: <span class="s">"…"</span>, <span class="s">"concurrency"</span>: {<span class="s">"key"</span>: <span class="s">"…"</span>, <span class="s">"max"</span>: <span class="num">2</span>},
  <span class="s">"traceparent"</span>: <span class="s">"…"</span>}</code></pre>
       </div>
@@ -1361,12 +1366,12 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>ExecutionFailed</td><td><code>error, reason, node?, cancel_children[]</code></td></tr>
           <tr><td>ExecutionCancelled</td><td><code>reason, cancel_children[]</code></td></tr>
           <tr><td>NodeEntered</td><td><code>node</code></td></tr>
-          <tr><td>NodeScheduled</td><td><code>key, node, kind, index?, generation, attempt, owner?, item?, resume?</code></td></tr>
+          <tr><td>NodeScheduled</td><td><code>key, node, kind, index?, generation, attempt, owner?, item?, resume?, resumed_by?</code></td></tr>
           <tr><td>NodeCompleted</td><td><code>key, node, generation, attempt, output?, writes?, next?, usage?, cached?, cache_key?</code></td></tr>
           <tr><td>NodeFailed</td><td><code>key, node, generation, attempt, error, reason, will_retry</code></td></tr>
           <tr><td>NodeInterrupted</td><td><code>key, node, generation, payload?</code></td></tr>
           <tr><td>NodeCancelled</td><td><code>key, node, reason</code></td></tr>
-          <tr><td>ChoiceEvaluated</td><td><code>node, rule, to, error?</code></td></tr>
+          <tr><td>ChoiceEvaluated</td><td><code>node, rule, name?, to, error?</code></td></tr>
           <tr><td>FanoutStarted</td><td><code>node, join, branches[]</code></td></tr>
           <tr><td>JoinCompleted</td><td><code>node, fanout, succeeded[], failed[], ok, output, cancel_children[]?</code></td></tr>
           <tr><td>AwaitStarted</td><td><code>node, signal, timer_id</code></td></tr>

@@ -33,6 +33,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/henomis/packtrail/internal/wire"
 )
 
 // Job is one attempt of a task instance.
@@ -65,8 +67,9 @@ type Job struct {
 }
 
 // Logger returns the worker's logger with this attempt bound: exec, flow,
-// node, key, kind, generation and attempt. Handlers log through it so their
-// lines join the engine's and the worker's on the same keys.
+// node, key, kind, generation and attempt, plus trace_id and span_id when the
+// job carries a valid traceparent. Handlers log through it so their lines
+// join the engine's and the worker's on the same keys.
 func (j *Job) Logger() *slog.Logger {
 	if j.logger == nil {
 		j.logger = jobLogger(slog.Default(), j)
@@ -76,10 +79,16 @@ func (j *Job) Logger() *slog.Logger {
 }
 
 func jobLogger(l *slog.Logger, j *Job) *slog.Logger {
-	return l.With(
+	l = l.With(
 		"exec", j.ExecID, "flow", j.Flow, "node", j.Node, "key", j.Key, "kind", j.Kind,
 		"generation", j.Generation, "attempt", j.Attempt,
 	)
+
+	if traceID, spanID, ok := wire.TraceIDs(j.Traceparent); ok {
+		l = l.With("trace_id", traceID, "span_id", spanID)
+	}
+
+	return l
 }
 
 // NodeError is how a node last failed permanently.
@@ -108,6 +117,9 @@ type Context struct {
 	Item   json.RawMessage      `json:"item,omitempty"`
 	Index  *int                 `json:"index,omitempty"`
 	Resume json.RawMessage      `json:"resume,omitempty"`
+	// ResumedBy is who resumed the instance (packtrail.WithResumedBy), on
+	// every attempt of its resumed run; empty when the resume named nobody.
+	ResumedBy string `json:"resumed_by,omitempty"`
 	// Interrupt is the payload the instance interrupted with, on every
 	// attempt of its resumed run; absent otherwise.
 	Interrupt json.RawMessage `json:"interrupt,omitempty"`

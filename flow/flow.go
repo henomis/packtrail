@@ -358,6 +358,9 @@ type Concurrency struct {
 
 // Rule is one branch of a choice node. Exactly one of When / Default is set.
 type Rule struct {
+	// Name labels the rule in ChoiceEvaluated events and timelines; optional,
+	// unique within its node.
+	Name    string `yaml:"name,omitempty" json:"name,omitempty"`
 	When    string `yaml:"when,omitempty" json:"when,omitempty"`
 	Default bool   `yaml:"default,omitempty" json:"default,omitempty"`
 	// To is the node the rule routes to, or End to complete the execution.

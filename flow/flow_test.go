@@ -219,6 +219,32 @@ func TestParseStrict(t *testing.T) {
 	}
 }
 
+// TestRuleNameKeepsHash: rule names are optional, so a flow without them keeps
+// the hash it had before they existed (pinned).
+func TestRuleNameKeepsHash(t *testing.T) {
+	const src = "name: x\nstart: c\nnodes:\n" +
+		"  - {id: c, type: choice, rules: [{when: 'input.x', to: a}, {default: true, to: $end}]}\n" +
+		"  - {id: a, type: task, kind: k}\n"
+
+	f, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if h, _ := f.Hash(); h != "288db386cc2e08e0" {
+		t.Fatalf("hash %s changed", h)
+	}
+
+	g, err := Parse([]byte(strings.Replace(src, "{when:", "{name: hi, when:", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if h, _ := g.Hash(); h == "288db386cc2e08e0" {
+		t.Fatal("a rule name must change the hash")
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	cases := []struct{ name, yaml, want string }{
 		{"bad name", "name: a.b\nnodes: [{id: a, type: task, kind: k}]", "invalid flow name"},
@@ -242,6 +268,8 @@ func TestValidateRejects(t *testing.T) {
 		{"choice no default", "name: x\nnodes: [{id: c, type: choice, rules: [{when: 'input.x', to: a}]}, {id: a, type: task, kind: k}]", "exactly one default"},
 		{"choice two defaults", "name: x\nnodes: [{id: c, type: choice, rules: [{default: true, to: a}, {default: true, to: a}]}, {id: a, type: task, kind: k}]", "exactly one default"},
 		{"choice default with when", "name: x\nnodes: [{id: c, type: choice, rules: [{default: true, when: 'true', to: a}]}, {id: a, type: task, kind: k}]", "must not also carry"},
+		{"choice dup rule name", "name: x\nnodes: [{id: c, type: choice, rules: [{name: hi, when: 'input.x', to: a}, {name: hi, default: true, to: a}]}, {id: a, type: task, kind: k}]", "duplicate rule name"},
+		{"choice bad rule name", "name: x\nnodes: [{id: c, type: choice, rules: [{name: 'a b', when: 'input.x', to: a}, {default: true, to: a}]}, {id: a, type: task, kind: k}]", "invalid rule name"},
 		{"choice bad expr", "name: x\nnodes: [{id: c, type: choice, rules: [{when: 'input.a + input.b > 1', to: a}, {default: true, to: a}]}, {id: a, type: task, kind: k}]", "concatenation"},
 		{"choice next", "name: x\nnodes: [{id: c, type: choice, next: a, rules: [{default: true, to: a}]}, {id: a, type: task, kind: k}]", "do not apply"},
 		{"choice on_error", "name: x\nnodes: [{id: c, type: choice, on_error: x, rules: [{default: true, to: a}]}, {id: a, type: task, kind: k}]", "on_error"},

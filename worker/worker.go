@@ -351,14 +351,16 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 
 	defer w.running.remove(wj.ExecID, rj)
 
+	job := w.newJob(wj, md)
+
 	stopLive := w.watchLive(jctx, wj, cancel)
-	c, err := w.run(jctx, wj, md)
+	c, err := w.run(jctx, wj, job, md)
 
 	stopLive()
 
 	if errors.Is(context.Cause(jctx), ErrCancelled) {
 		// The work is no longer wanted: its result would be stale (G5-02).
-		w.logger.DebugContext(ctx, "worker: job cancelled", "exec", wj.ExecID, "node", wj.Node, "key", wj.Key)
+		job.logger.DebugContext(ctx, "worker: job cancelled")
 
 		_ = msg.Ack()
 
@@ -366,11 +368,11 @@ func (w *Worker) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 
 	if err != nil {
-		w.logger.WarnContext(ctx, "worker: cannot build result", "exec", wj.ExecID, "node", wj.Node, "err", err)
+		job.logger.WarnContext(ctx, "worker: cannot build result", "err", err)
 	}
 
 	if err = w.publish(ctx, wj, c); err != nil {
-		w.logger.WarnContext(ctx, "worker: cannot publish result, job will be redelivered", "exec", wj.ExecID, "err", err)
+		job.logger.WarnContext(ctx, "worker: cannot publish result, job will be redelivered", "err", err)
 
 		_ = msg.NakWithDelay(time.Second)
 
@@ -419,8 +421,8 @@ func (w *Worker) resolve(ctx context.Context, msg jetstream.Msg) (body []byte, o
 // treated as gone rather than not replicated yet.
 const blobNotFoundTries = 3
 
-// run invokes the handler and turns its outcome into a command.
-func (w *Worker) run(ctx context.Context, wj wire.Job, md *jetstream.MsgMetadata) (cmd.Command, error) {
+// newJob builds the handler's view of one attempt, with its logger bound.
+func (w *Worker) newJob(wj wire.Job, md *jetstream.MsgMetadata) *Job {
 	job := &Job{
 		ExecID: wj.ExecID, Flow: wj.Flow, FlowHash: wj.FlowHash, Node: wj.Node, Kind: wj.Kind, Key: wj.Key,
 		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: md.NumDelivered,
@@ -428,6 +430,11 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, md *jetstream.MsgMetadata
 	}
 	job.logger = jobLogger(w.logger, job)
 
+	return job
+}
+
+// run invokes the handler and turns its outcome into a command.
+func (w *Worker) run(ctx context.Context, wj wire.Job, job *Job, md *jetstream.MsgMetadata) (cmd.Command, error) {
 	ref := cmd.TaskRef{Key: wj.Key, Generation: wj.Generation, Attempt: wj.Attempt}
 	id := wire.CmdID(wj.ExecID, wj.Key, wj.Generation, wj.Attempt)
 
@@ -503,7 +510,7 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			w.logger.ErrorContext(ctx, "worker: handler panic", "exec", job.ExecID, "node", job.Node, "panic", p,
+			job.logger.ErrorContext(ctx, "worker: handler panic", "panic", p,
 				"stack", string(debug.Stack()))
 
 			res, err = nil, fmt.Errorf("handler panic: %v", p)

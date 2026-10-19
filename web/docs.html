@@ -754,7 +754,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Context.ResumedBy</td><td>On a resumed run (every attempt), who resumed it (<code>WithResumedBy</code>); empty when the resume named nobody.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
-          <tr><td>Traceparent</td><td>W3C trace context of the command that scheduled the job (the start's, a signal's, a resume's…); empty when it had none, such as a timer.</td></tr>
+          <tr><td>Traceparent</td><td>W3C trace context of the command that scheduled the job: the one given with <code>WithTraceparent</code> at start reaches the jobs that follow from the start. Empty when that command had none, such as a timer, or a signal or resume sent with <code>Client</code>.</td></tr>
           <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, and <code>attempt</code>, plus <code>trace_id</code> and <code>span_id</code> from a valid traceparent. See <a href="#logging">logging</a>.</td></tr>
           <tr><td>Meta, DecodeMeta(&amp;v)</td><td>The node's <code>meta</code> from the execution's flow version (raw JSON, nil when absent), and a decoder for it.</td></tr>
         </tbody>

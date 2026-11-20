@@ -187,6 +187,7 @@ type Worker struct {
 	drain       time.Duration
 	logger      *slog.Logger
 	blobTimeout time.Duration
+	maxRecord   int
 
 	in *infra.Infra
 
@@ -427,6 +428,7 @@ func (w *Worker) newJob(wj wire.Job, md *jetstream.MsgMetadata) *Job {
 		ExecID: wj.ExecID, Flow: wj.Flow, FlowHash: wj.FlowHash, Node: wj.Node, Kind: wj.Kind, Key: wj.Key,
 		Index: wj.Index, Generation: wj.Generation, Attempt: wj.Attempt, Deliveries: md.NumDelivered,
 		Traceparent: wj.Traceparent, Meta: wj.Meta, progress: w.progressSink(wj), store: &Store{in: w.in},
+		record: recordSink{max: w.maxRecord},
 	}
 	job.logger = jobLogger(w.logger, job)
 
@@ -439,7 +441,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, job *Job, md *jetstream.M
 	id := wire.CmdID(wj.ExecID, wj.Key, wj.Generation, wj.Attempt)
 
 	if err := json.Unmarshal(wj.Context, &job.Context); err != nil {
-		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error(), nil)
+		return failCmd(id, wj.ExecID, ref, "undecodable context: "+err.Error(), nil, nil)
 	}
 
 	began := time.Now()
@@ -447,7 +449,7 @@ func (w *Worker) run(ctx context.Context, wj wire.Job, job *Job, md *jetstream.M
 		"queue_wait", began.Sub(md.Timestamp))
 
 	res, err := w.call(ctx, job)
-	c, cerr := resultCmd(id, wj, ref, res, err)
+	c, cerr := resultCmd(id, wj, ref, res, err, job.recorded())
 
 	job.logger.DebugContext(ctx, "worker: job ended", "outcome", outcome(c), "duration", time.Since(began))
 
@@ -470,7 +472,10 @@ func outcome(c cmd.Command) string {
 }
 
 // resultCmd turns what a handler returned into the command answering its job.
-func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error) (cmd.Command, error) {
+// record (Job.SetRecord) rides on whichever command it is.
+func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error,
+	record json.RawMessage,
+) (cmd.Command, error) {
 	var (
 		intr *InterruptError
 		c    cmd.Command
@@ -481,16 +486,18 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 	case errors.As(herr, &intr):
 		p, merr := marshalOutput(intr.Payload)
 		if merr != nil {
-			return failCmd(id, wj.ExecID, ref, merr.Error(), usageOf(herr))
+			return failCmd(id, wj.ExecID, ref, merr.Error(), usageOf(herr), record)
 		}
 
-		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{TaskRef: ref, Payload: p, Usage: usageOf(herr)})
+		c, err = cmd.New(id, cmd.Interrupt, wj.ExecID, cmd.InterruptData{
+			TaskRef: ref, Payload: p, Usage: usageOf(herr), Record: record,
+		})
 	case herr != nil:
 		c, err = cmd.New(id, cmd.Fail, wj.ExecID, cmd.FailData{
-			TaskRef: ref, Error: herr.Error(), Retryable: !IsPermanent(herr), Usage: usageOf(herr),
+			TaskRef: ref, Error: herr.Error(), Retryable: !IsPermanent(herr), Usage: usageOf(herr), Record: record,
 		})
 	default:
-		c, err = completeCmd(id, wj, ref, res)
+		c, err = completeCmd(id, wj, ref, res, record)
 	}
 
 	// A result that cannot be encoded (NaN usage, invalid raw JSON) would
@@ -501,7 +508,7 @@ func resultCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, herr error)
 			usage = res.Usage
 		}
 
-		return failCmd(id, wj.ExecID, ref, err.Error(), usage)
+		return failCmd(id, wj.ExecID, ref, err.Error(), usage, record)
 	}
 
 	return c, nil
@@ -521,24 +528,26 @@ func (w *Worker) call(ctx context.Context, job *Job) (res *Result, err error) {
 }
 
 // failCmd fails an attempt without retry: its answer cannot be encoded.
-func failCmd(id, execID string, ref cmd.TaskRef, msg string, usage map[string]float64) (cmd.Command, error) {
-	c, err := cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg, Usage: usage})
+func failCmd(id, execID string, ref cmd.TaskRef, msg string, usage map[string]float64,
+	record json.RawMessage,
+) (cmd.Command, error) {
+	c, err := cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg, Usage: usage, Record: record})
 	if err != nil && usage != nil {
 		// The usage itself cannot be encoded (NaN): fail without it.
-		return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg})
+		return cmd.New(id, cmd.Fail, execID, cmd.FailData{TaskRef: ref, Error: msg, Record: record})
 	}
 
 	return c, err
 }
 
-func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Command, error) {
+func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result, record json.RawMessage) (cmd.Command, error) {
 	if res == nil {
 		res = &Result{}
 	}
 
 	out, err := marshalOutput(res.Output)
 	if err != nil {
-		return failCmd(id, wj.ExecID, ref, err.Error(), res.Usage)
+		return failCmd(id, wj.ExecID, ref, err.Error(), res.Usage, record)
 	}
 
 	var writes map[string]json.RawMessage
@@ -549,7 +558,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 		for k, v := range res.Writes {
 			b, lerr := marshalOutput(v)
 			if lerr != nil {
-				return failCmd(id, wj.ExecID, ref, lerr.Error(), res.Usage)
+				return failCmd(id, wj.ExecID, ref, lerr.Error(), res.Usage, record)
 			}
 
 			if b == nil {
@@ -562,6 +571,7 @@ func completeCmd(id string, wj wire.Job, ref cmd.TaskRef, res *Result) (cmd.Comm
 
 	return cmd.New(id, cmd.Complete, wj.ExecID, cmd.CompleteData{
 		TaskRef: ref, Output: out, Writes: writes, Next: res.Next, Usage: res.Usage, CacheKey: wj.CacheKey,
+		Record: record,
 	})
 }
 

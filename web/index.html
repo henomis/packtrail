@@ -379,6 +379,7 @@ st, _ := c.<span class="fn">Wait</span>(ctx, id) <span class="cm">// channels, r
       <div class="optlist__row"><code>Fork(seq, WithForkWrites)</code><span>A new execution from that state, optionally with edited channels; the source is untouched.</span></div>
       <div class="optlist__row"><code>Rerun(node)</code><span>Fork at the point the node was last entered — the usual move after fixing a worker.</span></div>
       <div class="optlist__row"><code>OutputHistory(node)</code><span>Every output a node produced across its visits.</span></div>
+      <div class="optlist__row"><code>RecordHistory(node)</code><span>What each attempt recorded it did: the request, the prompt, the replies.</span></div>
     </div>
   </div>
 </section>

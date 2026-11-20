@@ -31,6 +31,8 @@
 //	writes        return as channel writes
 //	next          {node: target}: the dynamic next node of that node
 //	usage         return as usage counters
+//	record        true: record {"node", "attempt"} on every outcome (complete,
+//	              fail, interrupt), sent as the command's record
 //
 // and the output is {"node", "attempt", "input", "resume"?, "item"?}.
 package conformance
@@ -54,6 +56,7 @@ type echoInput struct {
 	Writes    map[string]any     `json:"writes"`
 	Next      map[string]string  `json:"next"`
 	Usage     map[string]float64 `json:"usage"`
+	Record    bool               `json:"record"`
 }
 
 // Echo is the Go reference implementation of the echo contract.
@@ -61,6 +64,13 @@ func Echo(ctx context.Context, j *worker.Job) (*worker.Result, error) {
 	var in echoInput
 	if err := j.Input(&in); err != nil {
 		return nil, worker.Permanent(err)
+	}
+
+	if in.Record {
+		rec := map[string]any{"node": j.Node, "attempt": j.Attempt} //nolint:goconst // the contract's keys.
+		if err := j.SetRecord(rec); err != nil {
+			return nil, worker.Permanent(err)
+		}
 	}
 
 	if in.SleepMS > 0 {

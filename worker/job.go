@@ -62,6 +62,7 @@ type Job struct {
 	Meta json.RawMessage
 
 	progress *progressSink
+	record   recordSink
 	store    *Store
 	logger   *slog.Logger
 }

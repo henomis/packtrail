@@ -217,6 +217,10 @@ type NodeDone struct {
 	Usage      map[string]float64         `json:"usage,omitempty"`
 	Cached     bool                       `json:"cached,omitempty"`
 	CacheKey   string                     `json:"cache_key,omitempty"`
+	// Record is what the attempt did, as its worker recorded it
+	// (worker.Job.SetRecord): opaque JSON, never folded into the state.
+	// Absent on a cached completion (no worker ran).
+	Record json.RawMessage `json:"record,omitempty"`
 }
 
 // NodeFail is the payload of NodeFailed. WillRetry says whether another
@@ -230,6 +234,9 @@ type NodeFail struct {
 	Reason     string             `json:"reason"`
 	WillRetry  bool               `json:"will_retry"`
 	Usage      map[string]float64 `json:"usage,omitempty"`
+	// Record is what the attempt did, as its worker recorded it; absent
+	// when the engine failed the attempt itself (a timeout).
+	Record json.RawMessage `json:"record,omitempty"`
 }
 
 // Interrupted is the payload of NodeInterrupted.
@@ -239,6 +246,8 @@ type Interrupted struct {
 	Generation int                `json:"generation"`
 	Payload    json.RawMessage    `json:"payload,omitempty"`
 	Usage      map[string]float64 `json:"usage,omitempty"`
+	// Record is what the attempt did, as its worker recorded it.
+	Record json.RawMessage `json:"record,omitempty"`
 }
 
 // NodeCancel is the payload of NodeCancelled: an in-flight instance abandoned

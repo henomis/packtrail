@@ -540,12 +540,12 @@ func (d *decider) complete(p *cmd.CompleteData) error {
 	if problem, retryable := d.checkCompletion(n, t, output, p); problem != "" {
 		reason := event.ReasonInvalidOutput
 
-		return d.taskFailed(t, problem, retryable, reason, p.Usage)
+		return d.taskFailed(t, problem, retryable, reason, p.Usage, record(p.Record, p.Cached))
 	}
 
 	err := d.emit(event.NodeCompleted, &event.NodeDone{
 		Key: t.Key, Node: t.Node, Generation: t.Generation, Attempt: t.Attempt, Output: output, Writes: p.Writes,
-		Next: p.Next, Usage: p.Usage, Cached: p.Cached, CacheKey: p.CacheKey,
+		Next: p.Next, Usage: p.Usage, Cached: p.Cached, CacheKey: p.CacheKey, Record: record(p.Record, p.Cached),
 	})
 	if err != nil {
 		return err
@@ -628,13 +628,25 @@ func (d *decider) failTask(p *cmd.FailData) error {
 		reason = event.ReasonError
 	}
 
-	return d.taskFailed(t, p.Error, p.Retryable, reason, p.Usage)
+	return d.taskFailed(t, p.Error, p.Retryable, reason, p.Usage, record(p.Record, false))
+}
+
+// record is the record an event keeps: none for a cached completion (no
+// worker ran) or a JSON null.
+func record(r json.RawMessage, cached bool) json.RawMessage {
+	if cached || isNull(r) {
+		return nil
+	}
+
+	return r
 }
 
 // taskFailed records a failed attempt and the usage it reported: retry when
 // allowed, otherwise settle the instance as failed and let its owner react. A
 // usage that exceeds the budget fails the execution instead.
-func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string, usage map[string]float64) error {
+func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string, usage map[string]float64,
+	rec json.RawMessage,
+) error {
 	n := d.def.Node(t.Node)
 	over := d.overBudgetWith(usage)
 	willRetry := retryable && t.Attempt < n.MaxAttempts() && over == ""
@@ -644,7 +656,7 @@ func (d *decider) taskFailed(t *Task, msg string, retryable bool, reason string,
 
 	err := d.emit(event.NodeFailed, &event.NodeFail{
 		Key: tc.Key, Node: tc.Node, Generation: tc.Generation, Attempt: tc.Attempt, Error: msg, Reason: reason,
-		WillRetry: willRetry, Usage: usage,
+		WillRetry: willRetry, Usage: usage, Record: rec,
 	})
 	if err != nil {
 		return err
@@ -709,6 +721,7 @@ func (d *decider) interrupt(p *cmd.InterruptData) error {
 
 	err := d.emit(event.NodeInterrupted, &event.Interrupted{
 		Key: t.Key, Node: node, Generation: t.Generation, Payload: p.Payload, Usage: p.Usage,
+		Record: record(p.Record, false),
 	})
 	if err != nil {
 		return err
@@ -779,7 +792,7 @@ func (d *decider) timer(p *cmd.TimerData) error {
 			return nil
 		}
 
-		return d.taskFailed(t, "attempt timed out", true, event.ReasonTimeout, nil)
+		return d.taskFailed(t, "attempt timed out", true, event.ReasonTimeout, nil, nil)
 	case event.TimerAwait:
 		return d.awaitTimeout(tc)
 	default:

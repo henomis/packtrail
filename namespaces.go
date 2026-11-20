@@ -18,28 +18,36 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/henomis/packtrail/internal/infra"
 	"github.com/henomis/packtrail/internal/names"
 )
 
 // Namespaces lists the namespaces provisioned on the NATS account that nc
 // is connected to, sorted. A prefix p is a namespace when both its
-// p-events and p-cmd streams exist.
+// p-events and p-cmd streams exist and p-cmd carries the metadata packtrail
+// provisioning writes (partition count and protocol version), so streams of
+// other applications that happen to share the naming are not listed.
+//
+// It lists every stream of the account, so the NATS user needs permission
+// for the JetStream stream list API ($JS.API.STREAM.LIST). It returns an
+// empty, non-nil slice when there are none.
 func Namespaces(ctx context.Context, nc *nats.Conn) ([]string, error) {
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, err
 	}
 
-	streams := map[string]bool{}
+	streams := map[string]map[string]string{} // name -> metadata
 
-	lister := js.StreamNames(ctx)
-	for name := range lister.Name() {
-		streams[name] = true
+	lister := js.ListStreams(ctx)
+	for info := range lister.Info() {
+		streams[info.Config.Name] = info.Config.Metadata
 	}
 
 	if err = lister.Err(); err != nil {
@@ -54,7 +62,7 @@ func Namespaces(ctx context.Context, nc *nats.Conn) ([]string, error) {
 			continue
 		}
 
-		if n := names.New(p); streams[n.StreamCmd] {
+		if meta, found := streams[names.New(p).StreamCmd]; found && provisioned(meta) {
 			out = append(out, p)
 		}
 	}
@@ -62,4 +70,12 @@ func Namespaces(ctx context.Context, nc *nats.Conn) ([]string, error) {
 	slices.Sort(out)
 
 	return out, nil
+}
+
+// provisioned reports whether a command stream's metadata is packtrail's: a
+// positive partition count and a protocol version.
+func provisioned(meta map[string]string) bool {
+	parts, err := strconv.Atoi(meta[infra.MetaPartitions])
+
+	return err == nil && parts > 0 && meta[infra.MetaProtocol] != ""
 }

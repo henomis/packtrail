@@ -49,14 +49,21 @@ func TestNamespaces(t *testing.T) {
 		}
 	}
 
-	// A stray events stream without its cmd stream is not a namespace.
 	js, err := jetstream.New(nc)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err = js.CreateStream(ctx, jetstream.StreamConfig{Name: "gamma-events", Subjects: []string{"gamma.ev.>"}}); err != nil {
-		t.Fatal(err)
+	for _, cfg := range []jetstream.StreamConfig{
+		// An events stream without its cmd stream is not a namespace.
+		{Name: "gamma-events", Subjects: []string{"gamma.ev.>"}},
+		// Nor is a pair with packtrail's names but not its metadata.
+		{Name: "delta-events", Subjects: []string{"delta.ev.>"}},
+		{Name: "delta-cmd", Subjects: []string{"delta.cmd.>"}},
+	} {
+		if _, err = js.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("create %s: %v", cfg.Name, err)
+		}
 	}
 
 	got, err = packtrail.Namespaces(ctx, nc)

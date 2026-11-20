@@ -29,10 +29,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/henomis/packtrail"
-	"github.com/henomis/packtrail/internal/names"
 )
 
 const (
@@ -158,49 +156,12 @@ func (a *api) client(ctx context.Context, ns string) (*packtrail.Client, error) 
 // known lists the namespaces the UI may serve: every namespace provisioned on
 // the account, narrowed to the allowlist when there is one.
 func (a *api) known(ctx context.Context) ([]string, error) {
-	found, err := discover(ctx, a.nc)
+	found, err := packtrail.Namespaces(ctx, a.nc)
 	if err != nil || a.allow == nil {
 		return found, err
 	}
 
 	return slices.DeleteFunc(found, func(ns string) bool { return !slices.Contains(a.allow, ns) }), nil
-}
-
-// discover finds the provisioned namespaces: a prefix p is one when both the
-// p-events and p-cmd streams exist.
-func discover(ctx context.Context, nc *nats.Conn) ([]string, error) {
-	js, err := jetstream.New(nc)
-	if err != nil {
-		return nil, err
-	}
-
-	streams := map[string]bool{}
-
-	lister := js.StreamNames(ctx)
-	for name := range lister.Name() {
-		streams[name] = true
-	}
-
-	if err = lister.Err(); err != nil {
-		return nil, fmt.Errorf("list streams: %w", err)
-	}
-
-	out := []string{}
-
-	for name := range streams {
-		p, ok := strings.CutSuffix(name, "-events")
-		if !ok || !names.ValidPrefix(p) {
-			continue
-		}
-
-		if n := names.New(p); streams[n.StreamCmd] {
-			out = append(out, p)
-		}
-	}
-
-	slices.Sort(out)
-
-	return out, nil
 }
 
 func (a *api) namespaces(w http.ResponseWriter, r *http.Request) {

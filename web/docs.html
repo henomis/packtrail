@@ -795,7 +795,8 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
         use <code>packtrail.NewClient(nc, packtrail.WithClientNamespace("acme"))</code>. It is safe for
         concurrent use and performs no I/O until the first call. <code>WithClientLogger(l)</code> sets the
         logger for its own diagnostics (default <code>slog.Default()</code>); the engine's client uses the
-        engine's logger.
+        engine's logger. <code>packtrail.Namespaces(ctx, nc)</code> lists the namespaces provisioned on the
+        account, sorted.
       </p>
       <table class="doctable">
         <thead><tr><th>Method</th><th>Description</th></tr></thead>

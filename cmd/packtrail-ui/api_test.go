@@ -161,7 +161,7 @@ func TestAPIAllowlist(t *testing.T) {
 
 	nc := s.Connect(t)
 
-	got, err := discover(ctx, nc)
+	got, err := packtrail.Namespaces(ctx, nc)
 	if err != nil || strings.Join(got, ",") != "a,b" {
 		t.Fatalf("discover %v %v", got, err)
 	}

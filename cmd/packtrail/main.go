@@ -66,6 +66,7 @@ executions:
   cancel <exec> [-reason TEXT]
   get <exec> [-seq N]                    state now, or right after event N
   history <exec>
+  records <exec> <node>                  the records the node's attempts stored (JSON lines), oldest first
   watch <exec>                           stream events until the execution ends
   progress <exec>                        stream workers' progress messages (JSON lines) until it ends
   wait <exec>
@@ -155,8 +156,9 @@ func (a *app) dispatch(ctx context.Context, name string, args []string) error {
 		"delete":   a.delete,
 		"register": a.register, "flows": a.flows, "start": a.start, "signal": a.signal, "update": a.update,
 		"resume": a.resume,
-		"cancel": a.cancel, "get": a.get, "history": a.history, "watch": a.watch, "progress": a.progress,
-		"wait": a.wait, "fork": a.fork,
+		"cancel": a.cancel, "get": a.get, "history": a.history, "records": a.records, "watch": a.watch,
+		"progress": a.progress,
+		"wait":     a.wait, "fork": a.fork,
 		"rerun": a.rerun, "list": a.list, "schedule": a.schedule, "unschedule": a.unschedule,
 		"schedules": a.schedules, "dlq": a.dlq, "redrive": a.redrive, "quarantined": a.quarantined,
 		"unquarantine": a.unquarantine,
@@ -541,6 +543,31 @@ func (a *app) history(ctx context.Context, args []string) error {
 
 	for _, ev := range evs {
 		if err = a.printEvent(ev.Seq, ev); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *app) records(ctx context.Context, args []string) error {
+	pos, err := parse(flag.NewFlagSet("records", flag.ContinueOnError), args, 2) //nolint:mnd // exec and node.
+	if err != nil {
+		return err
+	}
+
+	recs, err := a.client.RecordHistory(ctx, pos[0], pos[1])
+	if err != nil {
+		return err
+	}
+
+	for _, r := range recs {
+		b, merr := json.Marshal(r)
+		if merr != nil {
+			return merr
+		}
+
+		if _, err = fmt.Fprintf(a.out, "%s\n", b); err != nil {
 			return err
 		}
 	}

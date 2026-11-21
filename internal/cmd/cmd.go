@@ -119,6 +119,9 @@ type CompleteData struct {
 	Usage    map[string]float64         `json:"usage,omitempty"`
 	CacheKey string                     `json:"cache_key,omitempty"`
 	Cached   bool                       `json:"cached,omitempty"`
+	// Record is what the attempt did, set by the worker (Job.SetRecord):
+	// opaque, copied to the event and never folded.
+	Record json.RawMessage `json:"record,omitempty"`
 }
 
 // FailData is the payload of Fail.
@@ -129,6 +132,7 @@ type FailData struct {
 	Retryable bool               `json:"retryable"`
 	Reason    string             `json:"reason,omitempty"`
 	Usage     map[string]float64 `json:"usage,omitempty"`
+	Record    json.RawMessage    `json:"record,omitempty"`
 }
 
 // InterruptData is the payload of Interrupt.
@@ -137,6 +141,7 @@ type InterruptData struct {
 
 	Payload json.RawMessage    `json:"payload,omitempty"`
 	Usage   map[string]float64 `json:"usage,omitempty"`
+	Record  json.RawMessage    `json:"record,omitempty"`
 }
 
 // ResumeData is the payload of Resume: re-run the interrupted node with Value

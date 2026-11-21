@@ -17,6 +17,7 @@ package conformance
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -209,6 +210,65 @@ func TestConformance(t *testing.T) {
 
 		if field(t, st.Results["t"], "resume") != `"go on"` {
 			t.Fatalf("%v %s", err, st.Results["t"])
+		}
+	})
+
+	t.Run("record on every outcome", func(t *testing.T) {
+		id, err := s.client.Start(s.ctx, "conf-task", map[string]any{
+			"record": true, "fail_until": map[string]int{"t": 2}, "interrupt": "t",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		deadline := time.Now().Add(20 * time.Second)
+
+		for {
+			st, lerr := s.client.Get(s.ctx, id)
+			if lerr == nil && st.Status == packtrail.StatusWaiting {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatalf("never waiting: %v", lerr)
+			}
+
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if err = s.client.Resume(s.ctx, id, "t", "go on"); err != nil {
+			t.Fatal(err)
+		}
+
+		if st, werr := s.client.Wait(s.ctx, id); werr != nil || st.Status != packtrail.StatusCompleted {
+			t.Fatalf("%v", werr)
+		}
+
+		recs, err := s.client.RecordHistory(s.ctx, id, "t")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want := []struct {
+			outcome string
+			attempt int
+		}{
+			// The resumed run starts again at attempt 1, and fails it again.
+			{packtrail.OutcomeFailed, 1},
+			{packtrail.OutcomeInterrupted, 2},
+			{packtrail.OutcomeFailed, 1},
+			{packtrail.OutcomeCompleted, 2},
+		}
+		if len(recs) != len(want) {
+			t.Fatalf("records %+v", recs)
+		}
+
+		for i, w := range want {
+			r := recs[i]
+			if r.Outcome != w.outcome || r.Attempt != w.attempt || field(t, r.Record, "attempt") != fmt.Sprint(w.attempt) ||
+				field(t, r.Record, "node") != `"t"` {
+				t.Fatalf("record %d = %+v (%s), want %v", i, r, r.Record, w)
+			}
 		}
 	})
 

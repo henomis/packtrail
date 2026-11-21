@@ -753,6 +753,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>Interrupted(&amp;v)</td><td>On a resumed run (every attempt), the payload this node interrupted with.</td></tr>
           <tr><td>Context.ResumedBy</td><td>On a resumed run (every attempt), who resumed it (<code>WithResumedBy</code>); empty when the resume named nobody.</td></tr>
           <tr><td>Progress(v)</td><td>Publish an intermediate result on <code>&lt;ns&gt;.progress.&lt;exec&gt;.&lt;node&gt;</code>.</td></tr>
+          <tr><td>SetRecord(v)</td><td>Record what this attempt did (the request it sent, a model call's prompt and replies), stored with its outcome — completion, failure, interrupt, or a panic turned into a failure. Encoded at once: an unencodable value returns an error and does not fail the attempt. A later call replaces an earlier one. Kept in NATS for the execution's retention (archive included); never read by the engine, so leave out secrets and personal data you would not keep there.</td></tr>
           <tr><td>Store()</td><td>The long-term store of the worker's namespace, the same one <code>Client.Store()</code> reads: <code>Put</code>, <code>Get</code>, <code>Delete</code>, <code>Keys</code>. Writes are outside the log, so keep them idempotent under redelivery.</td></tr>
           <tr><td>Traceparent</td><td>W3C trace context of the command that scheduled the job: the one given with <code>WithTraceparent</code> at start reaches the jobs that follow from the start. Empty when that command had none, such as a timer, or a signal or resume sent with <code>Client</code>.</td></tr>
           <tr><td>Logger()</td><td>The worker's logger with this attempt bound: <code>exec</code>, <code>flow</code>, <code>node</code>, <code>key</code>, <code>kind</code>, <code>generation</code>, and <code>attempt</code>, plus <code>trace_id</code> and <code>span_id</code> from a valid traceparent. See <a href="#logging">logging</a>.</td></tr>
@@ -812,7 +813,7 @@ log.<span class="fn">Fatal</span>(w.<span class="fn">Run</span>(ctx)) <span clas
           <tr><td>WatchTerminal(from)</td><td>Stream the end of every execution (status and sequence), from now or a sequence.</td></tr>
           <tr><td>Progress(exec)</td><td>Stream workers' progress messages from now on.</td></tr>
           <tr><td>List(filter)</td><td>Indexed executions by status, flow or search attribute, newest first.</td></tr>
-          <tr><td>History, StateAt, OutputHistory</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
+          <tr><td>History, StateAt, OutputHistory, RecordHistory</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
           <tr><td>Fork, Rerun</td><td>See <a href="#timetravel">time travel</a>.</td></tr>
           <tr><td>Register, Flows, Flow</td><td>Store a definition (new version when changed), list versions, read one.</td></tr>
           <tr><td>Schedule, Unschedule, Schedules</td><td>Manage cron schedules.</td></tr>
@@ -880,6 +881,7 @@ st, err := c.<span class="fn">Update</span>(ctx, id, <span class="kw">map</span>
           <tr><td>History(exec)</td><td>Every event in order, including archived segments of long executions.</td></tr>
           <tr><td>StateAt(exec, seq)</td><td>The state right after the decision at <code>seq</code>.</td></tr>
           <tr><td>OutputHistory(exec, node)</td><td>Every output the node produced, oldest first — one per visit.</td></tr>
+          <tr><td>RecordHistory(exec, node)</td><td>The record (<code>Job.SetRecord</code>) of every attempt of the node that stored one, oldest first, with its key, generation, attempt and outcome (<code>completed</code>, <code>failed</code>, <code>interrupted</code>).</td></tr>
           <tr><td>Fork(exec, seq, …)</td><td>A new execution from the state at <code>seq</code>, continuing from there: what was in flight is dispatched again. <code>WithForkWrites</code> edits its channels first; <code>WithForkID</code> names it.</td></tr>
           <tr><td>Rerun(exec, node, …)</td><td>Fork at the point the node was last entered, so it (and what follows) runs again — the usual move after fixing a worker bug. The node must still be in flight when the decision that entered it ends (a task, map, subflow, fan-out or waiting await): a node that settled right away (a choice, a join, an await whose signal was already buffered) is refused with <code>ErrInvalidArgument</code>; rerun the node before it.</td></tr>
         </tbody>
@@ -994,6 +996,7 @@ again, _ := c.<span class="fn">Rerun</span>(ctx, id, <span class="s">"draft"</sp
           <tr><td>WithMaxDeliver(n)</td><td>Deliveries before a job is dead-lettered and its node failed (default 5). Kind-wide.</td></tr>
           <tr><td>WithMaxAckPending(n)</td><td>Jobs of this kind in flight across every process (default 10 000). Kind-wide.</td></tr>
           <tr><td>WithReconfigure()</td><td>Apply this worker's kind-wide settings to the shared consumer. Without it the first worker's settings stay.</td></tr>
+          <tr><td>WithMaxRecordBytes(n)</td><td>Cap on a job's encoded record (default none). A larger one is stored as <code>{"truncated": true, "size": …, "head": "…"}</code> within the cap; the attempt is not failed.</td></tr>
           <tr><td>WithLiveCheck(d)</td><td>Period of the log-head check that stops jobs whose execution ended.</td></tr>
           <tr><td>WithDrainTimeout(d), WithBlobTimeout(d), WithLogger(l)</td><td>Shutdown drain, claim-check transfer timeout, logger.</td></tr>
         </tbody>
@@ -1249,9 +1252,9 @@ unquarantine &lt;exec&gt;</code></pre>
         <tbody>
           <tr><td>start</td><td><code>flow, version?, input?, parent?</code> — idempotent per execution id (command id <code>start.&lt;exec&gt;</code>); <code>conflict</code> when the id is an execution of another flow</td></tr>
           <tr><td>fork</td><td><code>from, seq, writes?</code></td></tr>
-          <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?</code></td></tr>
-          <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?</code></td></tr>
-          <tr><td>interrupt</td><td><code>key, generation, attempt, payload?</code></td></tr>
+          <tr><td>complete</td><td><code>key, generation, attempt, output?, writes?, next?, usage?, cache_key?, record?</code></td></tr>
+          <tr><td>fail</td><td><code>key, generation, attempt, error, retryable, reason?, usage?, record?</code></td></tr>
+          <tr><td>interrupt</td><td><code>key, generation, attempt, payload?, usage?, record?</code> — <code>record</code> (any JSON) is what the attempt did, stored on its event and never interpreted</td></tr>
           <tr><td>resume</td><td><code>node, key?, value?, by?</code></td></tr>
           <tr><td>signal</td><td><code>name, payload?</code> — the command id is the signal id</td></tr>
           <tr><td>update</td><td><code>writes</code> — send with <code>reply</code>; the command id is the update id</td></tr>
@@ -1368,9 +1371,9 @@ unquarantine &lt;exec&gt;</code></pre>
           <tr><td>ExecutionCancelled</td><td><code>reason, cancel_children[]</code></td></tr>
           <tr><td>NodeEntered</td><td><code>node</code></td></tr>
           <tr><td>NodeScheduled</td><td><code>key, node, kind, index?, generation, attempt, owner?, item?, resume?, resumed_by?</code></td></tr>
-          <tr><td>NodeCompleted</td><td><code>key, node, generation, attempt, output?, writes?, next?, usage?, cached?, cache_key?</code></td></tr>
-          <tr><td>NodeFailed</td><td><code>key, node, generation, attempt, error, reason, will_retry</code></td></tr>
-          <tr><td>NodeInterrupted</td><td><code>key, node, generation, payload?</code></td></tr>
+          <tr><td>NodeCompleted</td><td><code>key, node, generation, attempt, output?, writes?, next?, usage?, cached?, cache_key?, record?</code></td></tr>
+          <tr><td>NodeFailed</td><td><code>key, node, generation, attempt, error, reason, will_retry, usage?, record?</code></td></tr>
+          <tr><td>NodeInterrupted</td><td><code>key, node, generation, payload?, usage?, record?</code></td></tr>
           <tr><td>NodeCancelled</td><td><code>key, node, reason</code></td></tr>
           <tr><td>ChoiceEvaluated</td><td><code>node, rule, name?, to, error?</code></td></tr>
           <tr><td>FanoutStarted</td><td><code>node, join, branches[]</code></td></tr>

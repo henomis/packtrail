@@ -103,12 +103,42 @@ A worker can stream intermediate results with `j.Progress(v)`; clients follow
 them with `c.Progress(ctx, id)` (or `packtrail progress <exec>`). Progress is
 never stored: the log keeps the final result only.
 
+A worker can also record what an attempt did — the request it sent, the
+query it ran, a model call's prompt and replies — with `j.SetRecord(v)`. The
+record is stored with the attempt's outcome (completion, failure or
+interrupt) in the event log, and `c.RecordHistory(ctx, id, node)` (or
+`packtrail records <exec> <node>`) lists it per attempt:
+
+```go
+w, _ := worker.New(nc, "fetch", func(ctx context.Context, j *worker.Job) (*worker.Result, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/api", nil)
+	resp, err := http.DefaultClient.Do(req)
+
+	rec := map[string]any{"method": req.Method, "url": req.URL.String()}
+	if resp != nil {
+		rec["status"] = resp.StatusCode
+		resp.Body.Close()
+	}
+	_ = j.SetRecord(rec) // rides on the completion or the failure below
+
+	if err != nil {
+		return nil, err
+	}
+	return &worker.Result{Output: map[string]any{"status": resp.StatusCode}}, nil
+}, worker.WithMaxRecordBytes(64<<10)) // larger records are truncated, not refused
+```
+
+Records are diagnostic and opt-in: the engine never reads them. Whatever a
+worker records is stored in NATS for the execution's retention (and in its
+archive), so leave out secrets and personal data you would not keep there.
+
 The CLI does the same from a shell:
 
 ```sh
 packtrail run -flows flows/ &
 packtrail start review -input '{"topic":"NATS"}' -wait
 packtrail history <exec>          # every event
+packtrail records <exec> draft    # what each attempt of a node recorded
 packtrail get <exec> -seq 12      # state right after event 12
 packtrail fork <exec> 12          # continue from there in a new execution
 packtrail fork <exec> 12 -writes '{"notes":"try again"}'  # … with edited state

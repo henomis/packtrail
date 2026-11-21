@@ -92,6 +92,7 @@ async function render() {
   $("#d-at").textContent = selectedSeq ? `(state at seq ${selectedSeq})` : "(latest)";
   $("#state").textContent = JSON.stringify(st, null, 2);
   renderTimeline(hist);
+  renderAttempt(hist.find((row) => row.seq === selectedSeq));
   const def = await api(nsPath(`/flows/${encodeURIComponent(st.flow)}?version=${encodeURIComponent(st.flow_hash)}`));
   renderGraph(def.definition, def.start, st);
 }
@@ -99,7 +100,24 @@ async function render() {
 function summary(ev) {
   const d = ev.data || {};
   return [d.node, d.key && d.key !== d.node ? d.key : "", d.name, d.to ? "→ " + d.to : "",
-    d.attempt ? "#" + d.attempt : "", d.error || d.reason || ""].filter(Boolean).join(" ");
+    d.attempt ? "#" + d.attempt : "", d.error || d.reason || "", d.record ? "[record]" : ""].filter(Boolean).join(" ");
+}
+
+// The outcome of the selected attempt (completed, failed or interrupted) next
+// to the record its worker stored, shown as raw JSON: its shape is the
+// worker's.
+const ATTEMPT_EVENTS = new Set(["NodeCompleted", "NodeFailed", "NodeInterrupted"]);
+
+function renderAttempt(row) {
+  const box = $("#attempt");
+  if (!row || !ATTEMPT_EVENTS.has(row.event.type)) { box.hidden = true; return; }
+  const d = row.event.data || {};
+  const outcome = row.event.type === "NodeCompleted" ? { output: d.output ?? null }
+    : row.event.type === "NodeFailed" ? { error: d.error, reason: d.reason, will_retry: d.will_retry }
+    : { payload: d.payload ?? null };
+  $("#attempt-at").textContent = `${d.key || d.node} · generation ${d.generation}` + (d.attempt ? ` · attempt ${d.attempt}` : "");
+  $("#attempt-body").textContent = JSON.stringify({ ...outcome, record: d.record ?? null }, null, 2);
+  box.hidden = false;
 }
 
 function renderTimeline(hist) {

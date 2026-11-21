@@ -568,6 +568,84 @@ func (c *Client) OutputHistory(ctx context.Context, execID, node string) ([]json
 	return out, nil
 }
 
+// Outcomes of an attempt, in AttemptRecord.Outcome.
+const (
+	OutcomeCompleted   = "completed"
+	OutcomeFailed      = "failed"
+	OutcomeInterrupted = "interrupted"
+)
+
+// AttemptRecord is the record one attempt of a node stored with its outcome
+// (worker.Job.SetRecord).
+type AttemptRecord struct {
+	// Key, Generation and Attempt identify the attempt, as on its job.
+	Key        string `json:"key"`
+	Generation int    `json:"generation"`
+	Attempt    int    `json:"attempt"`
+	// Outcome is how the attempt ended: completed, failed or interrupted.
+	Outcome string `json:"outcome"`
+	// Seq is the event's position in the execution's log (event.Event.Index)
+	// and Time when it was decided.
+	Seq  int       `json:"seq"`
+	Time time.Time `json:"time"`
+	// Record is the value the worker set, as JSON.
+	Record json.RawMessage `json:"record"`
+}
+
+// RecordHistory returns the record of every attempt of node that stored one,
+// oldest first; attempts without a record are left out. One attempt has at
+// most one record, so a lookup by (key, generation, attempt) is a scan of the
+// slice. It reads the whole history, archived stretches included.
+func (c *Client) RecordHistory(ctx context.Context, execID, node string) ([]AttemptRecord, error) {
+	evs, err := c.History(ctx, execID)
+	if err != nil {
+		return nil, err
+	}
+
+	// NodeInterrupted carries no attempt: it is the last one scheduled for
+	// its key and generation.
+	type instance struct {
+		key        string
+		generation int
+	}
+
+	attempts := map[instance]int{}
+
+	var out []AttemptRecord
+
+	add := func(ev event.Event, key string, generation, attempt int, outcome string, rec json.RawMessage) {
+		if len(rec) > 0 {
+			out = append(out, AttemptRecord{
+				Key: key, Generation: generation, Attempt: attempt, Outcome: outcome, Seq: ev.Index, Time: ev.Time,
+				Record: rec,
+			})
+		}
+	}
+
+	for _, ev := range evs {
+		switch d := ev.Data.(type) {
+		case *event.Scheduled:
+			if d.Node == node {
+				attempts[instance{d.Key, d.Generation}] = d.Attempt
+			}
+		case *event.NodeDone:
+			if d.Node == node {
+				add(ev, d.Key, d.Generation, d.Attempt, OutcomeCompleted, d.Record)
+			}
+		case *event.NodeFail:
+			if d.Node == node {
+				add(ev, d.Key, d.Generation, d.Attempt, OutcomeFailed, d.Record)
+			}
+		case *event.Interrupted:
+			if d.Node == node {
+				add(ev, d.Key, d.Generation, attempts[instance{d.Key, d.Generation}], OutcomeInterrupted, d.Record)
+			}
+		}
+	}
+
+	return out, nil
+}
+
 // List returns indexed executions matching the filter, newest first.
 func (c *Client) List(ctx context.Context, f ListFilter) ([]Summary, error) {
 	if err := c.attach(ctx); err != nil {
